@@ -6,7 +6,8 @@ A Discord Webhook (https://support.discord.com/hc/en-us/articles/228383668-Intro
 A working tbot installation that outputs machine identity (https://goteleport.com/docs/machine-workload-identity/machine-id/getting-started/)
 A role associated with your tbot that permits read and list verbs on the notification resource
 
-*You will need to*
+**You will need to**
+
 Edit DISCORD_WEBHOOK_URL with the webhook URL 
 
 Edit TENANT_FQDN with the fqdn of your Teleport tenant (eg mytenant.teleport.sh)
