@@ -3,7 +3,9 @@ This script will check output of tctl notifications ls and look for "**Teleport 
 **Requires**
 
 A Discord Webhook (https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks)
+
 A working tbot installation that outputs machine identity (https://goteleport.com/docs/machine-workload-identity/machine-id/getting-started/)
+
 A role associated with your tbot that permits read and list verbs on the notification resource
 
 **You will need to**
