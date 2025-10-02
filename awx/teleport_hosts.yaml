@@ -1,0 +1,93 @@
+---
+all:
+  children:
+    auto-users:
+      hosts:
+        beverly.stitch.geekvoice.net:
+          ansible_host: beverly.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 4 Model B Rev 1.1"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        coldwater.stitch.geekvoice.net:
+          ansible_host: coldwater.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 4 Model B Rev 1.5"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        huntington.stitch.geekvoice.net:
+          ansible_host: huntington.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 5 Model B Rev 1.0"
+          os: "Debian GNU/Linux 12 (bookworm)"
+          system_arch: "aarch64"
+        lajolla.stitch.geekvoice.net:
+          ansible_host: lajolla.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 5 Model B Rev 1.0"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        malibu.stitch.geekvoice.net:
+          ansible_host: malibu.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 5 Model B Rev 1.0"
+          os: "Debian GNU/Linux 12 (bookworm)"
+          system_arch: "aarch64"
+        otternaut.stitch.geekvoice.net:
+          ansible_host: otternaut.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 4 Model B Rev 1.5"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        rodeo.stitch.geekvoice.net:
+          ansible_host: rodeo.stitch.geekvoice.net
+          app: "auto-users"
+          owner: "paul"
+          teleport.internal/resource-id: "17672c64-e157-4c8a-bc51-13d5b9bec6fe"
+          board_info: "Raspberry Pi 4 Model B Rev 1.1"
+          os: "Ubuntu 25.04"
+        venice.stitch.geekvoice.net:
+          ansible_host: venice.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: "Raspberry Pi 5 Model B Rev 1.0"
+          os: "Debian GNU/Linux 12 (bookworm)"
+          system_arch: "aarch64"
+        wilshire.stitch.geekvoice.net:
+          ansible_host: wilshire.stitch.geekvoice.net
+          app: "auto-users"
+          board_info: ""
+          os: "Debian GNU/Linux 13 (trixie)"
+          raspi_board_info: "Raspberry Pi 4 Model B Rev 1.1"
+          system_arch: "aarch64"
+    critical:
+      hosts:
+        avenuesaintcharles.stitch.geekvoice.net:
+          ansible_host: avenuesaintcharles.stitch.geekvoice.net
+          app: "critical"
+          arch: "x86_64"
+          board_info: "Droplet"
+          os: "Ubuntu 25.04"
+        hermosa.stitch.geekvoice.net:
+          ansible_host: hermosa.stitch.geekvoice.net
+          app: "critical"
+          board_info: "Raspberry Pi 5 Model B Rev 1.0"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        olympic.stitch.geekvoice.net:
+          ansible_host: olympic.stitch.geekvoice.net
+          app: "critical"
+          board_info: "Raspberry Pi 4 Model B Rev 1.5"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        sunset.stitch.geekvoice.net:
+          ansible_host: sunset.stitch.geekvoice.net
+          app: "critical"
+          board_info: "Raspberry Pi 4 Model B Rev 1.4"
+          os: "Ubuntu 25.04"
+          system_arch: "aarch64"
+        wombat.stitch.geekvoice.net:
+          ansible_host: wombat.stitch.geekvoice.net
+          app: "critical"
+          board_info: "Raspberry Pi 5 Model B Rev 1.1"
+          os: "Debian GNU/Linux 12 (bookworm)"
+          system_arch: "aarch64"
