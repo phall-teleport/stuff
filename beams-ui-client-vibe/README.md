@@ -1,8 +1,8 @@
 # Beams
 
-A macOS app, written in Go, that runs **Claude Code inside a Teleport Beam**
-(an ephemeral sandbox VM) the way the Claude Code CLI itself does, and keeps
-the **conversation transcript and Claude's memory in GitHub** so nothing is
+A macOS app, written in Go, that runs **Claude Code or another Beams supported model inside a Teleport Beam**
+(an ephemeral sandbox VM), and keeps
+the **conversation transcript and memory in GitHub** so nothing is
 lost when the beam expires.
 
 ```
