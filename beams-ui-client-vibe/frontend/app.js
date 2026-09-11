@@ -346,7 +346,7 @@ async function loadSessions() {
 function showEmpty() {
   clearTranscript();
   const e = el("div", "empty");
-  e.innerHTML = `<div class="empty-mark">◈</div><h2>Claude Code, inside a beam</h2><p>Create or pick a sandbox on the left. Each session runs Claude Code (or another model choosable from Settings) in the beam, streams the conversation here, and can commit the transcript and memory to GitHub.</p>`;
+  e.innerHTML = `<div class="empty-mark">◈</div><h2>Do all the things, inside a Beam</h2><p>Create or pick a sandbox on the left. Each session runs Claude Code (or another model choosable from Settings) in the beam, streams the conversation here, and can commit the transcript and memory to GitHub.</p>`;
   T().appendChild(e);
   $("composer").classList.add("hidden");
   $("head-title").textContent = "Pick a sandbox to start";
