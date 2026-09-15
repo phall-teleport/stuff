@@ -48,3 +48,7 @@ PLIST
 
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
 echo "Built $APP"
+
+# Ship a committed copy for people who just want to run it.
+rm -rf dist/Beams.app && mkdir -p dist && cp -R "$APP" dist/Beams.app
+echo "Copied to dist/Beams.app"

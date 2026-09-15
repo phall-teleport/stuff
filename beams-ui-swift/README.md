@@ -40,6 +40,18 @@ with the Go/Wails version, so both see the same sessions and settings.
 - **Native** — real alerts and confirmations, Settings window (⌘,), sidebar
   and inspector, keyboard shortcuts, dark/light appearance.
 
+## Run the prebuilt app
+
+A compiled copy is committed at `dist/Beams.app`. It is signed ad hoc, so
+after cloning or downloading, macOS will quarantine it; either right-click →
+Open the first time, or clear the flag:
+
+```bash
+xattr -dr com.apple.quarantine dist/Beams.app && open dist/Beams.app
+```
+
+`Scripts/bundle.sh` refreshes `dist/Beams.app` on every build.
+
 ## Build
 
 Only the Xcode Command Line Tools are required (no Xcode):
