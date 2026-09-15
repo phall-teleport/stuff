@@ -43,6 +43,10 @@ final class AppModel {
     private var seq: [String: Int] = [:]
     var busy: Set<String> = []
     private var running: [String: RunningProcess] = [:]
+    /// Tool-permission questions from Claude Code waiting for an answer, per session.
+    var pendingPermissions: [String: [PermissionRequest]] = [:]
+    /// Sessions where the user chose "allow everything for the rest of this turn".
+    private var allowAllThisTurn: Set<String> = []
     var probeHint = ""
     var composer = ""
 
@@ -237,7 +241,7 @@ final class AppModel {
     private func probe(_ beamID: String) async {
         do {
             var lines: [String] = []
-            try await client.run(id: beamID, script: AgentScripts.probe, stdin: nil, onStdoutLine: { lines.append($0) }, onStderrLine: nil, register: nil)
+            try await client.run(id: beamID, script: AgentScripts.probe, stdin: nil, interactiveStdin: false, onStdoutLine: { lines.append($0) }, onStderrLine: nil, register: nil)
             if lines.count >= 2 { probeHint = "\(lines[0])@\(lines[1]) · \(lines.count > 2 ? lines[2] : "")" }
         } catch { probeHint = "probe failed: \(error.localizedDescription)" }
     }
@@ -274,15 +278,24 @@ final class AppModel {
                                permissionMode: config.permissionMode, model: config.model)
         var errMsg = ""
         do {
-            try await client.run(id: s.beamId, script: opts.script, stdin: nil,
+            // The prompt travels as the first stream-json message on stdin; the
+            // same pipe carries our answers to permission requests.
+            try await client.run(id: s.beamId, script: opts.script, stdin: nil, interactiveStdin: true,
                                  onStdoutLine: { [weak self] line in Task { @MainActor in self?.handleLine(sessionID, line) } },
                                  onStderrLine: { [weak self] line in Task { @MainActor in self?.appendStderr(sessionID, line) } },
-                                 register: { [weak self] p in Task { @MainActor in self?.running[sessionID] = p } })
+                                 register: { [weak self] p in
+                                     Task { @MainActor in
+                                         self?.running[sessionID] = p
+                                         p.send(line: TurnOptions.userMessage(prompt))
+                                     }
+                                 })
         } catch {
             errMsg = running[sessionID] == nil ? "stopped" : error.localizedDescription
             if let p = running[sessionID], !p.process.isRunning, p.process.terminationReason == .uncaughtSignal { errMsg = "stopped" }
         }
         running[sessionID] = nil
+        pendingPermissions[sessionID] = nil
+        allowAllThisTurn.remove(sessionID)
         busy.remove(sessionID)
         if !errMsg.isEmpty {
             appendItem(sessionID, TranscriptItem(id: nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
@@ -297,6 +310,50 @@ final class AppModel {
         guard let id = id ?? currentID, let p = running[id] else { return }
         p.terminate()
     }
+
+    // MARK: permission prompts (Claude Code control protocol)
+
+    private func handleControlRequest(_ id: String, _ ev: StreamEvent) {
+        guard let rid = ev.raw["request_id"] as? String else { return }
+        guard let req = PermissionRequest(event: ev, sessionID: id) else {
+            // Only tool permissions are supported; refuse anything else politely.
+            running[id]?.send(line: TurnOptions.errorResponse(requestID: rid, error: "unsupported control request"))
+            return
+        }
+        if allowAllThisTurn.contains(id) {
+            answer(req, allow: true, note: "auto")
+            return
+        }
+        pendingPermissions[id, default: []].append(req)
+        if currentID != id, let s = sessions.first(where: { $0.id == id }) {
+            toast("\(s.beamName) is asking to use \(req.toolName)", .info, seconds: 6)
+        }
+    }
+
+    /// Answers one request and records the decision in the transcript.
+    func answer(_ req: PermissionRequest, allow: Bool, allRestOfTurn: Bool = false, note: String = "") {
+        let sid = req.sessionID
+        pendingPermissions[sid]?.removeAll { $0.id == req.id }
+        if allRestOfTurn { allowAllThisTurn.insert(sid) }
+        let line = allow ? TurnOptions.allowResponse(requestID: req.id, input: req.input)
+                         : TurnOptions.denyResponse(requestID: req.id, message: "The user declined this tool use in the Beams app.")
+        running[sid]?.send(line: line)
+        let record: [String: Any] = ["type": "beamsui.permission", "allowed": allow, "tool": req.toolName,
+                                     "summary": req.summary.isEmpty ? req.description : req.summary, "note": note]
+        let json = TurnOptions.jsonLine(record)
+        store.appendTranscript(sid, line: json)
+        if let ev = StreamEvent(line: json) {
+            var n = seq[sid, default: 0]
+            items[sid, default: []] += TranscriptItem.items(from: ev, seq: &n)
+            seq[sid] = n
+        }
+        // Anything still queued is answered the same way when "allow all" was chosen.
+        if allRestOfTurn, let rest = pendingPermissions[sid], !rest.isEmpty {
+            for r in rest { answer(r, allow: true, note: "auto") }
+        }
+    }
+
+    var currentPermission: PermissionRequest? { currentID.flatMap { pendingPermissions[$0]?.first } }
 
     private func nextSeq(_ id: String) -> String { seq[id, default: 0] += 1; return "\(seq[id]!)" }
 
@@ -317,6 +374,19 @@ final class AppModel {
     }
 
     private func ingest(_ id: String, _ ev: StreamEvent) {
+        switch ev.type {
+        case "control_request":
+            handleControlRequest(id, ev)
+            return
+        case "control_cancel_request":
+            if let rid = ev.raw["request_id"] as? String { pendingPermissions[id]?.removeAll { $0.id == rid } }
+            return
+        case "result":
+            // stream-json input keeps Claude waiting for more; tell it we're done.
+            running[id]?.closeStdin()
+        default:
+            break
+        }
         var n = seq[id, default: 0]
         let newItems = TranscriptItem.items(from: ev, seq: &n)
         seq[id] = n
@@ -388,7 +458,7 @@ final class AppModel {
             }
             let (data, count) = try await store.tarGz(directory: dir)
             guard count > 0 else { toast("Memory snapshot is empty"); return }
-            try await client.run(id: s.beamId, script: AgentScripts.memoryRestore, stdin: data, onStdoutLine: nil, onStderrLine: nil, register: nil)
+            try await client.run(id: s.beamId, script: AgentScripts.memoryRestore, stdin: data, interactiveStdin: false, onStdoutLine: nil, onStderrLine: nil, register: nil)
             toast("Restored \(count) memory files into \(s.beamName)", .ok)
         } catch { fail(error) }
     }

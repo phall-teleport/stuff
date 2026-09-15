@@ -27,6 +27,29 @@ this file covers what's specific to the Swift build.
   app). `NSAppleEventsUsageDescription` is required for the iTerm/Terminal
   hand-off via `NSAppleScript`.
 
+## Permission prompts (verified 2026-09-15 against a real beam)
+
+Print mode can't answer terminal permission prompts, so turns always run
+`claude -p --output-format stream-json --input-format stream-json`; the prompt
+is the first stream-json `user` message on stdin (`TurnOptions.userMessage`).
+For any mode other than bypass we add `--permission-prompt-tool stdio`, and
+Claude Code then emits
+`{"type":"control_request","request_id":…,"request":{"subtype":"can_use_tool","tool_name","display_name","input","description","permission_suggestions","tool_use_id"}}`.
+We reply on stdin with `control_response` → `{"behavior":"allow","updatedInput"}`
+or `{"behavior":"deny","message"}` (`AppModel.answer`), and close stdin after
+the `result` event so the process exits. `PermissionCard` renders the pending
+request inline (Y/N shortcuts); decisions are recorded as `beamsui.permission`
+lines in the transcript. `RunningProcess.send/closeStdin` are the plumbing.
+
+## Do NOT use FileHandle.bytes / AsyncBytes for child output
+
+`FileHandle.bytes.lines` (AsyncBytes) **stops delivering once the parent writes
+to the child's stdin**, which deadlocks the interactive permission protocol
+above (Claude asks, we write the allow, AsyncBytes never yields the result, the
+turn hangs forever and the UI stacks retries). `Shell.run` reads stdout/stderr
+with `StreamReader`, a blocking `availableData` loop on a `Thread`. Keep it that
+way. Verified 2026-09-15: AsyncBytes hangs, StreamReader completes cleanly.
+
 ## Architecture
 
 - `AppModel` (`@MainActor @Observable`) owns all state and actions; views are

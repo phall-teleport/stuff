@@ -11,20 +11,85 @@ struct TurnOptions {
     var model: String
     var maxTurns: Int = 0
 
+    /// Anything but bypass means Claude Code will ask before using tools. In
+    /// print mode nobody can answer a terminal prompt, so we tell it to route
+    /// permission requests over stdin/stdout (`--permission-prompt-tool stdio`)
+    /// and answer them from the UI — the same channel the Agent SDK uses.
+    var asksPermission: Bool { !["", "bypass", "bypassPermissions"].contains(permissionMode) }
+
+    /// The prompt itself is not on the command line: it is sent as the first
+    /// stream-json user message on stdin (see `userMessage`).
     var script: String {
         var s = "set -e\n"
         s += "export PATH=\"$HOME/.local/bin:$PATH\"\n"
         s += "mkdir -p \(Shell.quote(workDir)) && cd \(Shell.quote(workDir))\n"
-        s += "exec claude -p --verbose --output-format stream-json"
+        s += "exec claude -p --verbose --output-format stream-json --input-format stream-json"
         s += resume ? " --resume \(sessionID)" : " --session-id \(sessionID)"
-        switch permissionMode {
-        case "", "bypass", "bypassPermissions": s += " --dangerously-skip-permissions"
-        default: s += " --permission-mode \(permissionMode)"
+        if asksPermission {
+            s += " --permission-mode \(permissionMode) --permission-prompt-tool stdio"
+        } else {
+            s += " --dangerously-skip-permissions"
         }
         if !model.isEmpty { s += " --model \(Shell.quote(model))" }
         if maxTurns > 0 { s += " --max-turns \(maxTurns)" }
-        s += " -- \(Shell.quote(prompt))\n"
+        s += "\n"
         return s
+    }
+
+    static func jsonLine(_ obj: [String: Any]) -> String {
+        (try? JSONSerialization.data(withJSONObject: obj)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+
+    /// stream-json user message carrying the prompt.
+    static func userMessage(_ text: String) -> String {
+        jsonLine(["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]]])
+    }
+
+    /// Replies to a `can_use_tool` control request.
+    static func allowResponse(requestID: String, input: [String: Any]) -> String {
+        jsonLine(["type": "control_response", "response": ["subtype": "success", "request_id": requestID,
+                                                             "response": ["behavior": "allow", "updatedInput": input]]])
+    }
+
+    static func denyResponse(requestID: String, message: String) -> String {
+        jsonLine(["type": "control_response", "response": ["subtype": "success", "request_id": requestID,
+                                                             "response": ["behavior": "deny", "message": message]]])
+    }
+
+    static func errorResponse(requestID: String, error: String) -> String {
+        jsonLine(["type": "control_response", "response": ["subtype": "error", "request_id": requestID, "error": error]])
+    }
+}
+
+/// A tool-permission question from Claude Code, awaiting the user's answer.
+struct PermissionRequest: Identifiable, Hashable {
+    var id: String            // request_id
+    var sessionID: String
+    var toolName: String
+    var description: String   // Claude's one-liner, e.g. the file name
+    var summary: String       // command / file path etc.
+    var inputJSON: String
+    var input: [String: Any]
+    var suggestsAcceptEdits: Bool
+
+    static func == (a: PermissionRequest, b: PermissionRequest) -> Bool { a.id == b.id }
+    func hash(into h: inout Hasher) { h.combine(id) }
+
+    init?(event ev: StreamEvent, sessionID: String) {
+        guard ev.type == "control_request",
+              let rid = ev.raw["request_id"] as? String,
+              let req = ev.raw["request"] as? [String: Any],
+              req["subtype"] as? String == "can_use_tool" else { return nil }
+        id = rid
+        self.sessionID = sessionID
+        toolName = req["display_name"] as? String ?? req["tool_name"] as? String ?? "tool"
+        description = req["description"] as? String ?? ""
+        input = req["input"] as? [String: Any] ?? [:]
+        summary = TranscriptItem.toolSummary(input)
+        inputJSON = (try? JSONSerialization.data(withJSONObject: input, options: [.prettyPrinted, .sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let sugg = req["permission_suggestions"] as? [[String: Any]] ?? []
+        suggestsAcceptEdits = sugg.contains { $0["type"] as? String == "setMode" && $0["mode"] as? String == "acceptEdits" }
     }
 }
 

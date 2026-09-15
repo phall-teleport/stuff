@@ -195,7 +195,7 @@ struct ToolInfo: Hashable {
 }
 
 struct TranscriptItem: Identifiable, Hashable {
-    enum Kind: Hashable { case user, systemInit, assistant, thinking, tool, stderr, result }
+    enum Kind: Hashable { case user, systemInit, assistant, thinking, tool, stderr, result, permission }
     var id: String
     var kind: Kind
     var text: String = ""
@@ -211,6 +211,11 @@ extension TranscriptItem {
         switch ev.type {
         case "beamsui.user":
             return [TranscriptItem(id: nextID(), kind: .user, text: ev.raw["text"] as? String ?? "")]
+        case "beamsui.permission":
+            // Our own record of a permission decision, so reloads show it.
+            let allowed = ev.raw["allowed"] as? Bool ?? false
+            let text = "\(allowed ? "allowed" : "denied") \(ev.raw["tool"] as? String ?? "tool") \(ev.raw["summary"] as? String ?? "")"
+            return [TranscriptItem(id: nextID(), kind: .permission, text: text, ok: allowed)]
         case "system" where ev.subtype == "init":
             let sid = (ev.raw["session_id"] as? String ?? "").prefix(8)
             let text = "session \(sid) · \(ev.raw["model"] as? String ?? "") · \(ev.raw["cwd"] as? String ?? "") · \(ev.raw["permissionMode"] as? String ?? "")"

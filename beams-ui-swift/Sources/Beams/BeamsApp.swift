@@ -22,7 +22,8 @@ struct BeamsApp: App {
                 .frame(minWidth: 960, minHeight: 600)
                 .task { await model.boot() }
         }
-        .windowStyle(.hiddenTitleBar)
+        // Standard unified title bar: without it (.hiddenTitleBar) the detail
+        // ScrollView renders up into the title-bar area and overlaps the toolbar.
         .defaultSize(width: 1320, height: 860)
         .commands {
             CommandGroup(replacing: .newItem) {

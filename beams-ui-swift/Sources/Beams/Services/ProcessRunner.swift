@@ -23,11 +23,37 @@ struct NotFoundError: LocalizedError {
     var errorDescription: String? { "\"\(binary)\" not found on PATH. Install it or set its path in Settings." }
 }
 
-/// A handle to a running child so a turn can be stopped.
+/// A handle to a running child so a turn can be stopped, and — when started
+/// with interactive stdin — written to (Claude Code's stream-json control
+/// protocol rides on stdin/stdout).
 final class RunningProcess {
     let process: Process
-    init(_ p: Process) { process = p }
+    private let stdin: FileHandle?
+    private let queue = DispatchQueue(label: "beams.process.stdin")
+    private var closed = false
+
+    init(_ p: Process, stdin: FileHandle? = nil) { process = p; self.stdin = stdin }
+
     func terminate() { if process.isRunning { process.terminate() } }
+
+    /// Writes one line (a JSON message) to the child's stdin.
+    func send(line: String) {
+        guard let stdin else { return }
+        queue.async { [self] in
+            guard !closed else { return }
+            try? stdin.write(contentsOf: Data((line + "\n").utf8))
+        }
+    }
+
+    /// Closes stdin so a stream-json child knows no more input is coming.
+    func closeStdin() {
+        guard let stdin else { return }
+        queue.async { [self] in
+            guard !closed else { return }
+            closed = true
+            try? stdin.close()
+        }
+    }
 }
 
 /// Runs child processes with a terminal-like PATH. GUI apps launched from the
@@ -83,6 +109,7 @@ enum Shell {
     @discardableResult
     static func run(_ argv: [String],
                     stdin: Data? = nil,
+                    interactiveStdin: Bool = false,
                     cwd: String? = nil,
                     extraEnv: [String: String] = [:],
                     onStdoutLine: ((String) -> Void)? = nil,
@@ -103,38 +130,30 @@ enum Shell {
         let outPipe = Pipe(), errPipe = Pipe()
         p.standardOutput = outPipe
         p.standardError = errPipe
-        let inPipe: Pipe? = stdin == nil ? nil : Pipe()
+        let inPipe: Pipe? = (stdin != nil || interactiveStdin) ? Pipe() : nil
         p.standardInput = inPipe ?? FileHandle.nullDevice
 
         try p.run()
-        register?(RunningProcess(p))
+        register?(RunningProcess(p, stdin: interactiveStdin ? inPipe?.fileHandleForWriting : nil))
 
-        if let stdin, let inPipe {
+        if let stdin, let inPipe, !interactiveStdin {
             Task.detached {
                 try? inPipe.fileHandleForWriting.write(contentsOf: stdin)
                 try? inPipe.fileHandleForWriting.close()
             }
         }
 
-        let outTask = Task.detached { () -> Data in
-            if let onStdoutLine {
-                for try await line in outPipe.fileHandleForReading.bytes.lines { onStdoutLine(line) }
-                return Data()
-            }
-            return outPipe.fileHandleForReading.readDataToEndOfFile()
+        // Read on plain background threads, NOT FileHandle.bytes (AsyncBytes):
+        // AsyncBytes stops delivering once we write to the child's stdin, which
+        // deadlocks the interactive permission protocol. A blocking
+        // availableData loop keeps working while we write.
+        let outReader = StreamReader(outPipe.fileHandleForReading, collectRaw: onStdoutLine == nil, onLine: onStdoutLine)
+        let errReader = StreamReader(errPipe.fileHandleForReading, collectRaw: false, onLine: onStderrLine, capText: 64 * 1024)
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async { p.waitUntilExit(); cont.resume() }
         }
-        let errTask = Task.detached { () -> String in
-            var s = ""
-            for try await line in errPipe.fileHandleForReading.bytes.lines {
-                onStderrLine?(line)
-                s += line + "\n"
-                if s.count > 64 * 1024 { s = String(s.suffix(32 * 1024)) }
-            }
-            return s
-        }
-        let outData = try await outTask.value
-        let errText = try await errTask.value
-        await Task.detached { p.waitUntilExit() }.value
+        let outData = outReader.finish()
+        let errText = errReader.finishText()
 
         let res = ProcessResult(status: p.terminationStatus, stdout: outData, stderr: errText)
         if check && !res.ok {
@@ -146,7 +165,69 @@ enum Shell {
     /// Single-quotes s for a POSIX shell.
     static func quote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
+    // (StreamReader lives below.)
+
     static func stripANSI(_ s: String) -> String {
         s.replacingOccurrences(of: #"\u{1b}\[[0-9;]*[A-Za-z]"#, with: "", options: .regularExpression)
+    }
+}
+
+/// Reads a FileHandle to EOF on a background thread with a blocking
+/// availableData loop, splitting into newline-delimited lines. Unlike
+/// FileHandle.bytes (AsyncBytes) it keeps delivering while the parent writes
+/// to the child's stdin, which the interactive permission protocol needs.
+final class StreamReader {
+    private let lock = NSLock()
+    private let doneSem = DispatchSemaphore(value: 0)
+    private var raw = Data()
+    private var text = ""
+    private let collectRaw: Bool
+    private let capText: Int
+
+    init(_ handle: FileHandle, collectRaw: Bool, onLine: ((String) -> Void)?, capText: Int = 0) {
+        self.collectRaw = collectRaw
+        self.capText = capText
+        Thread.detachNewThread { [self] in
+            var buf = Data()
+            while true {
+                let chunk = handle.availableData
+                if chunk.isEmpty { break }
+                if collectRaw { lock.lock(); raw.append(chunk); lock.unlock() }
+                buf.append(chunk)
+                while let nl = buf.firstIndex(of: 0x0A) {
+                    let s = String(decoding: buf[buf.startIndex..<nl], as: UTF8.self)
+                    buf.removeSubrange(buf.startIndex...nl)
+                    if capText > 0 { appendText(s) }
+                    onLine?(s)
+                }
+            }
+            // trailing partial line
+            if !buf.isEmpty {
+                let s = String(decoding: buf, as: UTF8.self)
+                if capText > 0 { appendText(s) }
+                onLine?(s)
+            }
+            doneSem.signal()
+        }
+    }
+
+    /// Waits for EOF and returns the raw bytes (empty unless collectRaw).
+    func finish() -> Data {
+        doneSem.wait()
+        lock.lock(); defer { lock.unlock() }
+        return raw
+    }
+
+    func finishText() -> String {
+        doneSem.wait()
+        lock.lock(); defer { lock.unlock() }
+        return text
+    }
+
+    /// Records a line into the capped text buffer (used for stderr).
+    func appendText(_ line: String) {
+        lock.lock(); defer { lock.unlock() }
+        text += line + "\n"
+        if capText > 0 && text.count > capText { text = String(text.suffix(capText / 2)) }
     }
 }

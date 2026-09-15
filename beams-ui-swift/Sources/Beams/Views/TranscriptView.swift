@@ -11,7 +11,10 @@ struct TranscriptView: View {
                     ForEach(model.items[sessionID] ?? []) { item in
                         TranscriptRow(item: item)
                     }
-                    if model.busy.contains(sessionID) {
+                    if let req = model.pendingPermissions[sessionID]?.first {
+                        PermissionCard(request: req, queued: (model.pendingPermissions[sessionID]?.count ?? 1) - 1)
+                            .padding(.leading, 30)
+                    } else if model.busy.contains(sessionID) {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
                             Text(thinkingLabel).font(.caption.monospaced()).foregroundStyle(.secondary)
@@ -25,6 +28,9 @@ struct TranscriptView: View {
                 .frame(maxWidth: .infinity)
             }
             .onChange(of: model.items[sessionID]?.count ?? 0) { _, _ in
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: model.pendingPermissions[sessionID]?.count ?? 0) { _, _ in
                 withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -56,6 +62,7 @@ struct TranscriptRow: View {
         case .thinking: return "∴"
         case .stderr: return "·"
         case .result: return item.ok ? "✓" : "✕"
+        case .permission: return item.ok ? "✓" : "⊘"
         }
     }
 
@@ -63,6 +70,7 @@ struct TranscriptRow: View {
         switch item.kind {
         case .user, .assistant: return .accentColor
         case .result: return item.ok ? .secondary : .red
+        case .permission: return item.ok ? .green : .orange
         default: return .secondary
         }
     }
@@ -81,6 +89,8 @@ struct TranscriptRow: View {
             if let t = item.tool { ToolCard(tool: t) }
         case .systemInit, .thinking:
             Text(item.text).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+        case .permission:
+            Text(item.text).font(.caption.monospaced()).foregroundStyle(item.ok ? Color.secondary : Color.orange).textSelection(.enabled)
         case .stderr:
             Text(item.text).font(.caption.monospaced()).foregroundStyle(.tertiary).textSelection(.enabled)
         case .result:
@@ -89,6 +99,47 @@ struct TranscriptRow: View {
                 Text(item.text).font(.caption.monospaced()).foregroundStyle(item.ok ? Color.secondary : Color.red).textSelection(.enabled)
             }
         }
+    }
+}
+
+// MARK: - Permission prompt (inline, like the CLI's)
+
+struct PermissionCard: View {
+    @Environment(AppModel.self) private var model
+    let request: PermissionRequest
+    let queued: Int
+    @StateObject private var showInput = LocalFlag()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
+                Text("Claude wants to use").foregroundStyle(.secondary)
+                Text(request.toolName).font(.body.monospaced().weight(.semibold))
+                if queued > 0 { Text("+\(queued) more waiting").font(.caption).foregroundStyle(.tertiary) }
+                Spacer()
+            }
+            if !request.summary.isEmpty || !request.description.isEmpty {
+                Text(request.summary.isEmpty ? request.description : request.summary)
+                    .font(.callout.monospaced()).textSelection(.enabled).lineLimit(6)
+            }
+            Button(showInput.on ? "Hide details" : "Show details") { withAnimation { showInput.on.toggle() } }
+                .buttonStyle(.link).font(.caption)
+            if showInput.on { CodeBlock(text: request.inputJSON) }
+            HStack(spacing: 8) {
+                Button("Allow") { model.answer(request, allow: true) }
+                    .buttonStyle(.borderedProminent).keyboardShortcut("y", modifiers: [])
+                Button("Allow all this turn") { model.answer(request, allow: true, allRestOfTurn: true) }
+                    .buttonStyle(.bordered).keyboardShortcut("a", modifiers: [.command, .shift])
+                Button("Deny") { model.answer(request, allow: false) }
+                    .buttonStyle(.bordered).tint(.red).keyboardShortcut("n", modifiers: [])
+                Spacer()
+                Text("Y allow · N deny").font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.5)))
     }
 }
 

@@ -108,7 +108,28 @@ struct BeamRow: View {
             Button("Delete beam…", role: .destructive) { model.deleteBeam(beam) }
         }
         .listRowBackground(model.current?.beamId == beam.id ? Color.accentColor.opacity(0.12) : nil)
-        .help("id: \(beam.id)\nowner: \(beam.raw["owner"] ?? "")\nexpires: \(beam.raw["expires"] ?? "")")
+        .help(tooltip)
+    }
+
+    private var tooltip: String {
+        var lines = [beam.name]
+        if let region = beam.raw["region"], !region.isEmpty { lines.append("Region: \(region)") }
+        lines.append("Expires: \(Self.expiry(beam.raw["expires"]))")
+        if let owner = beam.raw["owner"], !owner.isEmpty { lines.append("Owner: \(owner)") }
+        lines.append("ID: \(beam.id)")
+        return lines.joined(separator: "\n")
+    }
+
+    /// "Sep 12, 4:34 PM (in 3h)" from an RFC3339 timestamp; raw value if unparseable.
+    static func expiry(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "unknown" }
+        guard let date = RFC3339.parse(raw) else { return raw }
+        let f = DateFormatter(); f.dateFormat = "MMM d, h:mm a"
+        let rel = RelativeDateTimeFormatter()
+        rel.unitsStyle = .short
+        let now = Date()
+        let phrase = date < now ? "expired" : rel.localizedString(for: date, relativeTo: now)
+        return "\(f.string(from: date)) (\(phrase))"
     }
 }
 
@@ -170,8 +191,11 @@ struct MainView: View {
                 EmptyState()
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle(model.current.map { $0.title.isEmpty ? "Session on \($0.beamName)" : $0.title } ?? "Beams")
         .navigationSubtitle(model.current.map { "\($0.beamName) · \($0.id.prefix(8))" } ?? "")
+        .toolbarBackground(.visible, for: .windowToolbar)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if let s = model.current, let latest = s.publishedUrls.last {

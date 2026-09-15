@@ -20,11 +20,13 @@ struct SettingsView: View {
                 TextField("Beam login", text: $m.config.login, prompt: Text("(cluster default)"))
                 TextField("Working directory", text: $m.config.workDir, prompt: Text("/home/beams/work"))
                 Picker("Permissions", selection: $m.config.permissionMode) {
-                    Text("Bypass (sandbox default)").tag("bypass")
-                    Text("Accept edits").tag("acceptEdits")
-                    Text("Plan only").tag("plan")
-                    Text("Default").tag("default")
+                    Text("Bypass — never asks (sandbox default)").tag("bypass")
+                    Text("Default — asks before each tool").tag("default")
+                    Text("Accept edits — asks only for commands").tag("acceptEdits")
+                    Text("Plan only — read-only").tag("plan")
                 }
+                Text("When Claude asks, an Allow / Deny card appears in the transcript (Y / N).")
+                    .font(.caption).foregroundStyle(.secondary)
                 Picker("Model", selection: $m.config.model) {
                     Text("Beam default").tag("")
                     Text("claude-sonnet-5").tag("claude-sonnet-5")
