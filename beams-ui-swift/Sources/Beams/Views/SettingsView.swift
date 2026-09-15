@@ -3,6 +3,9 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
 
+    static let claudeModels = ["claude-sonnet-5", "claude-opus-5[1m]", "claude-opus-4-6[1m]"]
+    static let codexModels = ["gpt-5-codex", "gpt-5", "o4-mini"]
+
     var body: some View {
         @Bindable var m = model
         Form {
@@ -27,12 +30,22 @@ struct SettingsView: View {
                 }
                 Text("When Claude asks, an Allow / Deny card appears in the transcript (Y / N).")
                     .font(.caption).foregroundStyle(.secondary)
-                Picker("Model", selection: $m.config.model) {
-                    Text("Beam default").tag("")
-                    Text("claude-sonnet-5").tag("claude-sonnet-5")
-                    Text("claude-opus-5[1m]").tag("claude-opus-5[1m]")
-                    Text("claude-opus-4-6[1m]").tag("claude-opus-4-6[1m]")
+                Picker("Agent", selection: $m.config.agent) {
+                    Text("Claude Code (Anthropic)").tag("claude")
+                    Text("Codex (OpenAI)").tag("codex")
                 }
+                .onChange(of: model.config.agent) { _, _ in model.config.model = "" }
+                Picker("Model", selection: $m.config.model) {
+                    Text(model.config.agent == "codex" ? "Codex default" : "Beam default").tag("")
+                    ForEach(model.config.agent == "codex" ? Self.codexModels : Self.claudeModels, id: \.self) { Text($0).tag($0) }
+                }
+                if model.config.agent == "codex" {
+                    Text("Codex runs with approvals bypassed (beams are sandboxed). Permission prompts don't apply.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Section("Experimental") {
+                Toggle("Persistent session — keep one agent process alive per session (faster turns)", isOn: $m.config.persistentSession)
             }
             Section("Published apps") {
                 Toggle("Open apps Claude publishes from a beam in my browser automatically",

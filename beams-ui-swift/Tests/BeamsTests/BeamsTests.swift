@@ -80,6 +80,45 @@ import Foundation
     #expect(MarkdownBlocks.linkify("[docs](https://d.example.com)") == "[docs](https://d.example.com)")
 }
 
+@Test func codexTurnScript() {
+    let t = CodexTurn(workDir: "/home/beams/work", model: "gpt-5-codex", prompt: "make a thing", resumeThread: "")
+    #expect(t.script.contains("codex exec --json"))
+    #expect(t.script.contains("--dangerously-bypass-approvals-and-sandbox"))
+    #expect(t.script.contains("-m 'gpt-5-codex'"))
+    #expect(t.script.contains("-- 'make a thing'"))
+    #expect(!t.script.contains("resume"))
+    #expect(!t.script.contains("--color"))   // `codex exec resume` rejects --color
+    let r = CodexTurn(workDir: "/w", model: "", prompt: "x", resumeThread: "01a0")
+    #expect(r.script.contains("codex exec resume '01a0' --json"))
+    #expect(!r.script.contains("--color"))
+}
+
+@Test func codexEventMapping() throws {
+    var seq = 0
+    let started = try #require(StreamEvent(line: #"{"type":"thread.started","thread_id":"01a0a64b-9408-7441"}"#))
+    let (i0, tid) = CodexEvents.items(from: started, seq: &seq)
+    #expect(tid == "01a0a64b-9408-7441")
+    #expect(i0.first?.kind == .systemInit)
+
+    let msg = try #require(StreamEvent(line: #"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I'll create z.txt."}}"#))
+    #expect(CodexEvents.items(from: msg, seq: &seq).items.first?.kind == .assistant)
+
+    let fc = try #require(StreamEvent(line: #"{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/home/beams/work/codextest/z.txt","kind":"add"}],"status":"completed"}}"#))
+    let fcItem = CodexEvents.items(from: fc, seq: &seq).items.first
+    #expect(fcItem?.kind == .tool)
+    #expect(fcItem?.tool?.name == "Edit")
+    #expect(fcItem?.tool?.summary == "z.txt")
+
+    let done = try #require(StreamEvent(line: #"{"type":"turn.completed","usage":{"input_tokens":20422,"output_tokens":142}}"#))
+    let dItem = CodexEvents.items(from: done, seq: &seq).items.first
+    #expect(dItem?.kind == .result && dItem?.ok == true)
+    #expect(dItem?.text.contains("20422 in") == true)
+
+    #expect(CodexEvents.isCodexLine(started) && !CodexEvents.isCodexLine(msg) == false)
+    let claudeEv = try #require(StreamEvent(line: #"{"type":"assistant","message":{"content":[]}}"#))
+    #expect(!CodexEvents.isCodexLine(claudeEv))
+}
+
 @Test func beamExpiryFormatting() {
     #expect(BeamRow.expiry(nil) == "unknown")
     #expect(BeamRow.expiry("") == "unknown")

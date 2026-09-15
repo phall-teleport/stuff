@@ -50,8 +50,8 @@ struct TshClient: BeamClient {
         return a + sub
     }
 
-    private func runJSON(_ sub: [String]) async throws -> Any {
-        let res = try await Shell.run(args(sub))
+    private func runJSON(_ sub: [String], timeout: TimeInterval = 45) async throws -> Any {
+        let res = try await Shell.run(args(sub), timeout: timeout)
         var data = res.stdout
         // tsh may print a login banner before the JSON; skip to the first bracket.
         if let i = data.firstIndex(where: { $0 == UInt8(ascii: "[") || $0 == UInt8(ascii: "{") }) {
@@ -67,12 +67,12 @@ struct TshClient: BeamClient {
     }
 
     func create() async throws -> Beam {
-        let row = try await runJSON(["beams", "add", "-f", "json", "--no-console"]) as? [String: Any] ?? [:]
+        let row = try await runJSON(["beams", "add", "-f", "json", "--no-console"], timeout: 180) as? [String: Any] ?? [:]
         return Beam(row: row)
     }
 
     func delete(id: String) async throws {
-        try await Shell.run(args(["beams", "rm", id]))
+        try await Shell.run(args(["beams", "rm", id]), timeout: 60)
     }
 
     /// tsh joins the remaining args with spaces for the remote shell, so the
@@ -108,7 +108,7 @@ struct TshClient: BeamClient {
             return st
         }
         st.tshFound = true; st.tshPath = path
-        let res = try? await Shell.run([bin, "status", "-f", "json"], check: false)
+        let res = try? await Shell.run([bin, "status", "-f", "json"], timeout: 30, check: false)
         guard var data = res?.stdout else { st.message = "Not logged in to Teleport."; return st }
         if let i = data.firstIndex(of: UInt8(ascii: "{")) { data = data[i...] }
         guard !data.isEmpty, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {

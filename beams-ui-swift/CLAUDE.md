@@ -50,6 +50,38 @@ turn hangs forever and the UI stacks retries). `Shell.run` reads stdout/stderr
 with `StreamReader`, a blocking `availableData` loop on a `Thread`. Keep it that
 way. Verified 2026-09-15: AsyncBytes hangs, StreamReader completes cleanly.
 
+## tsh serializes on a credential lock
+
+Concurrent `tsh` commands contend on a per-key file lock in `~/.tsh`; while one
+holds it, others block (seen as `could not acquire lock for TLS credential`, or
+just a hang). A pile of background `tsh` probes will freeze the app's
+`beams ls`, leaving an empty sidebar with no error. `Shell.run` now takes a
+`timeout:` and `TshClient` uses it (ls/status 30-45s, create 180s, rm 60s) so a
+wedged call surfaces an error instead of hanging. Don't run many concurrent
+`tsh` commands against the same profile.
+
+## Agents: Claude Code and Codex
+
+`config.agent` selects the CLI run in the beam: `claude` (default) or `codex`.
+Codex uses `codex exec --json --color never --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -m <model> -- <prompt>`;
+context continues across turns via `codex exec resume <thread_id>` (thread id
+captured from the `thread.started` event, stored on `Session.codexThread`).
+Codex JSONL events (`thread.started`, `item.completed` with agent_message /
+file_change / command_execution, `turn.completed`) map to the shared
+`TranscriptItem` model in `CodexEvents`. Codex has no interactive permission
+protocol — beams are externally sandboxed, so approvals are bypassed. Model
+lists live in `SettingsView` (`claudeModels`, `codexModels`). Codex flag note:
+it's `--color never`, NOT `--no-color`. Codex turns are slow (minutes).
+
+## Persistent session mode (experimental)
+
+`config.persistentSession` (or `BEAMSUI_PERSISTENT=1`) keeps ONE
+`claude -p --input-format stream-json` process alive per session and feeds each
+turn as a stream-json user message — verified a single process handles turns in
+sequence with context preserved, removing per-turn tsh+claude startup.
+`runTurnPersistent` starts it once; `result` clears per-turn state without
+closing stdin; `endPersistent` tears it down. Codex always runs per-turn.
+
 ## Architecture
 
 - `AppModel` (`@MainActor @Observable`) owns all state and actions; views are

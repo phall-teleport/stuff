@@ -47,6 +47,10 @@ final class AppModel {
     var pendingPermissions: [String: [PermissionRequest]] = [:]
     /// Sessions where the user chose "allow everything for the rest of this turn".
     private var allowAllThisTurn: Set<String> = []
+    // Persistent-session mode bookkeeping.
+    private var lifeTasks: [String: Task<Void, Never>] = [:]
+    private var persistentActive: Set<String> = []
+    private var turnStart: [String: Date] = [:]
     var probeHint = ""
     var composer = ""
 
@@ -192,8 +196,12 @@ final class AppModel {
             var list: [TranscriptItem] = []
             for ln in store.readTranscript(id) {
                 guard let ev = StreamEvent(line: ln) else { continue }
-                list += TranscriptItem.items(from: ev, seq: &seqN)
-                TranscriptItem.attachToolResults(from: ev, into: &list)
+                if CodexEvents.isCodexLine(ev) {
+                    list += CodexEvents.items(from: ev, seq: &seqN).items
+                } else {
+                    list += TranscriptItem.items(from: ev, seq: &seqN)
+                    TranscriptItem.attachToolResults(from: ev, into: &list)
+                }
             }
             items[id] = list
             seq[id] = seqN
@@ -212,6 +220,7 @@ final class AppModel {
         let name = s.title.isEmpty ? "this session" : "\"\(s.title)\""
         let removeLocal: () -> Void = { [self] in
             stop(s.id)
+            endPersistent(s.id)
             do { try store.deleteSession(s.id) } catch { fail(error) }
             sessions.removeAll { $0.id == s.id }
             items[s.id] = nil
@@ -261,12 +270,32 @@ final class AppModel {
         Task { await runTurn(sessionID: s.id, prompt: prompt) }
     }
 
+    /// Persistent-session mode: keep one Claude process alive per session and
+    /// feed each turn to it. Env override `BEAMSUI_PERSISTENT=1` forces it on.
+    var usePersistent: Bool { config.persistentSession || ProcessInfo.processInfo.environment["BEAMSUI_PERSISTENT"] == "1" }
+
+    private func recordUserTurn(_ sessionID: String, _ prompt: String) {
+        if var s = sessions.first(where: { $0.id == sessionID }) {
+            if s.title.isEmpty { s.title = String(prompt.split(separator: "\n").first.map(String.init)?.prefix(80) ?? "") }
+            s.updated = Date()
+            updateSession(sessionID) { $0 = s }
+        }
+        let userLine = ["type": "beamsui.user", "text": prompt, "ts": RFC3339.string(Date())]
+        if let d = try? JSONSerialization.data(withJSONObject: userLine), let ln = String(data: d, encoding: .utf8) {
+            store.appendTranscript(sessionID, line: ln)
+            if let ev = StreamEvent(line: ln) { ingest(sessionID, ev) }
+        }
+    }
+
     private func runTurn(sessionID: String, prompt: String) async {
+        if config.agent == "codex" { runCodexTurn(sessionID: sessionID, prompt: prompt); return }
+        if usePersistent { runTurnPersistent(sessionID: sessionID, prompt: prompt); return }
         guard var s = sessions.first(where: { $0.id == sessionID }) else { return }
         busy.insert(sessionID)
         if s.title.isEmpty { s.title = String(prompt.split(separator: "\n").first.map(String.init)?.prefix(80) ?? "") }
         s.updated = Date()
         updateSession(sessionID) { $0 = s }
+        turnStart[sessionID] = Date()
 
         let userLine = ["type": "beamsui.user", "text": prompt, "ts": RFC3339.string(Date())]
         if let d = try? JSONSerialization.data(withJSONObject: userLine), let ln = String(data: d, encoding: .utf8) {
@@ -297,6 +326,7 @@ final class AppModel {
         pendingPermissions[sessionID] = nil
         allowAllThisTurn.remove(sessionID)
         busy.remove(sessionID)
+        logTurnLatency(sessionID)
         if !errMsg.isEmpty {
             appendItem(sessionID, TranscriptItem(id: nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
             if TshClient.isAuthError(ProcessError(command: "", status: 1, stderr: errMsg)) || errMsg.contains("not found") { _ = await checkTsh() }
@@ -308,7 +338,130 @@ final class AppModel {
 
     func stop(_ id: String? = nil) {
         guard let id = id ?? currentID, let p = running[id] else { return }
-        p.terminate()
+        p.terminate()  // in persistent mode this ends the session process; next turn restarts with --resume
+    }
+
+    // MARK: persistent-session turns
+
+    /// One long-lived Claude process per session; turns are stream-json user
+    /// messages sent to it (no per-turn tsh/claude startup). Verified that a
+    /// single `claude -p --input-format stream-json` handles turns in sequence.
+    private func runTurnPersistent(sessionID: String, prompt: String) {
+        guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
+        busy.insert(sessionID)
+        turnStart[sessionID] = Date()
+        recordUserTurn(sessionID, prompt)
+        let msg = TurnOptions.userMessage(prompt)
+
+        // Process already alive → just send the next turn.
+        if persistentActive.contains(sessionID), let p = running[sessionID] {
+            p.send(line: msg)
+            return
+        }
+
+        // Start the session process; it stays up for later turns.
+        let opts = TurnOptions(sessionID: sessionID, resume: s.turns > 0, workDir: config.workDir,
+                               prompt: "", permissionMode: config.permissionMode, model: config.model)
+        persistentActive.insert(sessionID)
+        lifeTasks[sessionID] = Task { [weak self] in
+            guard let self else { return }
+            var errMsg = ""
+            do {
+                try await self.client.run(id: s.beamId, script: opts.script, stdin: nil, interactiveStdin: true,
+                    onStdoutLine: { line in Task { @MainActor in self.handleLine(sessionID, line) } },
+                    onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },
+                    register: { p in Task { @MainActor in self.running[sessionID] = p; p.send(line: msg) } })
+            } catch {
+                errMsg = error.localizedDescription
+            }
+            await MainActor.run {
+                self.running[sessionID] = nil
+                self.persistentActive.remove(sessionID)
+                self.lifeTasks[sessionID] = nil
+                self.pendingPermissions[sessionID] = nil
+                self.allowAllThisTurn.remove(sessionID)
+                let wasBusy = self.busy.remove(sessionID) != nil
+                // If the process died mid-turn (not a clean stop), surface it.
+                if wasBusy && !errMsg.isEmpty && !errMsg.lowercased().contains("cancel") {
+                    self.appendItem(sessionID, TranscriptItem(id: self.nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
+                    if TshClient.isAuthError(ProcessError(command: "", status: 1, stderr: errMsg)) { Task { _ = await self.checkTsh() } }
+                }
+            }
+        }
+    }
+
+    // MARK: Codex turns
+
+    /// Runs one `codex exec` turn (OpenAI Codex CLI). Codex has no interactive
+    /// permission protocol — beams are externally sandboxed, so approvals are
+    /// bypassed. Context continues via the thread id captured on thread.started.
+    private func runCodexTurn(sessionID: String, prompt: String) {
+        guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
+        busy.insert(sessionID)
+        turnStart[sessionID] = Date()
+        recordUserTurn(sessionID, prompt)
+        let turn = CodexTurn(workDir: config.workDir, model: config.model, prompt: prompt, resumeThread: s.codexThread)
+        Task { [weak self] in
+            guard let self else { return }
+            var errMsg = ""
+            do {
+                try await self.client.run(id: s.beamId, script: turn.script, stdin: nil, interactiveStdin: false,
+                    onStdoutLine: { line in Task { @MainActor in self.handleCodexLine(sessionID, line) } },
+                    onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },
+                    register: { p in Task { @MainActor in self.running[sessionID] = p } })
+            } catch { errMsg = self.running[sessionID] == nil ? "stopped" : error.localizedDescription }
+            await MainActor.run {
+                self.running[sessionID] = nil
+                let wasBusy = self.busy.remove(sessionID) != nil
+                self.logTurnLatency(sessionID)
+                if wasBusy && !errMsg.isEmpty && errMsg != "stopped" {
+                    self.appendItem(sessionID, TranscriptItem(id: self.nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
+                    if TshClient.isAuthError(ProcessError(command: "", status: 1, stderr: errMsg)) { Task { _ = await self.checkTsh() } }
+                } else if errMsg.isEmpty && self.config.github.autoSync {
+                    Task { await self.pullMemory(sessionID, quiet: true); await self.syncNow(sessionID) }
+                }
+            }
+        }
+    }
+
+    private func handleCodexLine(_ id: String, _ line: String) {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        guard t.hasPrefix("{"), let ev = StreamEvent(line: t) else { appendStderr(id, t); return }
+        store.appendTranscript(id, line: t)
+        var n = seq[id, default: 0]
+        let (newItems, threadID) = CodexEvents.items(from: ev, seq: &n)
+        seq[id] = n
+        items[id, default: []] += newItems
+        if let threadID { updateSession(id) { $0.codexThread = threadID } }
+        notePublished(id, t)
+        if ev.type == "turn.completed" { updateSession(id) { $0.turns += 1; $0.updated = Date() } }
+    }
+
+    /// Ends a session's persistent process (on delete / quit).
+    func endPersistent(_ sessionID: String) {
+        running[sessionID]?.closeStdin()
+        running[sessionID]?.terminate()
+        lifeTasks[sessionID]?.cancel()
+    }
+
+    /// Called from `ingest` when a turn's result arrives in persistent mode:
+    /// the process stays alive, so clear per-turn state here instead.
+    private func finishPersistentTurn(_ sessionID: String) {
+        busy.remove(sessionID)
+        pendingPermissions[sessionID] = nil
+        allowAllThisTurn.remove(sessionID)
+        logTurnLatency(sessionID)
+        if config.github.autoSync {
+            Task { await pullMemory(sessionID, quiet: true); await syncNow(sessionID) }
+        }
+    }
+
+    private func logTurnLatency(_ sessionID: String) {
+        guard let start = turnStart[sessionID] else { return }
+        let wall = Date().timeIntervalSince(start) * 1000
+        NSLog("[beams] turn %@ wall=%.0fms mode=%@", sessionID.prefix(8).description, wall, usePersistent ? "persistent" : "per-turn")
+        turnStart[sessionID] = nil
     }
 
     // MARK: permission prompts (Claude Code control protocol)
@@ -382,8 +535,13 @@ final class AppModel {
             if let rid = ev.raw["request_id"] as? String { pendingPermissions[id]?.removeAll { $0.id == rid } }
             return
         case "result":
-            // stream-json input keeps Claude waiting for more; tell it we're done.
-            running[id]?.closeStdin()
+            if usePersistent && persistentActive.contains(id) {
+                // Process stays alive for the next turn; clear per-turn state here.
+                finishPersistentTurn(id)
+            } else {
+                // stream-json input keeps Claude waiting for more; tell it we're done.
+                running[id]?.closeStdin()
+            }
         default:
             break
         }

@@ -112,6 +112,7 @@ enum Shell {
                     interactiveStdin: Bool = false,
                     cwd: String? = nil,
                     extraEnv: [String: String] = [:],
+                    timeout: TimeInterval? = nil,
                     onStdoutLine: ((String) -> Void)? = nil,
                     onStderrLine: ((String) -> Void)? = nil,
                     register: ((RunningProcess) -> Void)? = nil,
@@ -136,6 +137,19 @@ enum Shell {
         try p.run()
         register?(RunningProcess(p, stdin: interactiveStdin ? inPipe?.fileHandleForWriting : nil))
 
+        // Guard against a wedged child (e.g. tsh blocked on a credential lock)
+        // so callers never hang forever with no feedback.
+        var timedOut = false
+        let timeoutItem: DispatchWorkItem?
+        if let timeout {
+            let item = DispatchWorkItem { if p.isRunning { timedOut = true; p.terminate() } }
+            timeoutItem = item
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: item)
+        } else {
+            timeoutItem = nil
+        }
+        defer { timeoutItem?.cancel() }
+
         if let stdin, let inPipe, !interactiveStdin {
             Task.detached {
                 try? inPipe.fileHandleForWriting.write(contentsOf: stdin)
@@ -155,6 +169,10 @@ enum Shell {
         let outData = outReader.finish()
         let errText = errReader.finishText()
 
+        if timedOut {
+            throw ProcessError(command: argv.prefix(3).joined(separator: " "), status: -1,
+                               stderr: "timed out after \(Int(timeout ?? 0))s (tsh may be waiting on a credential lock — is another tsh command running?)")
+        }
         let res = ProcessResult(status: p.terminationStatus, stdout: outData, stderr: errText)
         if check && !res.ok {
             throw ProcessError(command: argv.prefix(3).joined(separator: " "), status: res.status, stderr: errText)

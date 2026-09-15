@@ -44,10 +44,11 @@ struct Session: Codable, Identifiable, Hashable {
     var lastSync: String = ""
     var lastError: String = ""
     var publishedUrls: [String] = []
+    var codexThread: String = ""   // Codex thread id, for `codex exec resume`
 
     // Explicit because providing both init(from:) and encode(to:) disables synthesis.
     enum CodingKeys: String, CodingKey {
-        case id, beamId, beamName, title, created, updated, turns, costUsd, lastSync, lastError, publishedUrls
+        case id, beamId, beamName, title, created, updated, turns, costUsd, lastSync, lastError, publishedUrls, codexThread
     }
 
     init(id: String, beamId: String, beamName: String) {
@@ -68,6 +69,7 @@ struct Session: Codable, Identifiable, Hashable {
         lastSync = try c.decodeIfPresent(String.self, forKey: .lastSync) ?? ""
         lastError = try c.decodeIfPresent(String.self, forKey: .lastError) ?? ""
         publishedUrls = try c.decodeIfPresent([String].self, forKey: .publishedUrls) ?? []
+        codexThread = try c.decodeIfPresent(String.self, forKey: .codexThread) ?? ""
     }
 
     func encode(to encoder: Encoder) throws {
@@ -83,6 +85,7 @@ struct Session: Codable, Identifiable, Hashable {
         try c.encode(lastSync, forKey: .lastSync)
         try c.encode(lastError, forKey: .lastError)
         try c.encode(publishedUrls, forKey: .publishedUrls)
+        try c.encode(codexThread, forKey: .codexThread)
     }
 }
 
@@ -131,9 +134,13 @@ struct Config: Codable, Equatable {
     var login: String = ""
     var workDir: String = "/home/beams/work"
     var permissionMode: String = "bypass"
+    var agent: String = "claude"      // "claude" | "codex"
     var model: String = ""
     var disableAutoOpenApps: Bool = false
     var terminalApp: String = ""      // "", "iterm", "terminal"
+    /// Experimental: keep one Claude process alive per session and feed each
+    /// turn to it, instead of spawning tsh+claude per turn.
+    var persistentSession: Bool = false
     var github: GitHubConfig = GitHubConfig()
 
     init() {}
@@ -147,9 +154,11 @@ struct Config: Codable, Equatable {
         workDir = try c.decodeIfPresent(String.self, forKey: .workDir) ?? "/home/beams/work"
         if workDir.isEmpty { workDir = "/home/beams/work" }
         permissionMode = try c.decodeIfPresent(String.self, forKey: .permissionMode) ?? "bypass"
+        agent = try c.decodeIfPresent(String.self, forKey: .agent) ?? "claude"
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         disableAutoOpenApps = try c.decodeIfPresent(Bool.self, forKey: .disableAutoOpenApps) ?? false
         terminalApp = try c.decodeIfPresent(String.self, forKey: .terminalApp) ?? ""
+        persistentSession = try c.decodeIfPresent(Bool.self, forKey: .persistentSession) ?? false
         github = try c.decodeIfPresent(GitHubConfig.self, forKey: .github) ?? GitHubConfig()
     }
 }
