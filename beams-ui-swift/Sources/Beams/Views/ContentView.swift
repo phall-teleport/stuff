@@ -87,6 +87,7 @@ struct BeamRow: View {
     @Environment(AppModel.self) private var model
     let beam: Beam
     @StateObject private var hover = LocalFlag()
+    @StateObject private var pop = HoverPopover()
 
     var body: some View {
         HStack(spacing: 8) {
@@ -100,7 +101,10 @@ struct BeamRow: View {
             }
         }
         .contentShape(Rectangle())
-        .onHover { hover.on = $0 }
+        .onHover { h in hover.on = h; if h { pop.enter() } else { pop.exit() } }
+        .popover(isPresented: Binding(get: { pop.shown }, set: { if !$0 { pop.exit() } }), arrowEdge: .trailing) {
+            BeamInfoPopover(beam: beam)
+        }
         .onTapGesture { Task { await model.startSession(on: beam) } }
         .contextMenu {
             Button("New session on \(beam.name)") { Task { await model.startSession(on: beam) } }
@@ -108,16 +112,6 @@ struct BeamRow: View {
             Button("Delete beam…", role: .destructive) { model.deleteBeam(beam) }
         }
         .listRowBackground(model.current?.beamId == beam.id ? Color.accentColor.opacity(0.12) : nil)
-        .help(tooltip)
-    }
-
-    private var tooltip: String {
-        var lines = [beam.name]
-        if let region = beam.raw["region"], !region.isEmpty { lines.append("Region: \(region)") }
-        lines.append("Expires: \(Self.expiry(beam.raw["expires"]))")
-        if let owner = beam.raw["owner"], !owner.isEmpty { lines.append("Owner: \(owner)") }
-        lines.append("ID: \(beam.id)")
-        return lines.joined(separator: "\n")
     }
 
     /// "Sep 12, 4:34 PM (in 3h)" from an RFC3339 timestamp; raw value if unparseable.
@@ -130,6 +124,30 @@ struct BeamRow: View {
         let now = Date()
         let phrase = date < now ? "expired" : rel.localizedString(for: date, relativeTo: now)
         return "\(f.string(from: date)) (\(phrase))"
+    }
+}
+
+/// Region and expiration shown when hovering a sandbox row.
+struct BeamInfoPopover: View {
+    let beam: Beam
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(beam.name).font(.headline)
+            row("Region", beam.raw["region"] ?? "unknown")
+            row("Expires", BeamRow.expiry(beam.raw["expires"]))
+            if let owner = beam.raw["owner"], !owner.isEmpty { row("Owner", owner) }
+            row("ID", beam.id)
+        }
+        .padding(12)
+        .frame(minWidth: 220, alignment: .leading)
+    }
+
+    private func row(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 56, alignment: .leading)
+            Text(value).font(.callout).textSelection(.enabled)
+        }
     }
 }
 
