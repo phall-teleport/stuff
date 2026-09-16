@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fun Things to Do in Seattle</title>
+<style>
+  :root {
+    --sky-top: #ff9d5c;
+    --sky-mid: #ff6f91;
+    --sky-low: #6a5acd;
+    --night: #0d1b3e;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    color: #fff;
+    background: linear-gradient(to bottom, var(--sky-top) 0%, var(--sky-mid) 35%, var(--sky-low) 65%, var(--night) 100%);
+    min-height: 100vh;
+    overflow-x: hidden;
+    position: relative;
+  }
+
+  /* stars */
+  .stars {
+    position: fixed;
+    top: 0; left: 0; width: 100%; height: 100%;
+    background-image:
+      radial-gradient(1px 1px at 20% 15%, white, transparent),
+      radial-gradient(1px 1px at 60% 10%, white, transparent),
+      radial-gradient(2px 2px at 80% 20%, white, transparent),
+      radial-gradient(1px 1px at 35% 25%, white, transparent),
+      radial-gradient(1px 1px at 90% 8%, white, transparent),
+      radial-gradient(1px 1px at 10% 30%, white, transparent),
+      radial-gradient(2px 2px at 50% 5%, white, transparent);
+    opacity: 0.7;
+    z-index: 0;
+    pointer-events: none;
+  }
+
+  /* Space Needle silhouette, fixed to bottom center */
+  .space-needle {
+    position: fixed;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 340px;
+    height: 78vh;
+    z-index: 1;
+    pointer-events: none;
+    opacity: 0.92;
+    filter: drop-shadow(0 0 25px rgba(255, 210, 120, 0.25));
+  }
+
+  .skyline {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 22vh;
+    z-index: 1;
+    pointer-events: none;
+    opacity: 0.85;
+  }
+
+  main {
+    position: relative;
+    z-index: 2;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 60px 24px 120px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 50px;
+  }
+
+  header h1 {
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    margin: 0 0 10px;
+    text-shadow: 0 2px 12px rgba(0,0,0,0.4);
+    letter-spacing: 1px;
+  }
+
+  header p {
+    font-size: 1.1rem;
+    opacity: 0.9;
+    text-shadow: 0 1px 6px rgba(0,0,0,0.4);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 22px;
+  }
+
+  .card {
+    background: rgba(13, 20, 45, 0.55);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 16px;
+    padding: 22px;
+    backdrop-filter: blur(6px);
+    transition: transform 0.2s ease, background 0.2s ease;
+  }
+
+  .card:hover {
+    transform: translateY(-4px);
+    background: rgba(13, 20, 45, 0.75);
+  }
+
+  .card .emoji {
+    font-size: 2rem;
+    margin-bottom: 10px;
+    display: block;
+  }
+
+  .card h2 {
+    margin: 0 0 8px;
+    font-size: 1.2rem;
+  }
+
+  .card p {
+    margin: 0;
+    font-size: 0.95rem;
+    opacity: 0.85;
+    line-height: 1.4;
+  }
+
+  footer {
+    position: relative;
+    z-index: 2;
+    text-align: center;
+    padding: 30px 20px 40px;
+    font-size: 0.85rem;
+    opacity: 0.7;
+  }
+</style>
+</head>
+<body>
+
+<div class="stars"></div>
+
+<svg class="skyline" viewBox="0 0 1200 200" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+  <g fill="#0a1230">
+    <rect x="0" y="120" width="60" height="80"/>
+    <rect x="70" y="90" width="45" height="110"/>
+    <rect x="125" y="140" width="50" height="60"/>
+    <rect x="185" y="70" width="40" height="130"/>
+    <rect x="235" y="110" width="55" height="90"/>
+    <rect x="900" y="100" width="50" height="100"/>
+    <rect x="960" y="130" width="40" height="70"/>
+    <rect x="1010" y="80" width="45" height="120"/>
+    <rect x="1065" y="120" width="50" height="80"/>
+    <rect x="1125" y="95" width="45" height="105"/>
+  </g>
+</svg>
+
+<svg class="space-needle" viewBox="0 0 300 800" preserveAspectRatio="xMidYMax meet" xmlns="http://www.w3.org/2000/svg">
+  <g fill="#0a1230" stroke="#0a1230">
+    <!-- legs -->
+    <polygon points="150,150 90,800 120,800 155,220" />
+    <polygon points="150,150 210,800 180,800 145,220" />
+    <polygon points="150,150 150,800 150,800" />
+    <!-- cross braces -->
+    <line x1="105" y1="450" x2="195" y2="450" stroke-width="6"/>
+    <line x1="98" y1="560" x2="202" y2="560" stroke-width="6"/>
+    <line x1="93" y1="660" x2="207" y2="660" stroke-width="6"/>
+    <!-- saucer / top house -->
+    <ellipse cx="150" cy="150" rx="100" ry="30"/>
+    <rect x="60" y="120" width="180" height="40" rx="6"/>
+    <ellipse cx="150" cy="115" rx="70" ry="18"/>
+    <!-- spire -->
+    <rect x="145" y="10" width="10" height="105"/>
+    <circle cx="150" cy="8" r="6" fill="#ffd27a" stroke="none"/>
+  </g>
+</svg>
+
+<main>
+  <header>
+    <h1>🌆 Fun Things to Do in Seattle</h1>
+    <p>Your guide to the Emerald City — coffee, mountains, sound, and skyline included.</p>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <span class="emoji">🛰️</span>
+      <h2>Ride to the Top of the Space Needle</h2>
+      <p>Take the elevator up 520 feet for a 360° view of downtown, Puget Sound, and Mount Rainier on a clear day.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🐟</span>
+      <h2>Explore Pike Place Market</h2>
+      <p>Watch the famous fish-throwing fishmongers, grab a bite, and browse local crafts at this century-old market.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">☕</span>
+      <h2>Visit the Original Starbucks</h2>
+      <p>Steps from Pike Place, sip a coffee where it all began back in 1971.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🎨</span>
+      <h2>Marvel at Chihuly Garden and Glass</h2>
+      <p>Wander through vibrant blown-glass sculptures and a lush garden right at the base of the Space Needle.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">⛴️</span>
+      <h2>Take a Ferry Across Puget Sound</h2>
+      <p>Hop on a Washington State Ferry to Bainbridge Island for skyline views and a laid-back day trip.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🎸</span>
+      <h2>Rock Out at MoPOP</h2>
+      <p>The Museum of Pop Culture celebrates music, sci-fi, and gaming with interactive exhibits for all ages.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🌲</span>
+      <h2>Hike Discovery Park</h2>
+      <p>Escape the city in Seattle's largest park, with forest trails, bluffs, and a lighthouse on the water.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🏙️</span>
+      <h2>Stroll the Waterfront &amp; Great Wheel</h2>
+      <p>Walk the newly revamped waterfront and take a spin on the Seattle Great Wheel for sound-side views.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🦑</span>
+      <h2>Visit the Seattle Aquarium</h2>
+      <p>Get up close with giant Pacific octopuses, otters, and local marine life right on the waterfront.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🏀</span>
+      <h2>Catch a Game or Show</h2>
+      <p>Cheer on the Kraken, Storm, or Sounders, or catch a concert at Climate Pledge Arena or T-Mobile Park.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🍜</span>
+      <h2>Eat Your Way Through the International District</h2>
+      <p>Sample dim sum, ramen, and pastries in one of the city's most flavorful neighborhoods.</p>
+    </div>
+    <div class="card">
+      <span class="emoji">🚡</span>
+      <h2>Day Trip to Mount Rainier</h2>
+      <p>Just a couple hours away, wildflower meadows and glacier views make for an unforgettable escape.</p>
+    </div>
+  </div>
+</main>
+
+<footer>
+  Made with ❤️ in the shadow of the Space Needle
+</footer>
+
+</body>
+</html>
