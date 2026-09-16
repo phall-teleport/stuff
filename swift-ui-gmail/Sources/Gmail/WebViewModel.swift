@@ -32,6 +32,9 @@ final class WebViewModel: NSObject, ObservableObject {
     @Published private(set) var unreadCount = 0
 
     private var observers: [NSKeyValueObservation] = []
+    /// Set once the injected script has reported a count; the page title is then ignored
+    /// as a source because it only carries the count while the inbox is showing.
+    private var scriptReportsUnread = false
     private var popups: [PopupWindowController] = []
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
 
@@ -51,12 +54,16 @@ final class WebViewModel: NSObject, ObservableObject {
         content.addUserScript(
             WKUserScript(source: NotificationBridge.script, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         )
+        content.addUserScript(
+            WKUserScript(source: UnreadBadgeScript.script, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        )
         config.userContentController = content
 
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
 
         content.add(WeakScriptMessageHandler(self), name: NotificationBridge.handlerName)
+        content.add(WeakScriptMessageHandler(self), name: UnreadBadgeScript.handlerName)
 
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -151,9 +158,9 @@ final class WebViewModel: NSObject, ObservableObject {
         let t = (newTitle ?? "").trimmingCharacters(in: .whitespaces)
         title = t.isEmpty ? "Gmail" : t
 
-        // Gmail titles look like "Inbox (12) - you@example.com - Gmail". Only trust the
-        // count while the inbox is showing; other labels don't report the inbox count.
-        guard t.hasPrefix("Inbox") else { return }
+        // Fallback only: Gmail titles look like "Inbox (12) - you@example.com - Gmail", but
+        // the count is present only while the inbox is showing. Prefer the injected script.
+        guard !scriptReportsUnread, t.hasPrefix("Inbox") else { return }
         let count: Int
         if let open = t.firstIndex(of: "("), let close = t[open...].firstIndex(of: ")") {
             let digits = t[t.index(after: open)..<close].filter(\.isNumber)
@@ -492,8 +499,19 @@ extension WebViewModel: WKDownloadDelegate {
 
 extension WebViewModel: WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == NotificationBridge.handlerName,
-              let body = message.body as? [String: Any] else { return }
+        guard let body = message.body as? [String: Any] else { return }
+
+        if message.name == UnreadBadgeScript.handlerName {
+            // The count only arrives from the main Gmail web view, never from popups.
+            guard message.webView === webView else { return }
+            let count = (body["count"] as? NSNumber)?.intValue ?? 0
+            NSLog("[unread] count=%d source=%@", count, (body["source"] as? String) ?? "?")
+            scriptReportsUnread = true
+            setUnreadCount(count)
+            return
+        }
+
+        guard message.name == NotificationBridge.handlerName else { return }
         let title = (body["title"] as? String) ?? "Gmail"
         let text = (body["body"] as? String) ?? ""
         let id = (body["id"] as? String) ?? UUID().uuidString
