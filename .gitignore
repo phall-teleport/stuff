@@ -1,0 +1,4 @@
+# Local-only: never commit
+.DS_Store
+.claude/
+random_stuff/
