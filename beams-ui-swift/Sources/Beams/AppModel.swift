@@ -657,6 +657,10 @@ final class AppModel {
             let res = try await client.run(id: s.beamId, script: AgentScripts.workspacePull(workDir: config.workDir))
             if !res.stdout.isEmpty {
                 try await store.replaceWorkspace(id, tarGz: res.stdout)
+                let redacted = Secrets.redactFiles(in: store.workspaceDir(id))
+                if !redacted.isEmpty {
+                    syncLog.append("Redacted credentials in \(redacted.count) file(s): \(redacted.prefix(5).joined(separator: ", "))\(redacted.count > 5 ? "…" : "")")
+                }
                 let n = FileManager.default.enumerator(atPath: store.workspaceDir(id).path)?.allObjects.count ?? 0
                 if !quiet { toast("Pulled \(n) workspace files", .ok) } else { syncLog.append("Pulled workspace (\(n) files) from \(config.workDir)") }
             } else if !quiet {

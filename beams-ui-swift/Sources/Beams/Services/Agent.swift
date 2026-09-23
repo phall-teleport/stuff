@@ -111,6 +111,9 @@ enum AgentScripts {
     /// the commit stays small. Empty output when the dir is missing/empty.
     static func workspacePull(workDir: String) -> String {
         let q = Shell.quote(workDir)
+        // Credentials never leave the beam (see Secrets): well-known secret
+        // files are excluded here, and text files are redacted after pulling.
+        let secretExcludes = Secrets.excludedPatterns.map { "--exclude=\(Shell.quote($0))" }.joined(separator: " ")
         return """
         [ -d \(q) ] || exit 0
         cd \(q) || exit 0
@@ -124,6 +127,8 @@ enum AgentScripts {
           --exclude='./.venv' --exclude='*/.venv' \
           --exclude='__pycache__' --exclude='*.pyc' \
           --exclude='./.next' --exclude='*/.next' \
+          --exclude='./.beams' --exclude='*/beams/sessions' \
+          \(secretExcludes) \
           .
         """
     }

@@ -127,11 +127,11 @@ enum GitHubSync {
         let fm = FileManager.default
         let sessDir = cacheDir.appendingPathComponent("\(prefix)/sessions/\(session.id)", isDirectory: true)
         try fm.createDirectory(at: sessDir, withIntermediateDirectories: true)
-        try transcriptMD.write(to: sessDir.appendingPathComponent("transcript.md"), atomically: true, encoding: .utf8)
+        // Everything written to the repo is redacted (see Secrets): transcripts
+        // can contain credentials the agent printed in tool output.
+        try Secrets.redact(transcriptMD).write(to: sessDir.appendingPathComponent("transcript.md"), atomically: true, encoding: .utf8)
         if fm.fileExists(atPath: transcriptJSONL.path) {
-            let dst = sessDir.appendingPathComponent("transcript.jsonl")
-            try? fm.removeItem(at: dst)
-            try fm.copyItem(at: transcriptJSONL, to: dst)
+            try Secrets.copyRedacted(transcriptJSONL, to: sessDir.appendingPathComponent("transcript.jsonl"))
         }
         var isDir: ObjCBool = false
         if fm.fileExists(atPath: memoryDir.path, isDirectory: &isDir), isDir.boolValue {
@@ -142,6 +142,7 @@ enum GitHubSync {
             let perSession = sessDir.appendingPathComponent("memory", isDirectory: true)
             try? fm.removeItem(at: perSession)
             try fm.copyItem(at: memoryDir, to: perSession)
+            Secrets.redactFiles(in: latest); Secrets.redactFiles(in: perSession)
         }
 
         // Generated files from the beam's working directory.
@@ -151,6 +152,8 @@ enum GitHubSync {
             let dst = sessDir.appendingPathComponent("workspace", isDirectory: true)
             try? fm.removeItem(at: dst)
             try fm.copyItem(at: workspaceDir, to: dst)
+            let redacted = Secrets.redactFiles(in: dst)   // defense in depth; the pull already redacts
+            if !redacted.isEmpty { log("Redacted credentials in \(redacted.count) workspace file(s)") }
         }
 
         // What "pick up this session later" needs: the agent's own conversation
@@ -158,9 +161,7 @@ enum GitHubSync {
         for (src, name) in [(extras.claudeSession, "claude-session.jsonl"), (extras.codexSession, "codex-session.jsonl")] {
             guard let src, ((try? src.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0) > 0 else { continue }
             log("Saving \(name) so the conversation can be resumed")
-            let dst = sessDir.appendingPathComponent(name)
-            try? fm.removeItem(at: dst)
-            try fm.copyItem(at: src, to: dst)
+            try Secrets.copyRedacted(src, to: sessDir.appendingPathComponent(name))
         }
         if let meta = extras.meta { try meta.write(to: sessDir.appendingPathComponent("meta.json")) }
 

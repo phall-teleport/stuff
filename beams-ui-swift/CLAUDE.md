@@ -96,6 +96,17 @@ per-session + latest memory, AND the generated project files. The pull script
 must be sent through `Shell.quote` (the app does this); passing it unquoted to
 `tsh beams exec` breaks because tsh flattens argv and re-parses on the remote.
 
+## Secrets never leave the beam (incident 2026-09-23)
+
+Workspace sync once pushed a tbot identity, private keys and `.env` tokens into
+the PUBLIC phall-teleport/stuff repo (the repo was deleted and recreated).
+Transcripts leaked them too, because the agent `cat`ed those files. Now:
+`workspacePull` tar-excludes `Secrets.excludedPatterns` (.env, *.pem, keys,
+tbot outputs, nested `*/beams/sessions`); `pullWorkspace` runs
+`Secrets.redactFiles`; `GitHubSync.sync` redacts transcript.md/.jsonl,
+conversation files, memory and workspace before committing. Keep every path
+to GitHub going through `Secrets`. Sync targets should be private repos.
+
 ## Picking up a previous session (from GitHub)
 
 ⌘O / the tray button on the Sessions header opens `OpenFromGitHubView`, which

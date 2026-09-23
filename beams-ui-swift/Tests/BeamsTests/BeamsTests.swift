@@ -190,6 +190,45 @@ import Foundation
     #expect(!old.needsFreshStart && old.codexSessionRel.isEmpty)
 }
 
+@Test func secretsRedaction() throws {
+    let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nAbCdEf012345\n-----END PRIVATE KEY-----"
+    #expect(Secrets.redact("key:\n\(pem)\nafter") == "key:\n[REDACTED PRIVATE KEY]\nafter")
+    #expect(!Secrets.redact("-----BEGIN PIV YUBIKEY PRIVATE KEY-----\nabc").contains("BEGIN PIV"))
+    #expect(Secrets.redact("TOKEN=resource-monitor-bot-abc123def456") == "TOKEN=[REDACTED]")
+    #expect(Secrets.redact("export API_KEY=\"sk_live_abcdefgh1234\"").contains("[REDACTED]"))
+    #expect(Secrets.redact("ghp_" + String(repeating: "a1B2", count: 9)) == "[REDACTED TOKEN]")
+    let jwt = "eyJhbGciOiJFZERTQSIsImtpZCI6IjEyMyJ9.eyJzdWIiOiJib3QtbW9uaXRvciJ9.c2lnbmF0dXJlLWJ5dGVz"
+    #expect(Secrets.redact("cert \(jwt) end") == "cert [REDACTED JWT] end")
+
+    // A transcript line: key printed by a tool, with JSON-escaped newlines and
+    // an escaped .env inside the string. Must stay valid JSON after redaction.
+    let line = #"{"type":"user","message":{"content":[{"type":"tool_result","content":"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADAN\n-----END PRIVATE KEY-----\n\"token\": \"abcdefgh12345678\"\nTOKEN=a0b91bf133b5f5a914"}]},"usage":{"input_tokens":2678,"cache_read_input_tokens":123456789,"output_tokens":42}}"#
+    let clean = Secrets.redact(line)
+    #expect(!clean.contains("MIIEvQ") && !clean.contains("abcdefgh12345678") && !clean.contains("a0b91bf133"))
+    #expect(clean.contains("123456789"))                       // numeric token counts untouched
+    #expect((try? JSONSerialization.jsonObject(with: Data(clean.utf8))) != nil)
+
+    // Harmless text is untouched.
+    let prose = "Set the token in Settings, then run go test. input_tokens: 42"
+    #expect(Secrets.redact(prose) == prose)
+    #expect(!Secrets.containsSecret(prose))
+}
+
+@Test func redactFilesAndExcludes() throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("beams-secrets-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("app"), withIntermediateDirectories: true)
+    try "package main\n".write(to: dir.appendingPathComponent("app/main.go"), atomically: true, encoding: .utf8)
+    try "PORT=8080\nSECRET=supersecretvalue99\n".write(to: dir.appendingPathComponent("app/config.txt"), atomically: true, encoding: .utf8)
+    #expect(Secrets.redactFiles(in: dir) == ["app/config.txt"])
+    #expect(try String(contentsOf: dir.appendingPathComponent("app/config.txt"), encoding: .utf8) == "PORT=8080\nSECRET=[REDACTED]\n")
+    // The workspace tar skips well-known secret files and nested session copies.
+    let s = AgentScripts.workspacePull(workDir: "/home/beams/work")
+    for p in [".env", "*.pem", "id_ed25519*", "tokenhash", "identity", "*/beams/sessions"] {
+        #expect(s.contains("--exclude='\(p)'"), "missing exclude \(p)")
+    }
+}
+
 @Test func beamExpiryFormatting() {
     #expect(BeamRow.expiry(nil) == "unknown")
     #expect(BeamRow.expiry("") == "unknown")
