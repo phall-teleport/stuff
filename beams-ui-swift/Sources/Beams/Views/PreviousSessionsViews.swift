@@ -116,13 +116,16 @@ struct RemoteSessionRow: View {
 }
 
 /// Shown above the transcript when the current session's beam no longer
-/// exists: pick a beam (or a new one) and move the session into it.
+/// exists. Deliberately just text and ONE button: any second control in this
+/// row (a Picker, a Menu, or a second button with a popover) made the split
+/// view's layout feed back on itself in windows around 960-1100pt wide with the
+/// inspector open, until AppKit threw "_postWindowNeedsUpdateConstraints" and
+/// left the window half laid out. Choosing the beam happens in a sheet instead.
 struct ContinueBanner: View {
     @Environment(AppModel.self) private var model
     let session: Session
 
     var body: some View {
-        @Bindable var m = model
         let plan = model.restorePlan(session)
         let busy = model.restoring.contains(session.id)
         VStack(alignment: .leading, spacing: 10) {
@@ -131,49 +134,76 @@ struct ContinueBanner: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(session.beamName.isEmpty ? "This session isn't in a beam yet"
                                                   : "The beam \(session.beamName) for this session is gone")
-                        .font(.headline)
-                    Text(summary(plan)).font(.callout).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .font(.headline).lineLimit(2)
+                    Text(ContinueText.summary(plan, turns: session.turns)).font(.callout).foregroundStyle(.secondary).lineLimit(4)
                 }
-                Spacer()
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            HStack(spacing: 8) {
-                Text("Continue in").foregroundStyle(.secondary)
-                Picker("", selection: $m.continueBeamID) {
-                    ForEach(model.beams) { b in Text(b.name).tag(b.id) }
-                    Text("New beam").tag("")
-                }
-                .labelsHidden().frame(maxWidth: 220)
-                Button {
-                    Task { await model.continueSession(session.id) }
-                } label: {
-                    if busy { ProgressView().controlSize(.small) } else { Text("Continue here") }
-                }
-                .buttonStyle(.borderedProminent).disabled(busy)
-                Spacer()
+            Button {
+                model.continueSheetSessionID = session.id
+            } label: {
+                if busy { ProgressView().controlSize(.small) } else { Text("Continue in a beam…") }
             }
-            if !model.continueBeamID.isEmpty, plan.files > 0 {
-                Text("Files go into \(model.config.workDir) on that beam; files with the same names are replaced.")
-                    .font(.caption).foregroundStyle(.tertiary)
-            }
+            .buttonStyle(.borderedProminent).disabled(busy)
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.blue.opacity(0.07)))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.blue.opacity(0.35)))
         .padding(.horizontal, 28).padding(.top, 14)
     }
+}
 
-    private func summary(_ p: AppModel.RestorePlan) -> String {
+/// Sheet for picking which beam a session continues in. A sheet is its own
+/// window, so its controls can't disturb the main window's layout.
+struct ContinueSheet: View {
+    @Environment(AppModel.self) private var model
+    let session: Session
+
+    var body: some View {
+        @Bindable var m = model
+        let plan = model.restorePlan(session)
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Continue “\(session.title.isEmpty ? "this session" : session.title)”")
+                .font(.title3.weight(.semibold)).lineLimit(2)
+            Text(ContinueText.summary(plan, turns: session.turns)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Picker("Continue in", selection: $m.continueBeamID) {
+                ForEach(model.beams) { b in Text(b.name).tag(b.id) }
+                Text("A new beam").tag("")
+            }
+            .pickerStyle(.radioGroup)
+            if !model.continueBeamID.isEmpty, plan.files > 0 {
+                Text("Files go into \(model.config.workDir) on that beam; files with the same names are replaced.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { model.continueSheetSessionID = nil }.keyboardShortcut(.cancelAction)
+                Button("Continue") {
+                    model.continueSheetSessionID = nil
+                    Task { await model.continueSession(session.id) }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+}
+
+enum ContinueText {
+    static func summary(_ p: AppModel.RestorePlan, turns: Int) -> String {
         var bring: [String] = []
         if p.files > 0 { bring.append("\(p.files) file\(p.files == 1 ? "" : "s")") }
         if p.memory { bring.append("memory") }
-        if session.turns > 0 { bring.append(p.resumable ? "the conversation" : "the previous transcript") }
+        if turns > 0 { bring.append(p.resumable ? "the conversation" : "the previous transcript") }
         let head = bring.isEmpty ? "Pick a beam to keep going." : "Continuing brings \(joined(bring))."
-        guard session.turns > 0, !p.resumable else { return head }
+        guard turns > 0, !p.resumable else { return head }
         return head + " The agent's conversation wasn't saved, so it starts fresh with the old transcript to read."
     }
 
-    private func joined(_ xs: [String]) -> String {
+    private static func joined(_ xs: [String]) -> String {
         xs.count <= 1 ? xs.joined() : xs.dropLast().joined(separator: ", ") + " and " + xs.last!
     }
 }

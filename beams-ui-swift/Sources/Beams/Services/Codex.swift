@@ -17,12 +17,17 @@ struct CodexTurn {
     var model: String
     var prompt: String
     var resumeThread: String   // empty = start a new thread
+    var mcpServers: [MCPServer] = []
 
     var script: String {
         var s = "set -e\n"
         s += "export PATH=\"$HOME/.local/bin:$PATH\"\n"
         s += "mkdir -p \(Shell.quote(workDir)) && cd \(Shell.quote(workDir))\n"
-        s += "exec codex exec"
+        s += MCPConfig.waitScript(mcpServers)
+        s += "exec codex"
+        // Config overrides go before the subcommand (MCP wiring unverified for Codex).
+        for o in MCPConfig.codexOverrides(mcpServers) { s += " -c \(Shell.quote(o))" }
+        s += " exec"
         if !resumeThread.isEmpty { s += " resume \(Shell.quote(resumeThread))" }
         // No --color flag: `codex exec resume` rejects it, and --json output is
         // already plain. --json is accepted by both exec and exec resume.

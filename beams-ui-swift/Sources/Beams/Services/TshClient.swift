@@ -33,6 +33,15 @@ struct TshStatus {
     var cluster = ""
     var validUntil = ""
     var message = ""
+    var roles: [String] = []
+    /// SSH logins the certificate grants; nil when tsh didn't report them.
+    var logins: [String]? = nil
+    /// Certificate expiry of every tsh profile, by proxy host (for MCP
+    /// proxies into other clusters). Filled even when `proxy` has no profile.
+    var profileExpiry: [String: Date] = [:]
+
+    /// nil = no profile for that proxy host.
+    func expiry(forProxy proxy: String) -> Date? { profileExpiry[hostOnly(proxy)] }
 }
 
 enum TshError: Error { case needsTerminal }
@@ -41,7 +50,40 @@ struct TshClient: BeamClient {
     var bin: String
     var proxy: String
     var login: String
+    /// `tsh login --auth=<connector>`; empty = the cluster's default connector.
+    var auth: String = ""
+    /// `tsh login --mfa-mode=browser`.
+    var mfaBrowser: Bool = false
     var kind: String { "tsh" }
+
+    /// Keep tsh away from the user's ssh-agent. Otherwise each SSH connection
+    /// to a beam also offers every Teleport key in the agent (other clusters,
+    /// other identities); each rejected key is a failed-login audit event, so
+    /// one denied command showed up as a flood of failures.
+    static let env = ["TELEPORT_USE_LOCAL_SSH_AGENT": "false"]
+
+    /// Connector names are simple identifiers; drop anything else so the value
+    /// is safe on a command line and in the Terminal hand-off.
+    var authConnector: String {
+        String(auth.trimmingCharacters(in: .whitespaces).filter { $0.isASCII && ($0.isLetter || $0.isNumber || "-_.:".contains($0)) })
+    }
+
+    /// Flags shared by the in-app login and the Terminal hand-off.
+    func loginArgs(user: String) -> [String] {
+        var a = ["login", "--proxy=\(proxy)"]
+        if !user.isEmpty { a.append("--user=\(user)") }
+        if !authConnector.isEmpty { a.append("--auth=\(authConnector)") }
+        if mfaBrowser { a.append("--mfa-mode=browser") }
+        return a
+    }
+
+    /// Why an exec into a beam was refused: the certificate has no matching SSH
+    /// login (e.g. an SSO identity without the beam-user role).
+    static func isSSHLoginDenied(_ message: String) -> Bool {
+        let s = message.lowercased()
+        return s.contains("not in the set of valid principals") || s.contains("access denied")
+            || s.contains("unable to authenticate") || s.contains("no supported methods remain")
+    }
 
     private func args(_ sub: [String]) -> [String] {
         var a = [bin]
@@ -51,7 +93,7 @@ struct TshClient: BeamClient {
     }
 
     private func runJSON(_ sub: [String], timeout: TimeInterval = 45) async throws -> Any {
-        let res = try await Shell.run(args(sub), timeout: timeout)
+        let res = try await Shell.run(args(sub), extraEnv: Self.env, timeout: timeout)
         var data = res.stdout
         // tsh may print a login banner before the JSON; skip to the first bracket.
         if let i = data.firstIndex(where: { $0 == UInt8(ascii: "[") || $0 == UInt8(ascii: "{") }) {
@@ -72,7 +114,7 @@ struct TshClient: BeamClient {
     }
 
     func delete(id: String) async throws {
-        try await Shell.run(args(["beams", "rm", id]), timeout: 60)
+        try await Shell.run(args(["beams", "rm", id]), extraEnv: Self.env, timeout: 60)
     }
 
     /// tsh joins the remaining args with spaces for the remote shell, so the
@@ -81,7 +123,7 @@ struct TshClient: BeamClient {
              onStdoutLine: ((String) -> Void)?, onStderrLine: ((String) -> Void)?,
              register: ((RunningProcess) -> Void)?) async throws -> ProcessResult {
         try await Shell.run(args(["beams", "exec", id, "--", "sh", "-lc", Shell.quote(script)]),
-                            stdin: stdin, interactiveStdin: interactiveStdin,
+                            stdin: stdin, interactiveStdin: interactiveStdin, extraEnv: Self.env,
                             onStdoutLine: onStdoutLine, onStderrLine: onStderrLine, register: register)
     }
 
@@ -89,15 +131,13 @@ struct TshClient: BeamClient {
         var sub = ["beams", "scp", "-q"]
         if recursive { sub.append("-r") }
         sub += [local, "\(id):\(remote)"]
-        try await Shell.run(args(sub))
+        try await Shell.run(args(sub), extraEnv: Self.env)
     }
 
     // MARK: login state
 
     func loginCommand(user: String) -> String {
-        var cmd = "\(bin) login --proxy=\(proxy)"
-        if !user.isEmpty { cmd += " --user=\(user)" }
-        return cmd
+        ([bin] + loginArgs(user: user)).joined(separator: " ")
     }
 
     /// Inspects `tsh status -f json` without triggering a login.
@@ -108,7 +148,7 @@ struct TshClient: BeamClient {
             return st
         }
         st.tshFound = true; st.tshPath = path
-        let res = try? await Shell.run([bin, "status", "-f", "json"], timeout: 30, check: false)
+        let res = try? await Shell.run([bin, "status", "-f", "json"], extraEnv: Self.env, timeout: 30, check: false)
         guard var data = res?.stdout else { st.message = "Not logged in to Teleport."; return st }
         if let i = data.firstIndex(of: UInt8(ascii: "{")) { data = data[i...] }
         guard !data.isEmpty, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -117,6 +157,10 @@ struct TshClient: BeamClient {
         var profiles: [[String: Any]] = []
         if let a = obj["active"] as? [String: Any] { profiles.append(a) }
         profiles += obj["profiles"] as? [[String: Any]] ?? []
+        for p in profiles {
+            let host = hostOnly(p["profile_url"] as? String ?? "")
+            if !host.isEmpty, let d = RFC3339.parse(p["valid_until"] as? String ?? "") { st.profileExpiry[host] = d }
+        }
         let want = hostOnly(proxy)
         let match = profiles.first { p in
             want.isEmpty
@@ -127,6 +171,8 @@ struct TshClient: BeamClient {
         st.user = m["username"] as? String ?? ""
         st.cluster = m["cluster"] as? String ?? ""
         st.validUntil = m["valid_until"] as? String ?? ""
+        st.roles = m["roles"] as? [String] ?? []
+        if let l = m["logins"] as? [String] { st.logins = l } else if m.keys.contains("logins") { st.logins = [] }
         if st.proxy.isEmpty { st.proxy = hostOnly(m["profile_url"] as? String ?? "") }
         if let exp = RFC3339.parse(st.validUntil), exp < Date() {
             let f = DateFormatter(); f.dateFormat = "MMM d HH:mm"
@@ -141,8 +187,7 @@ struct TshClient: BeamClient {
     /// Headless `tsh login`. SSO clusters open the browser and succeed;
     /// local-password clusters throw `.needsTerminal`.
     func runLogin(user: String, log: @escaping (String) -> Void) async throws {
-        var sub = [bin, "login", "--proxy=\(proxy)"]
-        if !user.isEmpty { sub.append("--user=\(user)") }
+        let sub = [bin] + loginArgs(user: user)
         var tail: [String] = []
         let handle: (String) -> Void = { raw in
             let ln = Shell.stripANSI(raw).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -150,7 +195,7 @@ struct TshClient: BeamClient {
             tail.append(ln); if tail.count > 20 { tail.removeFirst() }
             log(ln)
         }
-        let res = try await Shell.run(sub, stdin: Data(), onStdoutLine: handle, onStderrLine: handle, check: false)
+        let res = try await Shell.run(sub, stdin: Data(), extraEnv: Self.env, onStdoutLine: handle, onStderrLine: handle, check: false)
         if res.ok { return }
         let joined = tail.joined(separator: "\n").lowercased()
         if joined.contains("without a terminal") || joined.contains("not a terminal") || joined.contains("password") {

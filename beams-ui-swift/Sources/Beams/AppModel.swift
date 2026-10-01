@@ -22,7 +22,7 @@ struct ConfirmRequest: Identifiable {
     var secondaryAction: (() -> Void)? = nil
 }
 
-enum InspectorTab: String, CaseIterable { case memory = "Memory", github = "GitHub" }
+enum InspectorTab: String, CaseIterable { case files = "Save locally", github = "GitHub" }
 
 /// All app state and actions. Views observe it; services do the work.
 @MainActor
@@ -87,17 +87,28 @@ final class AppModel {
     var remoteQuery = ""
     /// Beam chosen in the "continue this session" banner; "" means a new beam.
     var continueBeamID = ""
+    /// Session whose "continue in a beam" sheet is open, if any.
+    var continueSheetSessionID: String?
     var restoring: Set<String> = []
 
-    // memory
-    var memory: [MemoryFile] = []
-    var memorySelected: MemoryFile? = nil
-    var memoryContent = ""
 
     // ui
     var showInspector = true
-    var inspectorTab: InspectorTab = .memory
+    var inspectorTab: InspectorTab = .files
     var toasts: [Toast] = []
+    /// Sessions whose working directory is being saved to this Mac.
+    var savingLocal: Set<String> = []
+
+    // MCP servers (Settings → MCP servers; AppModel+MCP.swift)
+    var mcpApps: [MCPApp] = []
+    var mcpLoading = false
+    var mcpNote = ""
+    /// Supervisor state by key ("proxy:<server id>", "tunnel:<beam id>").
+    var mcpStatus: [String: String] = [:]
+    @ObservationIgnored var mcpSupervisors: [String: Supervisor] = [:]
+    @ObservationIgnored var mcpTunnelPorts: [String: [Int]] = [:]
+    @ObservationIgnored var mcpLoginWatch: Task<Void, Never>?
+    @ObservationIgnored var mcpProxyHosts: [String: String] = [:]
     var confirm: ConfirmRequest? = nil
 
     init() throws {
@@ -108,8 +119,11 @@ final class AppModel {
         store = st
         config = cfg
         isMock = mock
-        client = mock ? MockClient() : TshClient(bin: cfg.tshBin, proxy: cfg.proxy, login: cfg.login)
+        client = mock ? MockClient() : TshClient(bin: cfg.tshBin, proxy: cfg.proxy, login: cfg.login, auth: cfg.tshAuth, mfaBrowser: cfg.tshMFABrowser)
         tshUser = cfg.teleportUser.isEmpty ? (ProcessInfo.processInfo.environment["USER"] ?? "") : cfg.teleportUser
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stopAllMCP() }
+        }
     }
 
     var current: Session? { sessions.first { $0.id == currentID } }
@@ -117,12 +131,18 @@ final class AppModel {
     var currentBusy: Bool { currentID.map { busy.contains($0) } ?? false }
     var backendLabel: String { isMock ? "mock" : (config.proxy.isEmpty ? "tsh" : config.proxy) }
 
-    private var tshClient: TshClient { TshClient(bin: config.tshBin, proxy: config.proxy, login: config.login) }
+    var tshClient: TshClient { TshClient(bin: config.tshBin, proxy: config.proxy, login: config.login, auth: config.tshAuth, mfaBrowser: config.tshMFABrowser) }
 
     // MARK: boot
 
     func boot() async {
         sessions = store.listSessions()
+        // Drop 🌐 URLs recorded by older builds that weren't published apps
+        // (e.g. https://anthropic.<tenant>, the beam's API proxy).
+        for s in sessions where s.publishedUrls.contains(where: { !PublishedURLs.isPublishedApp($0, proxy: config.proxy) }) {
+            updateSession(s.id) { $0.publishedUrls.removeAll { !PublishedURLs.isPublishedApp($0, proxy: self.config.proxy) } }
+        }
+        backfillCodexUsage()
         if isMock { tsh = TshStatus(tshFound: true, loggedIn: true, proxy: "mock", user: "mock", cluster: "mock", message: "Mock backend"); tshChecked = true }
         await refreshGitHub()
         if await checkTsh() { await loadBeams() } else { beamsNote = "Log in to Teleport to see your sandboxes." }
@@ -157,6 +177,7 @@ final class AppModel {
         do {
             beams = try await client.list()
             beamsLoaded = true
+            pruneMCPTunnels()
             beamsNote = beams.isEmpty ? "No sandboxes. Click ＋ to create one." : ""
             if continueBeamID.isEmpty || !beams.contains(where: { $0.id == continueBeamID }) { continueBeamID = beams.first?.id ?? "" }
         } catch {
@@ -185,6 +206,7 @@ final class AppModel {
     func deleteBeam(_ b: Beam) {
         ask("Delete beam \(b.name)?", "This destroys the sandbox VM and anything in it.", ok: "Delete beam", destructive: true) { [self] in
             Task {
+                stopTunnel(b.id)
                 do { try await client.delete(id: b.id); toast("Deleted \(b.name)", .ok); await loadBeams() } catch { fail(error) }
             }
         }
@@ -206,6 +228,7 @@ final class AppModel {
     }
 
     func openSession(_ id: String) {
+        invalidateRestorePlan(id)   // recompute once per open, never per render
         currentID = id
         if items[id] == nil {
             var seqN = 0
@@ -223,8 +246,6 @@ final class AppModel {
             seq[id] = seqN
             backfillPublished(id)
         }
-        memory = store.listMemory(id)
-        memorySelected = nil; memoryContent = ""
         syncLog = []
         syncLogBranchState()
     }
@@ -264,14 +285,15 @@ final class AppModel {
     }
 
     private func probe(_ beamID: String) async {
+        guard sshBlockedReason == nil else { probeHint = "can't reach the beam with this Teleport login"; return }
         do {
             var lines: [String] = []
             try await client.run(id: beamID, script: AgentScripts.probe, stdin: nil, interactiveStdin: false, onStdoutLine: { lines.append($0) }, onStderrLine: nil, register: nil)
             if lines.count >= 2 { probeHint = "\(lines[0])@\(lines[1]) · \(lines.count > 2 ? lines[2] : "")" }
-        } catch { probeHint = "probe failed: \(error.localizedDescription)" }
+        } catch { noteSSHFailure(error.localizedDescription); probeHint = "probe failed: \(error.localizedDescription)" }
     }
 
-    private func updateSession(_ id: String, _ f: (inout Session) -> Void) {
+    func updateSession(_ id: String, _ f: (inout Session) -> Void) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         f(&sessions[i])
         try? store.saveSession(sessions[i])
@@ -324,6 +346,8 @@ final class AppModel {
             toast("The beam \(s.beamName.isEmpty ? "for this session" : s.beamName) is gone. Continue the session in a beam from the banner above.", .err, seconds: 7)
             return
         }
+        guard sshAllowed() else { composer = prompt; return }
+        if let s = sessions.first(where: { $0.id == sessionID }) { prepareMCP(beamID: s.beamId) }
         if config.agent == "codex" { runCodexTurn(sessionID: sessionID, prompt: prompt); return }
         if usePersistent { runTurnPersistent(sessionID: sessionID, prompt: prompt); return }
         guard var s = sessions.first(where: { $0.id == sessionID }) else { return }
@@ -340,7 +364,7 @@ final class AppModel {
         }
 
         let opts = TurnOptions(sessionID: sessionID, resume: s.turns > 0 && !s.needsFreshStart, workDir: config.workDir, prompt: prompt,
-                               permissionMode: config.permissionMode, model: config.model)
+                               permissionMode: config.permissionMode, model: config.model, mcpServers: config.mcpServers)
         let firstMessage = TurnOptions.userMessage(promptToSend(s, prompt))
         var errMsg = ""
         do {
@@ -365,6 +389,7 @@ final class AppModel {
         busy.remove(sessionID)
         logTurnLatency(sessionID)
         if !errMsg.isEmpty {
+            noteSSHFailure(errMsg)
             appendItem(sessionID, TranscriptItem(id: nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
             if TshClient.isAuthError(ProcessError(command: "", status: 1, stderr: errMsg)) || errMsg.contains("not found") { _ = await checkTsh() }
         } else if config.github.autoSync {
@@ -398,7 +423,7 @@ final class AppModel {
 
         // Start the session process; it stays up for later turns.
         let opts = TurnOptions(sessionID: sessionID, resume: s.turns > 0 && !s.needsFreshStart, workDir: config.workDir,
-                               prompt: "", permissionMode: config.permissionMode, model: config.model)
+                               prompt: "", permissionMode: config.permissionMode, model: config.model, mcpServers: config.mcpServers)
         persistentActive.insert(sessionID)
         lifeTasks[sessionID] = Task { [weak self] in
             guard let self else { return }
@@ -419,6 +444,7 @@ final class AppModel {
                 self.allowAllThisTurn.remove(sessionID)
                 let wasBusy = self.busy.remove(sessionID) != nil
                 // If the process died mid-turn (not a clean stop), surface it.
+                if !errMsg.isEmpty { self.noteSSHFailure(errMsg) }
                 if wasBusy && !errMsg.isEmpty && !errMsg.lowercased().contains("cancel") {
                     self.appendItem(sessionID, TranscriptItem(id: self.nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
                     if TshClient.isAuthError(ProcessError(command: "", status: 1, stderr: errMsg)) { Task { _ = await self.checkTsh() } }
@@ -438,7 +464,7 @@ final class AppModel {
         turnStart[sessionID] = Date()
         recordUserTurn(sessionID, prompt)
         let turn = CodexTurn(workDir: config.workDir, model: config.model, prompt: promptToSend(s, prompt),
-                             resumeThread: s.needsFreshStart ? "" : s.codexThread)
+                             resumeThread: s.needsFreshStart ? "" : s.codexThread, mcpServers: config.mcpServers)
         Task { [weak self] in
             guard let self else { return }
             var errMsg = ""
@@ -452,6 +478,7 @@ final class AppModel {
                 self.running[sessionID] = nil
                 let wasBusy = self.busy.remove(sessionID) != nil
                 self.logTurnLatency(sessionID)
+                if !errMsg.isEmpty { self.noteSSHFailure(errMsg) }
                 if wasBusy && !errMsg.isEmpty && errMsg != "stopped" {
                     self.appendItem(sessionID, TranscriptItem(id: self.nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
                     if TshClient.isAuthError(ProcessError(command: "", status: 1, stderr: errMsg)) { Task { _ = await self.checkTsh() } }
@@ -473,7 +500,13 @@ final class AppModel {
         items[id, default: []] += newItems
         if let threadID { updateSession(id) { $0.codexThread = threadID } }
         notePublished(id, t)
-        if ev.type == "turn.completed" { updateSession(id) { $0.turns += 1; $0.updated = Date(); $0.needsFreshStart = false } }
+        if ev.type == "turn.completed" {
+            let usage = (ev.raw["usage"] as? [String: Any]).map(Session.usageTriple)
+            updateSession(id) {
+                $0.turns += 1; $0.updated = Date(); $0.needsFreshStart = false
+                if let usage { $0.codexUsage[$0.codexThread] = usage }
+            }
+        }
     }
 
     /// Ends a session's persistent process (on delete / quit).
@@ -617,6 +650,22 @@ final class AppModel {
         }
     }
 
+    /// Codex sessions from before token tracking: rebuild their usage from
+    /// the transcript, off the main actor (transcripts can be large).
+    private func backfillCodexUsage() {
+        let todo = sessions.filter { !$0.codexThread.isEmpty && $0.codexUsage.isEmpty }.map { ($0.id, store.transcriptURL($0.id)) }
+        guard !todo.isEmpty else { return }
+        Task { [weak self] in
+            for (id, url) in todo {
+                let usage = await Task.detached(priority: .utility) { () -> [String: [Int]] in
+                    guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
+                    return Session.codexUsage(fromTranscript: text.split(separator: "\n").map(String.init))
+                }.value
+                if !usage.isEmpty { self?.updateSession(id) { $0.codexUsage = usage } }
+            }
+        }
+    }
+
     private func backfillPublished(_ id: String) {
         guard let s = sessions.first(where: { $0.id == id }), s.publishedUrls.isEmpty else { return }
         var seen = Set<String>(); var found: [String] = []
@@ -633,53 +682,42 @@ final class AppModel {
 
     // MARK: memory
 
+    /// Snapshots Claude's memory from the beam so sync can commit it and a
+    /// later "continue in a beam" can put it back. No UI of its own.
     func pullMemory(_ id: String? = nil, quiet: Bool = false) async {
         guard let id = id ?? currentID, let s = sessions.first(where: { $0.id == id }) else { return }
+        guard quiet ? sshBlockedReason == nil : sshAllowed() else { return }
         do {
             let res = try await client.run(id: s.beamId, script: AgentScripts.memoryPull)
-            if !res.stdout.isEmpty { try await store.replaceMemory(id, tarGz: res.stdout) }
-            if currentID == id { memory = store.listMemory(id) }
+            if !res.stdout.isEmpty { try await store.replaceMemory(id, tarGz: res.stdout); invalidateRestorePlan(id) }
             if !quiet { toast("Pulled \(store.listMemory(id).count) memory files", .ok) }
-        } catch { if quiet { syncLog.append("memory pull failed: \(error.localizedDescription)") } else { fail(error) } }
-    }
-
-    func selectMemory(_ f: MemoryFile) {
-        guard let id = currentID else { return }
-        memorySelected = f
-        memoryContent = store.readMemoryFile(id, f.path)
+        } catch { noteSSHFailure(error.localizedDescription); if quiet { syncLog.append("memory pull failed: \(error.localizedDescription)") } else { fail(error) } }
     }
 
     /// Snapshots the beam's working directory (the files the agent generated)
     /// into the session so sync can commit them.
     func pullWorkspace(_ id: String? = nil, quiet: Bool = false) async {
         guard let id = id ?? currentID, let s = sessions.first(where: { $0.id == id }) else { return }
+        guard quiet ? sshBlockedReason == nil : sshAllowed() else { return }
         do {
             let res = try await client.run(id: s.beamId, script: AgentScripts.workspacePull(workDir: config.workDir))
             if !res.stdout.isEmpty {
                 try await store.replaceWorkspace(id, tarGz: res.stdout)
-                let redacted = Secrets.redactFiles(in: store.workspaceDir(id))
+                invalidateRestorePlan(id)
+                // Off the main actor: a big workspace (a whole repo) takes tens of
+                // seconds to scan, and doing it here beach-balled the app.
+                let dir = store.workspaceDir(id)
+                let (redacted, n) = await Task.detached(priority: .utility) {
+                    (Secrets.redactFiles(in: dir), FileManager.default.enumerator(atPath: dir.path)?.allObjects.count ?? 0)
+                }.value
                 if !redacted.isEmpty {
                     syncLog.append("Redacted credentials in \(redacted.count) file(s): \(redacted.prefix(5).joined(separator: ", "))\(redacted.count > 5 ? "…" : "")")
                 }
-                let n = FileManager.default.enumerator(atPath: store.workspaceDir(id).path)?.allObjects.count ?? 0
                 if !quiet { toast("Pulled \(n) workspace files", .ok) } else { syncLog.append("Pulled workspace (\(n) files) from \(config.workDir)") }
             } else if !quiet {
                 toast("Working directory \(config.workDir) is empty")
             }
-        } catch { if quiet { syncLog.append("workspace pull failed: \(error.localizedDescription)") } else { fail(error) } }
-    }
-
-    func restoreMemory() async {
-        guard let s = current else { return }
-        do {
-            guard let dir = try await GitHubSync.restoreMemoryDir(cfg: config.github, cacheDir: store.repoCacheDir(config.github.repo), log: { [weak self] l in Task { @MainActor in self?.syncLog.append(l) } }) else {
-                toast("No memory snapshot in the repo yet"); return
-            }
-            let (data, count) = try await store.tarGz(directory: dir)
-            guard count > 0 else { toast("Memory snapshot is empty"); return }
-            try await client.run(id: s.beamId, script: AgentScripts.memoryRestore, stdin: data, interactiveStdin: false, onStdoutLine: nil, onStderrLine: nil, register: nil)
-            toast("Restored \(count) memory files into \(s.beamName)", .ok)
-        } catch { fail(error) }
+        } catch { noteSSHFailure(error.localizedDescription); if quiet { syncLog.append("workspace pull failed: \(error.localizedDescription)") } else { fail(error) } }
     }
 
     @discardableResult
@@ -691,7 +729,7 @@ final class AppModel {
     /// Saves the agent's own conversation file from the beam, which is what
     /// lets the session be resumed in a different beam later.
     private func pullConversation(_ id: String) async {
-        guard let s = sessions.first(where: { $0.id == id }), s.turns > 0 else { return }
+        guard let s = sessions.first(where: { $0.id == id }), s.turns > 0, sshBlockedReason == nil else { return }
         do {
             var saved = false
             if !s.codexThread.isEmpty {
@@ -705,9 +743,10 @@ final class AppModel {
             }
             let claude = try await runInBeam(s.beamId, AgentScripts.claudeSessionPull(sessionID: id)).stdout
             if !claude.isEmpty { try claude.write(to: store.claudeSessionURL(id)); saved = true }
+            invalidateRestorePlan(id)
             syncLog.append(saved ? "Saved the conversation so it can be resumed in another beam"
                                  : "No conversation file found in the beam; the transcript is still saved")
-        } catch { syncLog.append("conversation pull failed: \(error.localizedDescription)") }
+        } catch { noteSSHFailure(error.localizedDescription); syncLog.append("conversation pull failed: \(error.localizedDescription)") }
     }
 
     // MARK: previous sessions (GitHub)
@@ -783,7 +822,21 @@ final class AppModel {
     /// What continuing the current session in a new beam would bring along.
     struct RestorePlan { var files: Int; var memory: Bool; var resumable: Bool; var hasTranscript: Bool }
 
+    /// Cached per session so rendering the banner never walks the workspace or
+    /// reads the transcript. Not observed: filling it from a view body must
+    /// not trigger another view update.
+    @ObservationIgnored private var restorePlanCache: [String: RestorePlan] = [:]
+
+    func invalidateRestorePlan(_ id: String) { restorePlanCache[id] = nil }
+
     func restorePlan(_ s: Session) -> RestorePlan {
+        if let cached = restorePlanCache[s.id] { return cached }
+        let plan = computeRestorePlan(s)
+        restorePlanCache[s.id] = plan
+        return plan
+    }
+
+    private func computeRestorePlan(_ s: Session) -> RestorePlan {
         var files = 0
         if let en = FileManager.default.enumerator(at: store.workspaceDir(s.id), includingPropertiesForKeys: [.isRegularFileKey]) {
             for case let url as URL in en where (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true {
@@ -793,7 +846,7 @@ final class AppModel {
         let resumable = s.turns == 0 || (s.codexThread.isEmpty ? store.hasFile(store.claudeSessionURL(s.id))
                                                                   : store.hasFile(store.codexSessionURL(s.id)) && !s.codexSessionRel.isEmpty)
         return RestorePlan(files: files, memory: store.dirHasFiles(store.memoryDir(s.id)), resumable: resumable,
-                           hasTranscript: !store.readTranscript(s.id).isEmpty)
+                           hasTranscript: store.hasFile(store.transcriptURL(s.id)))
     }
 
     /// Moves a session whose beam is gone into another beam (the one picked in
@@ -801,6 +854,7 @@ final class AppModel {
     /// conversation, then rebinds the session so the next turn continues there.
     func continueSession(_ id: String) async {
         guard let s = sessions.first(where: { $0.id == id }), !restoring.contains(id) else { return }
+        guard sshAllowed() else { return }
         restoring.insert(id)
         defer { restoring.remove(id) }
         let plan = restorePlan(s)
@@ -841,12 +895,18 @@ final class AppModel {
                 $0.needsFreshStart = fresh
                 if fresh { $0.codexThread = "" }
             }
+            invalidateRestorePlan(id)
             endPersistent(id)
             let what = [plan.files > 0 ? "\(plan.files) files" : nil, plan.memory ? "memory" : nil,
                         s.turns > 0 ? (fresh ? "previous transcript" : "conversation") : nil].compactMap { $0 }
             toast("Continuing in \(beam.name)\(what.isEmpty ? "" : " with " + what.joined(separator: ", "))", .ok, seconds: 7)
             await probe(beam.id)
-        } catch { fail(error) }
+        } catch {
+            // Stops at the first failure; a refused login is recorded so the
+            // next click explains instead of connecting again.
+            noteSSHFailure(error.localizedDescription)
+            fail(error)
+        }
     }
 
     // MARK: github
@@ -952,7 +1012,9 @@ final class AppModel {
         syncLog.append("— sync started —")
         defer { syncing = false }
         do {
-            if beamGone(s) {
+            if let reason = sshBlockedReason {
+                syncLog.append("Not connecting to the beam (\(reason.prefix(60))…); syncing the saved copy")
+            } else if beamGone(s) {
                 syncLog.append("Beam \(s.beamName) is gone; syncing the saved copy")
             } else {
                 if store.listMemory(id).isEmpty { syncLog.append("Pulling memory from beam first"); await pullMemory(id, quiet: true) }
@@ -985,10 +1047,65 @@ final class AppModel {
     @discardableResult
     func checkTsh() async -> Bool {
         if isMock { return true }
+        let previousCert = tsh.validUntil
+        let previousProfiles = tsh.profileExpiry
         tsh = await tshClient.status()
+        if tsh.profileExpiry != previousProfiles { mcpLoginsChanged(from: previousProfiles) }
         tshChecked = true
         if tsh.loggedIn { tshPending = nil }
+        // A new certificate (fresh login) or one that grants the login clears
+        // an earlier "access denied".
+        if tsh.validUntil != previousCert || (tsh.logins?.contains(beamLogin) ?? false) { sshDenied = nil }
         return tsh.loggedIn
+    }
+
+    @ObservationIgnored private var tshRecheckTask: Task<Void, Never>?
+
+    /// Re-checks tsh and reloads beams shortly after Settings stop changing.
+    func scheduleTshRecheck() {
+        tshRecheckTask?.cancel()
+        tshRecheckTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(800))
+            guard let self, !Task.isCancelled else { return }
+            if await self.checkTsh() { await self.loadBeams() }
+        }
+    }
+
+    // MARK: SSH access to beams
+
+    /// SSH login used inside beams: Settings' "Beam login", else the cluster default.
+    var beamLogin: String { config.login.isEmpty ? "beams" : config.login }
+
+    /// Set when a beam refused an SSH login (see `noteSSHFailure`).
+    var sshDenied: String?
+
+    /// Non-nil when this identity can't open SSH sessions into beams. The app
+    /// then explains it instead of connecting: every attempt is a failed login
+    /// in the cluster's audit log (one of them logged in with SSO and got a flood).
+    var sshBlockedReason: String? {
+        guard !isMock, tsh.loggedIn else { return nil }
+        if let logins = tsh.logins, !logins.contains(beamLogin) {
+            let who = tsh.user.isEmpty ? "This identity" : tsh.user
+            let roles = tsh.roles.isEmpty ? "" : " Its roles are \(tsh.roles.joined(separator: ", "))."
+            return "\(who) has no “\(beamLogin)” SSH login, so beams can be listed and created but nothing can run in them.\(roles) "
+                + "The beam-user role grants it. If it was just added to your SSO mapping, log in again: roles are fixed at login."
+        }
+        return sshDenied
+    }
+
+    /// Gate for anything that runs a command in a beam.
+    func sshAllowed() -> Bool {
+        guard sshBlockedReason != nil else { return true }
+        toast("Can't run commands in beams with this Teleport login. See the banner above.", .err, seconds: 6)
+        return false
+    }
+
+    /// Records a refused SSH login so later actions stop instead of retrying.
+    func noteSSHFailure(_ message: String) {
+        guard TshClient.isSSHLoginDenied(message) else { return }
+        let who = tsh.user.isEmpty ? "this identity" : tsh.user
+        sshDenied = "The beam refused the “\(beamLogin)” SSH login for \(who). "
+            + "Your roles need to grant that login (the beam-user role does). If they were just changed, log in again."
     }
 
     var tshLoginCommand: String { tshClient.loginCommand(user: tshUser.trimmingCharacters(in: .whitespaces)) }

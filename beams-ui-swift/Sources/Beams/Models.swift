@@ -52,11 +52,19 @@ struct Session: Codable, Identifiable, Hashable {
     /// since --resume would fail with "no conversation found"), and the first
     /// prompt gets a note pointing at the restored previous transcript.
     var needsFreshStart: Bool = false
+    /// Folder on this Mac the beam's working directory was last saved to.
+    var localFolder: String = ""
+    /// RFC3339 time of that save; empty = never.
+    var localSaved: String = ""
+    /// Codex token usage by thread id: [input, cached input, output]. Codex
+    /// reports tokens, not dollars, and each turn.completed carries the
+    /// thread's running total, so the latest value per thread is kept.
+    var codexUsage: [String: [Int]] = [:]
 
     // Explicit because providing both init(from:) and encode(to:) disables synthesis.
     enum CodingKeys: String, CodingKey {
         case id, beamId, beamName, title, created, updated, turns, costUsd, lastSync, lastError, publishedUrls, codexThread,
-             codexSessionRel, needsFreshStart
+             codexSessionRel, needsFreshStart, localFolder, localSaved, codexUsage
     }
 
     init(id: String, beamId: String, beamName: String) {
@@ -80,6 +88,9 @@ struct Session: Codable, Identifiable, Hashable {
         codexThread = try c.decodeIfPresent(String.self, forKey: .codexThread) ?? ""
         codexSessionRel = try c.decodeIfPresent(String.self, forKey: .codexSessionRel) ?? ""
         needsFreshStart = try c.decodeIfPresent(Bool.self, forKey: .needsFreshStart) ?? false
+        localFolder = try c.decodeIfPresent(String.self, forKey: .localFolder) ?? ""
+        localSaved = try c.decodeIfPresent(String.self, forKey: .localSaved) ?? ""
+        codexUsage = try c.decodeIfPresent([String: [Int]].self, forKey: .codexUsage) ?? [:]
     }
 
     func encode(to encoder: Encoder) throws {
@@ -98,6 +109,60 @@ struct Session: Codable, Identifiable, Hashable {
         try c.encode(codexThread, forKey: .codexThread)
         try c.encode(codexSessionRel, forKey: .codexSessionRel)
         try c.encode(needsFreshStart, forKey: .needsFreshStart)
+        try c.encode(localFolder, forKey: .localFolder)
+        try c.encode(localSaved, forKey: .localSaved)
+        if !codexUsage.isEmpty { try c.encode(codexUsage, forKey: .codexUsage) }
+    }
+}
+
+extension Session {
+    /// Total Codex tokens (input, cached input, output) across threads.
+    var codexTokens: (input: Int, cached: Int, output: Int) {
+        codexUsage.values.reduce((0, 0, 0)) { t, u in
+            (t.0 + (u.count > 0 ? u[0] : 0), t.1 + (u.count > 1 ? u[1] : 0), t.2 + (u.count > 2 ? u[2] : 0))
+        }
+    }
+
+    /// Codex sessions show tokens (no dollar figure exists); Claude shows $.
+    var usesTokens: Bool { costUsd == 0 && !codexUsage.isEmpty }
+
+    /// Short form for the sidebar: "$0.1093" or "10.2M tok".
+    var costShort: String {
+        guard usesTokens else { return String(format: "$%.4f", costUsd) }
+        let t = codexTokens
+        return "\(Self.compact(t.input + t.output)) tok"
+    }
+
+    /// Toolbar form: "$0.1093" or "10.2M in (99% cached) · 23k out".
+    var costLong: String {
+        guard usesTokens else { return String(format: "$%.4f", costUsd) }
+        let t = codexTokens
+        let cached = t.input > 0 ? " (\(Int((Double(t.cached) / Double(t.input) * 100).rounded()))% cached)" : ""
+        return "\(Self.compact(t.input)) in\(cached) · \(Self.compact(t.output)) out"
+    }
+
+    static func compact(_ n: Int) -> String {
+        if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+        if n >= 1_000 { return String(format: "%.0fk", Double(n) / 1_000) }
+        return "\(n)"
+    }
+
+    /// Rebuilds `codexUsage` from transcript lines (for sessions recorded
+    /// before usage was tracked).
+    static func codexUsage(fromTranscript lines: [String]) -> [String: [Int]] {
+        var thread = "", usage: [String: [Int]] = [:]
+        for ln in lines where ln.contains("\"thread.started\"") || ln.contains("\"turn.completed\"") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(ln.utf8)) as? [String: Any] else { continue }
+            if obj["type"] as? String == "thread.started", let t = obj["thread_id"] as? String { thread = t }
+            if obj["type"] as? String == "turn.completed", let u = obj["usage"] as? [String: Any] {
+                usage[thread] = usageTriple(u)
+            }
+        }
+        return usage
+    }
+
+    static func usageTriple(_ u: [String: Any]) -> [Int] {
+        [u["input_tokens"] as? Int ?? 0, u["cached_input_tokens"] as? Int ?? 0, u["output_tokens"] as? Int ?? 0]
     }
 }
 
@@ -150,9 +215,15 @@ struct Config: Codable, Equatable {
     var model: String = ""
     var disableAutoOpenApps: Bool = false
     var terminalApp: String = ""      // "", "iterm", "terminal"
+    /// `tsh login --auth=<connector>` (e.g. google-saml); empty = cluster default.
+    var tshAuth: String = ""
+    /// `tsh login --mfa-mode=browser`: do MFA in the browser, not a terminal prompt.
+    var tshMFABrowser: Bool = false
     /// Experimental: keep one Claude process alive per session and feed each
     /// turn to it, instead of spawning tsh+claude per turn.
     var persistentSession: Bool = false
+    /// MCP servers handed to the agent in every turn (see Services/MCP.swift).
+    var mcpServers: [MCPServer] = []
     var github: GitHubConfig = GitHubConfig()
 
     init() {}
@@ -170,7 +241,10 @@ struct Config: Codable, Equatable {
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         disableAutoOpenApps = try c.decodeIfPresent(Bool.self, forKey: .disableAutoOpenApps) ?? false
         terminalApp = try c.decodeIfPresent(String.self, forKey: .terminalApp) ?? ""
+        tshAuth = try c.decodeIfPresent(String.self, forKey: .tshAuth) ?? ""
+        tshMFABrowser = try c.decodeIfPresent(Bool.self, forKey: .tshMFABrowser) ?? false
         persistentSession = try c.decodeIfPresent(Bool.self, forKey: .persistentSession) ?? false
+        mcpServers = try c.decodeIfPresent([MCPServer].self, forKey: .mcpServers) ?? []
         github = try c.decodeIfPresent(GitHubConfig.self, forKey: .github) ?? GitHubConfig()
     }
 }

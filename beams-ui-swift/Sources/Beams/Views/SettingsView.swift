@@ -12,6 +12,11 @@ struct SettingsView: View {
             Section("Teleport") {
                 TextField("Proxy", text: $m.config.proxy, prompt: Text("super-grass.beams.sh"))
                 TextField("Teleport user (for tsh login)", text: $m.config.teleportUser, prompt: Text(model.osUser))
+                TextField("Login connector (--auth)", text: $m.config.tshAuth, prompt: Text("cluster default, e.g. google-saml"))
+                Toggle("Do MFA in the browser (--mfa-mode=browser)", isOn: $m.config.tshMFABrowser)
+                Text(model.tshLoginCommand)
+                    .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    .help("The login command the app runs, and hands to the terminal when a password is needed")
                 TextField("tsh binary", text: $m.config.tshBin, prompt: Text("tsh"))
                 Picker("Terminal for password logins", selection: $m.config.terminalApp) {
                     Text("Auto (iTerm2 if installed, else Terminal)").tag("")
@@ -44,6 +49,7 @@ struct SettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            MCPSettingsSection()
             Section("Experimental") {
                 Toggle("Persistent session — keep one agent process alive per session (faster turns)", isOn: $m.config.persistentSession)
             }
@@ -58,10 +64,15 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 560)
-        .onChange(of: model.config) { _, _ in
+        .onChange(of: model.config) { old, new in
             model.saveConfig()
-            model.tshUser = model.config.teleportUser.isEmpty ? model.osUser : model.config.teleportUser
-            Task { if await model.checkTsh() { await model.loadBeams() } }
+            model.tshUser = new.teleportUser.isEmpty ? model.osUser : new.teleportUser
+            // Only a change that affects which cluster/profile we talk to needs
+            // tsh re-checked, and not on every keystroke (tsh serializes on a lock).
+            if old.mcpServers != new.mcpServers { model.reconcileMCP() }
+            if old.proxy != new.proxy || old.tshBin != new.tshBin || old.login != new.login {
+                model.scheduleTshRecheck()
+            }
         }
     }
 }
@@ -114,6 +125,38 @@ struct AuthBanner: View {
     private var subtitle: String {
         if let p = model.tshPending { return p }
         return model.tsh.message
+    }
+}
+
+// MARK: - SSH access banner
+
+/// Logged in, but this identity can't SSH into beams (no matching login). One
+/// button only; see "Layout feedback loops" in CLAUDE.md.
+struct SSHAccessBanner: View {
+    @Environment(AppModel.self) private var model
+    let reason: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "lock.trianglebadge.exclamationmark").foregroundStyle(.orange).padding(.top, 2)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("This Teleport login can't run anything in beams").font(.headline).lineLimit(2)
+                    Text(reason).font(.callout).foregroundStyle(.secondary).lineLimit(5).textSelection(.enabled)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Button {
+                model.tshLogin()
+            } label: {
+                if model.tshLoggingIn { ProgressView().controlSize(.small) } else { Text("Log in again") }
+            }
+            .buttonStyle(.borderedProminent).disabled(model.tshLoggingIn)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.4)))
+        .padding(.horizontal, 28).padding(.top, 14)
     }
 }
 

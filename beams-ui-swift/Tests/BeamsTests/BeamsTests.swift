@@ -11,6 +11,12 @@ import Foundation
             ["https://mild-moon-7727.super-grass.beams.sh", "https://MILD-MOON-7727.super-grass.beams.sh/play?x=1"])
     #expect(PublishedURLs.find(in: "nothing https://example.com", proxy: "super-grass.beams.sh").isEmpty)
     #expect(PublishedURLs.find(in: "https://x.super-grass.beams.sh", proxy: "").isEmpty)
+    // The beam's API proxies and ordinary tenant apps are not published apps.
+    let env = "ANTHROPIC_BASE_URL=https://anthropic.super-grass.beams.sh OPENAI_BASE_URL=https://openai.super-grass.beams.sh see https://grafana.super-grass.beams.sh"
+    #expect(PublishedURLs.find(in: env, proxy: "super-grass.beams.sh").isEmpty)
+    #expect(PublishedURLs.isPublishedApp("https://quiet-river-8080.super-grass.beams.sh/", proxy: "super-grass.beams.sh"))
+    #expect(!PublishedURLs.isPublishedApp("https://anthropic.super-grass.beams.sh", proxy: "super-grass.beams.sh"))
+    #expect(!PublishedURLs.isPublishedApp("https://mild-moon-7727.other.example", proxy: "super-grass.beams.sh"))
 }
 
 @Test func turnScript() {
@@ -229,6 +235,40 @@ import Foundation
     }
 }
 
+@Test func tshLoginFlags() {
+    var t = TshClient(bin: "tsh", proxy: "super-grass.beams.sh", login: "")
+    #expect(t.loginCommand(user: "paul") == "tsh login --proxy=super-grass.beams.sh --user=paul")
+    t.auth = "google-saml"; t.mfaBrowser = true
+    #expect(t.loginCommand(user: "") == "tsh login --proxy=super-grass.beams.sh --auth=google-saml --mfa-mode=browser")
+    t.auth = "google-saml; rm -rf ~"                 // can't smuggle shell into the Terminal hand-off
+    #expect(t.authConnector == "google-samlrm-rf")
+    #expect(TshClient.env["TELEPORT_USE_LOCAL_SSH_AGENT"] == "false")
+}
+
+@Test func sshLoginDeniedDetection() {
+    // The exact errors from the cluster's audit log and tsh.
+    #expect(TshClient.isSSHLoginDenied(#"ssh: principal "beams" not in the set of valid principals for given certificate: ["-teleport-nologin-46dc"]"#))
+    #expect(TshClient.isSSHLoginDenied("ERROR: access denied to beams connecting to beam-7853401c"))
+    #expect(TshClient.isSSHLoginDenied("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none publickey]"))
+    #expect(!TshClient.isSSHLoginDenied("claude: command not found"))
+}
+
+@MainActor @Test func sshBlockedWithoutBeamsLogin() throws {
+    let model = try AppModel()
+    model.config.login = ""
+    model.tsh = TshStatus(tshFound: true, loggedIn: true, proxy: "super-grass.beams.sh", user: "paul@geekvoice.net",
+                          cluster: "super-grass.beams.sh", roles: ["access", "beam-admin", "editor"], logins: [])
+    let reason = try #require(model.sshBlockedReason)
+    #expect(reason.contains("paul@geekvoice.net") && reason.contains("“beams”") && reason.contains("beam-admin"))
+    model.tsh.logins = ["beams", "root"]
+    #expect(model.sshBlockedReason == nil)
+    model.tsh.logins = nil                              // tsh didn't report logins: don't block up front
+    #expect(model.sshBlockedReason == nil)
+    model.tsh.loggedIn = false                          // the login banner covers this case
+    model.tsh.logins = []
+    #expect(model.sshBlockedReason == nil)
+}
+
 @Test func beamExpiryFormatting() {
     #expect(BeamRow.expiry(nil) == "unknown")
     #expect(BeamRow.expiry("") == "unknown")
@@ -241,4 +281,206 @@ import Foundation
 @Test func shellQuoteAndHost() {
     #expect(Shell.quote("a'b") == #"'a'\''b'"#)
     #expect(hostOnly("https://super-grass.beams.sh:443/x") == "super-grass.beams.sh")
+}
+
+@Test func mcpClaudeConfig() throws {
+    let servers = [
+        MCPServer(kind: .teleport, name: "grafana"),
+        MCPServer(kind: .laptop, name: "Home Assistant", port: 8931, path: "api/mcp"),
+        MCPServer(kind: .teleport, name: "off", enabled: false),
+        MCPServer(kind: .laptop, name: "bad", port: 0),
+    ]
+    let json = try #require(MCPConfig.claudeJSON(servers))
+    let obj = try #require(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: [String: [String: Any]]])
+    let map = try #require(obj["mcpServers"])
+    #expect(Set(map.keys) == ["grafana", "home-assistant"])
+    #expect(map["grafana"]?["command"] as? String == "tsh")
+    #expect(map["grafana"]?["args"] as? [String] == ["mcp", "connect", "grafana"])
+    #expect(map["home-assistant"]?["url"] as? String == "http://127.0.0.1:8931/api/mcp")
+    #expect(MCPConfig.claudeJSON([]) == nil)
+    #expect(MCPConfig.laptopPorts(servers) == [8931])
+
+    let turn = TurnOptions(sessionID: "s", resume: false, workDir: "/w", prompt: "", permissionMode: "bypass", model: "", mcpServers: servers)
+    #expect(turn.script.contains("--mcp-config '"))
+    #expect(turn.script.contains("for p in 8931;"))
+    let plain = TurnOptions(sessionID: "s", resume: false, workDir: "/w", prompt: "", permissionMode: "bypass", model: "")
+    #expect(!plain.script.contains("mcp"))
+}
+
+@Test func mcpCodexAndTsh() {
+    let s = [MCPServer(kind: .teleport, name: "gh; rm -rf /"), MCPServer(kind: .laptop, name: "x", port: 9000, path: "")]
+    #expect(MCPConfig.codexOverrides(s) == [
+        #"mcp_servers.gh--rm--rf--.command="tsh""#,
+        #"mcp_servers.gh--rm--rf--.args=["mcp","connect","ghrm-rf/"]"#,
+        #"mcp_servers.x.url="http://127.0.0.1:9000""#,
+    ])
+    let tc = TshClient(bin: "tsh", proxy: "super-grass.beams.sh", login: "beams")
+    #expect(tc.tunnelArgs(nodeUUID: "u-1", login: "beams", ports: [1, 2]) ==
+            ["tsh", "--proxy=super-grass.beams.sh", "ssh", "-N", "-R", "1:127.0.0.1:1", "-R", "2:127.0.0.1:2", "beams@u-1"])
+    let px = MCPServer(kind: .laptop, name: "g", port: 7000, proxyApp: "grafana-mcp", proxyCluster: "other.example.com")
+    #expect(tc.proxyAppArgs(px) == ["tsh", "--proxy=other.example.com", "proxy", "app", "--browser=none", "--port", "7000", "grafana-mcp"])
+    #expect(tc.proxyAppCommand(px)[2] == "'tsh' '--proxy=other.example.com' 'apps' 'login' 'grafana-mcp' >&2 && exec 'tsh' '--proxy=other.example.com' 'proxy' 'app' '--browser=none' '--port' '7000' 'grafana-mcp'")
+    #expect(tc.proxyHost(px) == "other.example.com")
+    #expect(tc.proxyHost(MCPServer(kind: .laptop, name: "h", port: 1)) == "super-grass.beams.sh")
+}
+
+@Test func mcpListParsing() throws {
+    #expect(MCPApp.parse(NSNull()).isEmpty)
+    let rows: Any = [["kind": "app", "metadata": ["name": "grafana", "description": "Dashboards"], "spec": ["uri": "mcp+stdio://"]], ["name": "flat"]]
+    #expect(MCPApp.parse(rows).map(\.name) == ["grafana", "flat"])
+    #expect(MCPApp.parse(rows).first?.uri == "mcp+stdio://")
+}
+
+@Test func mcpConfigDecodesOldFiles() throws {
+    let cfg = try JSONDecoder().decode(Config.self, from: Data(#"{"proxy":"p"}"#.utf8))
+    #expect(cfg.mcpServers.isEmpty)
+}
+
+// Supervisor tests run real (tiny) child processes.
+
+private func runs(_ file: String) -> Int {
+    ((try? String(contentsOfFile: file, encoding: .utf8)) ?? "").split(separator: "\n").count
+}
+
+@MainActor @Test func supervisorRestartsWithBackoff() async throws {
+    let f = NSTemporaryDirectory() + "sup-\(UUID().uuidString)"
+    let sup = Supervisor(key: "t", command: { .success(["/bin/sh", "-c", "echo run >> '\(f)'; exit 1"]) })
+    sup.start()
+    try await Task.sleep(for: .seconds(2.6))   // run, 1s backoff, run, 2s backoff…
+    sup.stop()
+    #expect(runs(f) == 2)
+    #expect(sup.state == .stopped)
+}
+
+@MainActor @Test func supervisorWaitsOnLoginPrompt() async throws {
+    let f = NSTemporaryDirectory() + "sup-\(UUID().uuidString)"
+    var states: [Supervisor.State] = []
+    let sup = Supervisor(key: "t", command: {
+        .success(["/bin/sh", "-c", "echo run >> '\(f)'; echo 'If browser window does not open automatically, open it by clicking on the link:'; exec sleep 30"])
+    }, onState: { states.append($0) })
+    sup.start()
+    try await Task.sleep(for: .seconds(2.5))
+    #expect(runs(f) == 1)                        // killed, and not restarted
+    #expect(sup.state == .waiting("waiting for tsh login"))
+    #expect(!sup.isRunning)
+    sup.resume()                                 // a login happened
+    try await Task.sleep(for: .seconds(1))
+    #expect(runs(f) == 2)
+    sup.stop()
+    #expect(states.contains(.running))
+}
+
+@MainActor @Test func supervisorDoesNotStartWhileLoggedOut() async throws {
+    var ready = false
+    let f = NSTemporaryDirectory() + "sup-\(UUID().uuidString)"
+    let sup = Supervisor(key: "t", command: {
+        ready ? .success(["/bin/sh", "-c", "echo run >> '\(f)'; exec sleep 31.7"]) : .failure(.init(text: "waiting for a tsh login"))
+    })
+    sup.start()
+    try await Task.sleep(for: .seconds(0.5))
+    #expect(sup.state == .waiting("waiting for a tsh login"))
+    #expect(runs(f) == 0)
+    ready = true
+    sup.resume()
+    try await Task.sleep(for: .seconds(1))
+    #expect(sup.isRunning && runs(f) == 1)
+    sup.stop()
+    // No orphaned child (allow a moment for the wrapper to notice).
+    var alive = true
+    for _ in 0..<20 where alive {
+        try await Task.sleep(for: .seconds(0.25))
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep"); p.arguments = ["-f", "sleep 31.7"]
+        try p.run(); p.waitUntilExit()
+        alive = p.terminationStatus == 0
+    }
+    #expect(!alive)
+}
+
+@Test func loginPromptDetection() {
+    #expect(Supervisor.looksLikeLoginPrompt("If browser window does not open automatically, open it by clicking on the link:"))
+    #expect(Supervisor.looksLikeLoginPrompt("Enter password for Teleport user paul:"))
+    #expect(!Supervisor.looksLikeLoginPrompt("Proxying connections to grafana on 127.0.0.1:7000"))
+}
+
+@Test func workspaceDownloadScript() {
+    let s = AgentScripts.workspaceDownload(workDir: "/home/beams/work")
+    #expect(s.contains("cd '/home/beams/work'"))
+    #expect(s.contains("--exclude='*/node_modules'") && s.contains("--exclude='.env'"))
+    #expect(!s.contains(".git'") && !s.contains("./dist"))   // a local copy keeps git history and build output
+}
+
+@Test func extractStaysInsideFolder() async throws {
+    let root = NSTemporaryDirectory() + "extract-\(UUID().uuidString)"
+    let src = root + "/src", dst = root + "/dst"
+    try FileManager.default.createDirectory(atPath: src + "/sub", withIntermediateDirectories: true)
+    try "a".write(toFile: src + "/a.txt", atomically: true, encoding: .utf8)
+    try "b".write(toFile: src + "/sub/b.txt", atomically: true, encoding: .utf8)
+    try FileManager.default.createDirectory(atPath: dst, withIntermediateDirectories: true)
+    try "keep".write(toFile: dst + "/mine.txt", atomically: true, encoding: .utf8)
+    let tgz = try await Shell.run(["/usr/bin/tar", "czf", "-", "-C", src, "."]).stdout
+    #expect(try await AppModel.extract(tgz, into: dst) == 2)
+    #expect(FileManager.default.fileExists(atPath: dst + "/sub/b.txt"))
+    #expect(FileManager.default.fileExists(atPath: dst + "/mine.txt"))   // nothing else deleted
+
+    // An archive with a ../ entry must not write outside the folder.
+    let evil = try await Shell.run(["/usr/bin/tar", "czf", "-", "-C", src + "/sub", "-P", "-s", ",^,../escaped-,", "b.txt"]).stdout
+    _ = try? await AppModel.extract(evil, into: dst)
+    #expect(!FileManager.default.fileExists(atPath: root + "/escaped-b.txt"))
+}
+
+@Test func sessionLocalFolderRoundTrip() throws {
+    var s = Session(id: "x", beamId: "b", beamName: "b")
+    s.localFolder = "/Users/me/out"; s.localSaved = "2026-09-30T12:00:00Z"
+    let back = try JSONDecoder().decode(Session.self, from: JSONEncoder().encode(s))
+    #expect(back.localFolder == "/Users/me/out" && back.localSaved == "2026-09-30T12:00:00Z")
+}
+
+// Writes the generated download script to $BEAMS_DUMP_DOWNLOAD_SCRIPT (skipped otherwise).
+@Test func dumpDownloadScript() throws {
+    guard let out = ProcessInfo.processInfo.environment["BEAMS_DUMP_DOWNLOAD_SCRIPT"] else { return }
+    try AgentScripts.workspaceDownload(workDir: "/home/beams/work").write(toFile: out, atomically: true, encoding: .utf8)
+}
+
+// Times Secrets.redact on every pulled workspace file (read-only); set BEAMS_REDACT_TIMING=1.
+@Test func redactTiming() throws {
+    guard ProcessInfo.processInfo.environment["BEAMS_REDACT_TIMING"] != nil else { return }
+    let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/BeamsUI/sessions")
+    var rows: [(Double, Int, String)] = []
+    for case let url as URL in FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey])! {
+        guard url.path.contains("/workspace/"), let d = try? Data(contentsOf: url), d.count <= 2_000_000, !d.contains(0) else { continue }
+        let t = Date(); _ = Secrets.redact(String(decoding: d, as: UTF8.self))
+        rows.append((Date().timeIntervalSince(t), d.count, url.path.replacingOccurrences(of: root.path, with: "")))
+    }
+    for r in rows.sorted(by: { $0.0 > $1.0 }).prefix(6) { print(String(format: "REDACT %.2fs %8d %@", r.0, r.1, r.2)) }
+    print("REDACT files=\(rows.count) total=\(String(format: "%.1f", rows.map(\.0).reduce(0, +)))s")
+}
+
+@Test func codexUsageFromTranscript() {
+    let lines = [
+        #"{"type":"thread.started","thread_id":"A"}"#,
+        #"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10}}"#,
+        #"{"type":"thread.started","thread_id":"A"}"#,
+        #"{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":200,"output_tokens":25}}"#,   // running total for A
+        #"{"type":"thread.started","thread_id":"B"}"#,
+        #"{"type":"turn.completed","usage":{"input_tokens":2000000,"cached_input_tokens":1000000,"output_tokens":4000}}"#,
+    ]
+    var s = Session(id: "x", beamId: "b", beamName: "b")
+    s.codexUsage = Session.codexUsage(fromTranscript: lines)
+    #expect(s.codexUsage == ["A": [300, 200, 25], "B": [2_000_000, 1_000_000, 4000]])
+    #expect(s.codexTokens == (2_000_300, 1_000_200, 4025))
+    #expect(s.usesTokens && s.costShort == "2.0M tok")
+    #expect(s.costLong == "2.0M in (50% cached) · 4k out")
+    s.costUsd = 0.25
+    #expect(!s.usesTokens && s.costShort == "$0.2500")
+    #expect(Session(id: "y", beamId: "", beamName: "").costShort == "$0.0000")
+}
+
+@Test func redactIsFastOnLongRuns() {
+    // 30 KB of base64 (an SVG data URI) took 11s with the old KEY=value rule.
+    let blob = "data:image/png;base64," + String(repeating: "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5", count: 640)
+    let t = Date()
+    _ = Secrets.redact(blob + "\nGITHUB_TOKEN=abcdefgh12345678\n" + blob)
+    #expect(Date().timeIntervalSince(t) < 0.5)
+    #expect(Secrets.redact("x GITHUB_TOKEN=abcdefgh12345678") == "x GITHUB_TOKEN=[REDACTED]")
+    #expect(Secrets.redact(#"{"api_key": "sk_live_abcdef123456"}"#) == #"{"api_key": "[REDACTED]"}"#)
 }

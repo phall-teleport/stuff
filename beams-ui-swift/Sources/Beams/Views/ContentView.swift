@@ -17,6 +17,12 @@ struct ContentView: View {
         }
         .overlay(alignment: .bottomTrailing) { ToastStack() }
         .sheet(isPresented: $m.showOpenFromGitHub) { OpenFromGitHubView().environment(model) }
+        .sheet(isPresented: Binding(get: { model.continueSheetSessionID != nil },
+                                    set: { if !$0 { model.continueSheetSessionID = nil } })) {
+            if let id = model.continueSheetSessionID, let s = model.sessions.first(where: { $0.id == id }) {
+                ContinueSheet(session: s).environment(model)
+            }
+        }
         .confirmationDialog(model.confirm?.title ?? "", isPresented: Binding(get: { model.confirm != nil }, set: { if !$0 { model.confirm = nil } }),
                             titleVisibility: .visible, presenting: model.confirm) { req in
             Button(req.okLabel, role: req.destructive ? .destructive : nil) { req.action(); model.confirm = nil }
@@ -185,7 +191,7 @@ struct SessionRow: View {
     }
 
     private var meta: String {
-        var parts = [session.beamName, "\(session.turns) turns", String(format: "$%.4f", session.costUsd), session.updated.relativeShort]
+        var parts = [session.beamName, "\(session.turns) turns", session.costShort, session.updated.relativeShort]
         if !session.lastSync.isEmpty { parts.append("synced") }
         if !session.publishedUrls.isEmpty { parts.append("🌐") }
         return parts.joined(separator: " · ")
@@ -210,7 +216,8 @@ struct MainView: View {
     var body: some View {
         VStack(spacing: 0) {
             if model.tshChecked && !model.tsh.loggedIn { AuthBanner() }
-            if let s = model.current, model.beamGone(s) { ContinueBanner(session: s) }
+            else if let reason = model.sshBlockedReason { SSHAccessBanner(reason: reason) }
+            if let s = model.current, model.beamGone(s), model.sshBlockedReason == nil { ContinueBanner(session: s) }
             if let s = model.current {
                 TranscriptView(sessionID: s.id)
                 Composer()
@@ -233,7 +240,8 @@ struct MainView: View {
                     .help(s.publishedUrls.joined(separator: "\n"))
                 }
                 if let s = model.current {
-                    Text(String(format: "$%.4f", s.costUsd)).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text(s.costLong).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .help(s.usesTokens ? "Codex reports tokens, not dollars" : "Cost reported by Claude Code")
                 }
                 if model.currentBusy {
                     Button { model.stop() } label: { Label("Stop", systemImage: "stop.fill") }.help("Stop the running turn (⌘.)")
@@ -254,12 +262,32 @@ struct EmptyState: View {
             Text("Do all the things, inside a Beam").font(.title2.weight(.semibold))
             Text("Create or pick a sandbox on the left. Each session runs Claude Code (or another model choosable from Settings) in the beam, streams the conversation here, and can commit the transcript and memory to GitHub.")
                 .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 520)
+            VStack(alignment: .leading, spacing: 8) {
+                feature("server.rack", "MCP servers", "In Settings, add MCP servers from your Teleport cluster, or ones running on this Mac. Local servers are tunneled into the beam for the agent to use.")
+                feature("square.and.arrow.down", "Save locally", "Copy what the agent made in the beam to a folder on this Mac (⌘S).")
+                feature("tray.and.arrow.down", "Pick up where you left off", "Open a session synced to GitHub and continue it in a new beam (⌘O).")
+                feature("cpu", "Claude Code or Codex", "Choose the agent and model in Settings. Permission prompts appear right in the conversation.")
+            }
+            .frame(maxWidth: 520, alignment: .leading)
+            .padding(.top, 8)
+            // Stacked, not side by side: see "Layout feedback loops" in CLAUDE.md.
+            SettingsLink { Label("Open Settings", systemImage: "gearshape") }
+                .padding(.top, 6)
             if model.config.github.repo.contains("/") {
                 Button { model.openFromGitHub() } label: { Label("Open a previous session…", systemImage: "tray.and.arrow.down") }
-                    .padding(.top, 6)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+
+    private func feature(_ icon: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Image(systemName: icon).foregroundStyle(Color.accentColor).frame(width: 18)
+            (Text(title).fontWeight(.semibold) + Text("  " + detail).foregroundColor(.secondary))
+                .font(.callout)
+            // No .fixedSize(vertical:) here: it made the split view's layout
+            // loop, leaving the sidebar and inspector blank (2026-09-30).
+        }
     }
 }

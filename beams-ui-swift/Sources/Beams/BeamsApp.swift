@@ -19,7 +19,11 @@ struct BeamsApp: App {
         WindowGroup("Beams") {
             ContentView()
                 .environment(model)
-                .frame(minWidth: 960, minHeight: 600)
+                // Below ~990pt the sidebar + main column + inspector don't fit and
+                // the split view's layout feeds back on itself until AppKit throws
+                // (reproduced offscreen with Tests/BeamsTests/LayoutProbe.swift).
+                // 1040 leaves a margin.
+                .frame(minWidth: 1040, minHeight: 600)
                 .task { await model.boot() }
         }
         // Standard unified title bar: without it (.hiddenTitleBar) the detail
@@ -35,7 +39,11 @@ struct BeamsApp: App {
             CommandMenu("Session") {
                 Button("Stop Turn") { model.stop() }.keyboardShortcut(".", modifiers: .command).disabled(!model.currentBusy)
                 Divider()
-                Button("Pull Memory from Beam") { Task { await model.pullMemory() } }.disabled(model.current == nil)
+                Button("Save Work Folder to Mac") { Task { await model.saveWorkFolder() } }
+                    .keyboardShortcut("s").disabled(model.current == nil)
+                Button("Save Work Folder To…") { Task { await model.saveWorkFolder(choose: true) } }
+                    .keyboardShortcut("s", modifiers: [.command, .shift]).disabled(model.current == nil)
+                Divider()
                 Button("Sync Beam Session to GitHub") { Task { await model.syncNow() } }.disabled(model.current == nil)
                 Divider()
                 Button("Toggle Inspector") { model.showInspector.toggle() }.keyboardShortcut("i", modifiers: [.command, .option])

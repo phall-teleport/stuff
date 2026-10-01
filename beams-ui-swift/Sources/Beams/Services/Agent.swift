@@ -10,6 +10,8 @@ struct TurnOptions {
     var permissionMode: String
     var model: String
     var maxTurns: Int = 0
+    /// MCP servers from Settings (`--mcp-config`, plus waiting for tunnels).
+    var mcpServers: [MCPServer] = []
 
     /// Anything but bypass means Claude Code will ask before using tools. In
     /// print mode nobody can answer a terminal prompt, so we tell it to route
@@ -23,7 +25,9 @@ struct TurnOptions {
         var s = "set -e\n"
         s += "export PATH=\"$HOME/.local/bin:$PATH\"\n"
         s += "mkdir -p \(Shell.quote(workDir)) && cd \(Shell.quote(workDir))\n"
+        s += MCPConfig.waitScript(mcpServers)
         s += "exec claude -p --verbose --output-format stream-json --input-format stream-json"
+        if let mcp = MCPConfig.claudeJSON(mcpServers) { s += " --mcp-config \(Shell.quote(mcp))" }
         s += resume ? " --resume \(sessionID)" : " --session-id \(sessionID)"
         if asksPermission {
             s += " --permission-mode \(permissionMode) --permission-prompt-tool stdio"
@@ -133,6 +137,27 @@ enum AgentScripts {
         """
     }
 
+    /// The working directory for saving on this Mac: like `workspacePull` but
+    /// keeps .git, dist and build (it's a local copy, not a commit), still
+    /// skips dependency caches, and still keeps credential files in the beam.
+    static func workspaceDownload(workDir: String) -> String {
+        let q = Shell.quote(workDir)
+        let secretExcludes = Secrets.excludedPatterns.map { "--exclude=\(Shell.quote($0))" }.joined(separator: " ")
+        return """
+        [ -d \(q) ] || exit 0
+        cd \(q) || exit 0
+        [ -z "$(ls -A . 2>/dev/null)" ] && exit 0
+        tar czf - \\
+          --exclude='./node_modules' --exclude='*/node_modules' \\
+          --exclude='./.venv' --exclude='*/.venv' \\
+          --exclude='__pycache__' --exclude='*.pyc' \\
+          --exclude='./.next' --exclude='*/.next' \\
+          --exclude='./target' --exclude='*/target' \\
+          \(secretExcludes) \\
+          .
+        """
+    }
+
     /// Unpacks a workspace tarball (from `workspacePull`) into the working dir.
     static func workspaceRestore(workDir: String) -> String {
         let q = Shell.quote(workDir)
@@ -199,8 +224,26 @@ enum PublishedURLs {
             while let last = u.last, ".,;:".contains(last) { u.removeLast() }
             let key = u.lowercased()
             if key.hasPrefix("https://" + host) { continue }   // the tenant's own web UI
+            guard isPublishedApp(key, proxy: host) else { continue }
             if !seen.contains(key) { seen.insert(key); out.append(u) }
         }
         return out
+    }
+
+    /// Tenant services that show up in every transcript (the beam's API
+    /// proxies, see ANTHROPIC_BASE_URL / OPENAI_BASE_URL) and are not apps.
+    static let serviceHosts: Set<String> = ["anthropic", "openai"]
+
+    /// A published beam app's host is `<beam-alias>-<number>.<tenant>`, e.g.
+    /// mild-moon-7727.super-grass.beams.sh. Other subdomains (API proxies,
+    /// regular Teleport apps) must not become 🌐 buttons.
+    static func isPublishedApp(_ url: String, proxy: String) -> Bool {
+        var h = url.lowercased()
+        for p in ["https://", "http://"] where h.hasPrefix(p) { h.removeFirst(p.count) }
+        guard let dot = h.firstIndex(of: ".") else { return false }
+        let label = String(h[..<dot])
+        guard String(h[h.index(after: dot)...]).hasPrefix(hostOnly(proxy)) else { return false }
+        if serviceHosts.contains(label) { return false }
+        return label.range(of: #"^[a-z0-9]+(?:-[a-z0-9]+)*-\d+$"#, options: .regularExpression) != nil
     }
 }

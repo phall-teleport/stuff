@@ -248,15 +248,6 @@ enum GitHubSync {
         return String(decoding: head, as: UTF8.self).contains(needle)
     }
 
-    /// Pulls the repo and returns <prefix>/memory, or nil if there's no snapshot yet.
-    static func restoreMemoryDir(cfg: GitHubConfig, cacheDir: URL, log: @escaping (String) -> Void) async throws -> URL? {
-        guard cfg.repo.contains("/") else { throw SyncError(message: "GitHub repo must be set in the panel") }
-        try await ensureClone(repo: cfg.repo, dir: cacheDir, branch: cfg.branch.isEmpty ? "main" : cfg.branch, log: log)
-        let dir = cacheDir.appendingPathComponent("\(prefix(cfg))/memory", isDirectory: true)
-        var isDir: ObjCBool = false
-        return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue ? dir : nil
-    }
-
     private static func ensureClone(repo: String, dir: URL, branch: String, log: @escaping (String) -> Void) async throws {
         let fm = FileManager.default
         if !fm.fileExists(atPath: dir.appendingPathComponent(".git").path) {

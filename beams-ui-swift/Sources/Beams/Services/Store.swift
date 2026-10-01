@@ -103,11 +103,6 @@ final class Store {
         return out.sorted { $0.path < $1.path }
     }
 
-    func readMemoryFile(_ id: String, _ rel: String) -> String {
-        guard !rel.contains("..") else { return "" }
-        return (try? String(contentsOf: memoryDir(id).appendingPathComponent(rel), encoding: .utf8)) ?? ""
-    }
-
     /// Replaces the session's memory snapshot with the contents of a gzip tarball.
     func replaceMemory(_ id: String, tarGz: Data) async throws {
         try await unpack(tarGz, into: memoryDir(id))

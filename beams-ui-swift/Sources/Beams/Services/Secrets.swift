@@ -31,7 +31,11 @@ enum Secrets {
             // Handles .env lines, JSON ("token": "…") and JSON escaped inside a
             // transcript string (\"token\": \"…\"). The value must contain a
             // letter so numeric JSON values (which would break JSON) are left alone.
-            (re(#"((?:[A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CLIENT_?SECRET))\\?"?\s*[=:]\s*\\?"?)(?=[A-Za-z0-9/+_.@:-]*[A-Za-z])([A-Za-z0-9/+_.@:-]{8,})"#, [.caseInsensitive]), "$1[REDACTED]"),
+            // Anchored at the start of a word with bounded prefixes: the old
+            // unanchored `[A-Za-z0-9_]*` retried from every position of a long
+            // run (base64 in an SVG, minified JS), which made it quadratic —
+            // 11s for a 29 KB file, minutes for a repo, on the main thread.
+            (re(#"(?<![A-Za-z0-9_])((?:[A-Za-z0-9_]{0,48}?(?:TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|CLIENT_?SECRET))\\?"?[ \t]{0,8}[=:][ \t]{0,8}\\?"?)(?=[A-Za-z0-9/+_.@:-]{0,256}?[A-Za-z])([A-Za-z0-9/+_.@:-]{8,})"#, [.caseInsensitive]), "$1[REDACTED]"),
         ]
     }()
 

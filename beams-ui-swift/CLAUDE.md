@@ -70,6 +70,26 @@ just a hang). A pile of background `tsh` probes will freeze the app's
 wedged call surfaces an error instead of hanging. Don't run many concurrent
 `tsh` commands against the same profile.
 
+## SSO logins without the `beams` SSH login (2026-09-24)
+
+Beams need the SSH login `beams` (Settings' "Beam login" overrides). The
+`beam-user` role grants it; `beam-admin` does NOT. An SSO identity lacking
+beam-user can list/create beams but every exec is refused (`principal "beams"
+not in the set of valid principals`, cert shows `-teleport-nologin-…`), and
+because tsh also offered every key in the ssh-agent, each attempt logged a burst
+of failed logins. Now: all tsh calls set `TELEPORT_USE_LOCAL_SSH_AGENT=false`
+(`TshClient.env`); `TshStatus` parses `roles`/`logins`; `sshBlockedReason`
+blocks in-beam actions up front (`sshAllowed()` gate) and `noteSSHFailure`
+records a refusal so later clicks explain instead of reconnecting;
+`SSHAccessBanner` offers "Log in again" (roles are fixed at login). Settings has
+`--auth=<connector>` and `--mfa-mode=browser` for `tsh login`, shared by the
+in-app login and the Terminal hand-off (`TshClient.loginArgs`). Settings only
+re-checks tsh when proxy/tsh binary/beam login change, debounced.
+Verified 2026-09-24: `tsh status -f json` exposes `active.logins` and
+`active.roles`; exec works with the agent switch. Re-logging in via SAML after
+beam-user was mapped gave `Logins: beams`. Not verified: that the switch removes
+the extra failed-key audit entries (needs a failing login to observe).
+
 ## Agents: Claude Code and Codex
 
 `config.agent` selects the CLI run in the beam: `claude` (default) or `codex`.
@@ -84,6 +104,10 @@ lists live in `SettingsView` (`claudeModels`, `codexModels`). Codex flag note:
 pass NO color flag — `--no-color` doesn't exist and `codex exec resume` rejects
 `--color` (plain `exec` accepts it). Codex turns are slow (minutes). With a bad
 thread id, `exec resume` silently starts a new thread instead of erroring.
+Codex reports tokens, not dollars: `turn.completed.usage` is the THREAD's
+running total, so `Session.codexUsage` keeps the latest [input, cached, output]
+per thread id and the UI shows tokens (`costShort`/`costLong`) instead of $0.
+Older sessions are backfilled from the transcript at boot (off main).
 
 ## Sync commits generated files too
 
@@ -96,6 +120,17 @@ per-session + latest memory, AND the generated project files. The pull script
 must be sent through `Shell.quote` (the app does this); passing it unquoted to
 `tsh beams exec` breaks because tsh flattens argv and re-parses on the remote.
 
+## Saving the work folder to the Mac (2026-09-30)
+
+Inspector → Save locally (and Session → Save Work Folder, ⌘S / ⇧⌘S) runs
+`AgentScripts.workspaceDownload` (like workspacePull but keeps .git, dist,
+build; still skips dependency caches and `Secrets.excludedPatterns`) and
+unpacks into a folder picked with NSOpenPanel (`AppModel+Files.swift`).
+Merge, not mirror: same-named files are replaced, nothing is deleted. The
+folder is remembered per session (`Session.localFolder`/`localSaved`, which
+the Go app drops if it rewrites the session). bsdtar rejects `..`/absolute
+entries (tested). Verified 2026-09-30: the generated script against a beam.
+
 ## Secrets never leave the beam (incident 2026-09-23)
 
 Workspace sync once pushed a tbot identity, private keys and `.env` tokens into
@@ -106,6 +141,31 @@ tbot outputs, nested `*/beams/sessions`); `pullWorkspace` runs
 `Secrets.redactFiles`; `GitHubSync.sync` redacts transcript.md/.jsonl,
 conversation files, memory and workspace before committing. Keep every path
 to GitHub going through `Secrets`. Sync targets should be private repos.
+Redaction must stay linear and off the main actor (beach ball 2026-09-30: a
+workspace holding the whole teleport repo, 14.8k files, took 258s on the main
+thread after every turn; the KEY=value rule's unanchored `[A-Za-z0-9_]*` was
+quadratic on base64/minified runs — 11s for one 29 KB SVG). The rule is now
+word-anchored with bounded quantifiers (26s total), `pullWorkspace` redacts in
+`Task.detached`, and `redactIsFastOnLongRuns` guards it.
+
+## Layout feedback loops (blank sidebar/inspector, missing composer)
+
+Symptom: after clicking, the sidebar and inspector go blank and the composer
+disappears; the app stays alive and idle. Cause: a layout feedback loop in the
+split view; AppKit throws `_postWindowNeedsUpdateConstraints` during layout, the
+app swallows it, and the window is left half laid out. Two triggers, found with
+`Tests/BeamsTests/LayoutProbe.swift` (see its header):
+- Window narrower than ~990pt with the inspector open → min width is now 1040.
+- `ContinueBanner` with a second control in its row (Picker, Menu, or button +
+  popover) at ~1000–1100pt → the banner has ONE button; beam choice is in
+  `ContinueSheet`. Keep controls out of banners in the main column.
+- `.fixedSize(horizontal: false, vertical: true)` on wrapping text in the
+  main column (the empty-state feature list, 2026-09-30) → blank sidebar AND
+  inspector even with no session open. Let the frame's maxWidth wrap it.
+The probe doesn't always crash: a PNG with blank side panes IS the bug (don't
+write it off as an offscreen artifact). `BEAMS_LAYOUT_PROBE="none|…"` renders
+the empty state (no session).
+Also never do disk I/O in a view body (`restorePlan` is cached, @ObservationIgnored).
 
 ## Picking up a previous session (from GitHub)
 
@@ -129,6 +189,39 @@ the next turn use `--session-id` (resume would fail), writes the old transcript
 to `<workDir>/.beams/previous-session.md`, and prefixes the first prompt with a
 note pointing at it; any `result` clears the flag. `runTurn` refuses to run in a
 gone beam and hands the prompt back.
+
+## MCP servers (Settings → MCP servers, 2026-09-30)
+
+`config.mcpServers` ([MCPServer], Services/MCP.swift) is handed to every turn:
+Claude via `--mcp-config '<json>'`, Codex via `codex -c mcp_servers.<n>.…`
+(Codex path unverified). Two kinds:
+- `.teleport`: an MCP app in the Beams cluster (`tsh mcp ls -f json`). The beam
+  runs `tsh mcp connect <app>` itself (stdio) with its delegated identity
+  (`TELEPORT_IDENTITY_FILE` is set in `beams exec` shells; tsh 18.11 is there).
+- `.laptop`: HTTP MCP on the Mac's 127.0.0.1:<port>. `prepareMCP` keeps one
+  `tsh ssh -N -R p:127.0.0.1:p beams@<beam uuid>` per beam (`tsh beams ssh/exec`
+  have no -R; beams are OpenSSH nodes named by `uuid` from `beams ls`), and
+  optionally `tsh apps login` + `tsh proxy app --port p <app>` (another
+  cluster via `proxyCluster`). The turn script waits for the ports with curl.
+  Long-lived tsh children run under `Supervised.argv`, which kills them when
+  the app's stdin pipe closes (quit or crash); stop them with `closeStdin()`.
+  Commands run in that wrapper must `exec` the real program (a surviving
+  grandchild holds the output pipe and keeps it alive).
+- `Supervisor` (after prism's internal/tunnel) owns each proxy/tunnel:
+  restart with backoff 1s→30s (reset after 30s up), HTTP health probe of a
+  proxy's port every 10s (restart after 6 failures), and NO start while the
+  cluster's login is expired (`loginWait` reads `TshStatus.profileExpiry`,
+  every profile's valid_until from one `tsh status`). tsh started on an
+  expired cert begins a login by itself, so output that looks like a login
+  prompt stops the process and waits; `checkTsh` seeing new certs calls
+  `mcpLoginsChanged` (restart running, resume waiting). While anything waits,
+  `watchForLogin` re-checks `tsh status` every 30s. `tsh proxy app` gets
+  `--browser=none` (`tsh ssh`/`apps login` don't have that flag).
+Verified 2026-09-30: reverse tunnel + wait loop against a beam, no orphans;
+Supervisor restart/backoff/login-wait/no-orphan behavior in tests.
+Not verified: a real MCP app (super-grass has none), `tsh proxy app` on an
+MCP app, Codex MCP flags. `tsh mcp ls` with an expired cert starts a browser
+SSO login by itself, so `loadMCPApps` requires `tsh.loggedIn`.
 
 ## Persistent session mode (experimental)
 
@@ -155,6 +248,10 @@ closing stdin; `endPersistent` tears it down. Codex always runs per-turn.
 
 ## Commands
 
+`Scripts/bundle.sh` bumps `BUILD_NUMBER` (CFBundleVersion) on every successful
+build and reads the marketing version from `VERSION`; both are committed. It
+fails on compile errors instead of bundling a stale binary.
+
 ```bash
 Scripts/bundle.sh && open build/Beams.app
 Scripts/test.sh
@@ -167,4 +264,7 @@ BEAMSUI_MOCK=1 .build/debug/Beams
 - Agent work happens in the beam, never locally; test turns cost money.
 - Don't push to GitHub, create repos, or run `tsh login` for Paul unasked.
 - Config is shared with the Go app; restore anything a test changes.
+- Never relaunch the app while any `tsh … beams exec` process exists: those are
+  Paul's running turns and die with the app. Gate the relaunch on the count
+  (`ps -Ao command | grep -c '[t]sh --proxy.*beams exec'`), don't just print it.
 - Sentence-case labels ("Sync beam session", "Pull from beam").

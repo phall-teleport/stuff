@@ -23,8 +23,10 @@ with the Go/Wails version, so both see the same sessions and settings.
   Claude Code session. All agent work happens in the beam.
 - **Transcript** — assistant markdown, collapsible tool cards with results,
   per-turn cost footer, stop button (⌘.). Enter sends, ⌥Enter inserts a newline.
-- **Memory** — pull `~/.claude/projects/*/memory` + `CLAUDE.md` out of the
-  beam; restore the last committed snapshot into a fresh beam.
+- **Save locally** — save the beam's working directory to a folder on this Mac (⌘S).
+- **Memory** — `~/.claude/projects/*/memory` + `CLAUDE.md` are pulled from the
+  beam on every sync and put back when a session continues in a new beam
+  (no panel of its own).
 - **GitHub** — `gh` sign-in state and browser device-flow sign-in with the
   one-time code shown in the panel; searchable list of every repo you can
   access; branch dropdown with "＋ New branch…"; create a private repo; sync
@@ -50,7 +52,9 @@ Open the first time, or clear the flag:
 xattr -dr com.apple.quarantine dist/Beams.app && open dist/Beams.app
 ```
 
-`Scripts/bundle.sh` refreshes `dist/Beams.app` on every build.
+`Scripts/bundle.sh` refreshes `dist/Beams.app` on every build and bumps the
+build number in `BUILD_NUMBER`, shown in About as "Version 0.1.0 (N)". Edit
+`VERSION` to change the marketing version.
 
 ## Build
 

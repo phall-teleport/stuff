@@ -12,7 +12,7 @@ struct InspectorView: View {
             .pickerStyle(.segmented).labelsHidden().padding(10)
             Divider()
             switch model.inspectorTab {
-            case .memory: MemoryPanel()
+            case .files: FilesPanel()
             case .github: GitHubPanel()
             }
         }
@@ -20,43 +20,48 @@ struct InspectorView: View {
     }
 }
 
-// MARK: - Memory
+// MARK: - Files
 
-struct MemoryPanel: View {
+/// Saves the beam's working directory to a folder on this Mac.
+struct FilesPanel: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Button { Task { await model.pullMemory() } } label: { Label("Pull from beam", systemImage: "arrow.down") }
-                Button { Task { await model.restoreMemory() } } label: { Label("Restore from GitHub", systemImage: "arrow.up") }
-            }
-            .disabled(model.current == nil)
-            Text("Snapshot of ~/.claude/projects/*/memory and CLAUDE.md inside the beam. Pull after a turn, or turn on auto-sync.")
+            Text("What the agent writes in \(model.config.workDir) stays in the beam until you save it. Saving copies it into a folder on this Mac; files with the same names are replaced and nothing else there is deleted.")
                 .font(.caption).foregroundStyle(.secondary)
-            if model.current == nil {
-                Text("Open a session to see its memory.").font(.callout).foregroundStyle(.tertiary)
-            } else if model.memory.isEmpty {
-                Text("No memory pulled yet.").font(.callout).foregroundStyle(.tertiary)
-            } else {
-                List(model.memory, selection: Binding(get: { model.memorySelected?.id }, set: { id in
-                    if let f = model.memory.first(where: { $0.id == id }) { model.selectMemory(f) }
-                })) { f in
+            if let s = model.current {
+                let saving = model.savingLocal.contains(s.id)
+                if s.localFolder.isEmpty {
+                    Button { Task { await model.saveWorkFolder(s.id) } } label: {
+                        Label(saving ? "Saving…" : "Save to this Mac…", systemImage: "square.and.arrow.down")
+                    }
+                    .disabled(saving || model.beamGone(s))
+                } else {
                     HStack {
-                        Text(f.path).font(.caption.monospaced()).lineLimit(1)
-                        Spacer()
-                        Text("\(f.size) B").font(.caption2).foregroundStyle(.tertiary)
+                        Button { Task { await model.saveWorkFolder(s.id) } } label: {
+                            Label(saving ? "Saving…" : "Save again", systemImage: "square.and.arrow.down")
+                        }
+                        .disabled(saving || model.beamGone(s))
+                        Button("Other folder…") { Task { await model.saveWorkFolder(s.id, choose: true) } }
+                            .disabled(saving || model.beamGone(s))
                     }
-                    .tag(f.id)
-                }
-                .frame(minHeight: 120, maxHeight: 220)
-                if model.memorySelected != nil {
-                    ScrollView {
-                        Text(model.memoryContent).font(.caption.monospaced()).textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Button(AppModel.displayPath(s.localFolder)) { model.showInFinder(s.localFolder) }
+                            .buttonStyle(.link).font(.caption.monospaced()).help("Show in Finder")
+                        if let d = RFC3339.parse(s.localSaved) {
+                            Text("Saved \(d.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.tertiary)
+                        }
                     }
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
                 }
+                if saving { ProgressView().controlSize(.small) }
+                if model.beamGone(s) {
+                    Text("This session's beam is gone. Continue it in a beam to save new files.").font(.caption).foregroundStyle(.orange)
+                }
+                Text("Skipped: node_modules, .venv, target, .next, __pycache__, and credential files (.env, keys, tbot identities), which never leave the beam.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            } else {
+                Text("Open a session to save its files.").font(.callout).foregroundStyle(.tertiary)
             }
             Spacer()
         }

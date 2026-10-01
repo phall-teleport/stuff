@@ -1,15 +1,31 @@
 #!/bin/sh
 # Builds the release binary with SwiftPM and assembles a signed Beams.app.
 # Usage: Scripts/bundle.sh [debug|release]   (default: release)
+#
+# Versioning: VERSION holds the marketing version (e.g. 0.1.0, edit by hand);
+# BUILD_NUMBER is incremented on every successful build, so the About panel
+# shows e.g. "Version 0.1.0 (2)". Both files are committed.
 set -eu
 cd "$(dirname "$0")/.."
 CONF="${1:-release}"
 APP="build/Beams.app"
 ICON_PNG="Resources/appicon.png"
+mkdir -p build
 
-swift build -c "$CONF" 2>&1 | grep -v '^\[' || true
+# Fail on compile errors instead of bundling a stale binary from a previous build.
+if ! swift build -c "$CONF" > build/swift-build.log 2>&1; then
+  grep -E 'error' build/swift-build.log | grep -v '^\s*|' | sed 's/\x1b\[[0-9;]*m//g' | sort -u >&2 || cat build/swift-build.log >&2
+  echo "build failed; see build/swift-build.log" >&2
+  exit 1
+fi
 BIN="$(swift build -c "$CONF" --show-bin-path)/Beams"
 [ -x "$BIN" ] || { echo "build failed: $BIN missing" >&2; exit 1; }
+
+VERSION="$(tr -d ' \n' < VERSION 2>/dev/null || true)"; [ -n "$VERSION" ] || VERSION="0.1.0"
+BUILD="$(tr -d ' \n' < BUILD_NUMBER 2>/dev/null || true)"
+case "$BUILD" in ''|*[!0-9]*) BUILD=0 ;; esac
+BUILD=$((BUILD + 1))
+echo "$BUILD" > BUILD_NUMBER
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -26,15 +42,15 @@ if [ -f "$ICON_PNG" ]; then
   rm -rf "$ICONSET"
 fi
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleName</key><string>Beams</string>
   <key>CFBundleDisplayName</key><string>Beams</string>
   <key>CFBundleIdentifier</key><string>com.teleport.beams.native</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>Beams</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
@@ -47,7 +63,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
-echo "Built $APP"
+echo "Built $APP — version $VERSION ($BUILD)"
 
 # Ship a committed copy for people who just want to run it.
 rm -rf dist/Beams.app && mkdir -p dist && cp -R "$APP" dist/Beams.app
