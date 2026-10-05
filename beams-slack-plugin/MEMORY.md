@@ -28,8 +28,10 @@ beam); beam-list questions skip Claude.
 
 ## Repositories
 
-- Code and CI: <https://github.com/geekvoice408/vibes>, directory
-  `beams-slack-plugin/`, branch `main`.
+- This directory is mirrored in two repositories: a private one that runs CI
+  and holds deployment details, and this public one. Keep private details
+  (hosts, Slack and Teleport identifiers, tenant names) out of the public
+  copy.
 - `teleport.patch` is the full diff against `gravitational/teleport`
   `v18.11.1`. CI clones Teleport at that tag, applies the patch, builds
   `teleport-slack`, bundles `tsh` 18.11.3, and pushes tags `latest`, `main`,
@@ -216,30 +218,28 @@ it if the Beams docs (limits, features) change.
   identity-*           temp delegated identities, deleted after each command
 ```
 
+## Terraform
+
+`terraform/` deploys the stack: `teleport_bot` (default roles: preset
+`access-plugin`, which already has user/user_login_state read, plus
+`beam-user`), a `bound_keypair` `teleport_provision_token` with a
+`random_password` registration secret (`recovery.mode = relaxed`), and
+kreuzwerker/docker volumes plus `volume-init`, `tbot`, and plugin containers.
+Configs and Slack tokens are `upload`ed into the containers from
+`templates/*.tftpl` and variables, so state holds secrets. Provider creds:
+`eval "$(tctl terraform env)"` (temporary bot with the preset
+`terraform-provider` role). The Slack app comes from `slack-app-manifest.yaml`;
+the image is built and pushed by hand. `terraform validate` passes with
+teleport v18.11.3, kreuzwerker/docker v3.9.0, random v3.9.1. Not yet applied
+anywhere; the live deployment still uses Compose.
+
 ## Live deployment
 
-- Host `ventura.local` (10.0.0.188), reachable with `ssh ventura.local`.
-- Directory `/usr/local/docker/beams-hackathon`, Compose project
-  `beams-hackathon`: `volume-init`, `tbot`, and `teleport-slack`. Its
-  `docker-compose.yml` matches the one in this repo.
-- Teleport tenant `example-beams-tenant.beams.sh:443`. Bot `scotty` with roles
-  `access-plugin,beam-user`. `tbot` instance
-  `9d773b47-bef6-4f36-b7eb-83deb955a23b` joined 2026-10-01 with token join.
-- Identity file `/var/lib/teleport-slack/identity/identity` in the plugin
-  container (volume `beams-hackathon_plugin-identity`).
-- `config.toml` there has `bot_name = "scotty"`, `delegation_ttl = "168h"`,
-  `required_role = "beam-user"`. The Slack tokens are inline in that file
-  (not in the repo); moving them into `secrets/` files would be tidier.
-- Rollback: pre-`tbot` copies are `config.toml.bak-20261001-145142` and
-  `docker-compose.yml.bak-20261001-145142`. The old `docker run` container
-  `clever_williams` is stopped but not removed. The old hand-signed
-  `secrets/plugin-identity` (user `access-plugin`) is unused and can be
-  deleted.
-- Deploy a new image: `docker compose pull teleport-slack && docker compose up
-  -d --no-deps teleport-slack`.
-
-Test identities: Slack workspace `T03PXFLJF`, user `U049LDB6K` mapped to
-`paul@geekvoice.net` (Google SSO), test channel `C0C5D5M81U7`.
+The running deployment uses the Docker Compose stack from this directory with
+`tbot` 18.11.3 and bot `scotty` (roles `access-plugin,beam-user`). New images
+are deployed with `docker compose pull teleport-slack && docker compose up -d
+--no-deps teleport-slack`. Host, paths, identifiers, and rollback notes are
+kept in the private repository, not here, because this repository is public.
 
 ## History: what was tried
 
@@ -277,10 +277,8 @@ was expected, broken line continuations).
    and `bot-scotty`.
 4. The bot may no longer need `beam-user`, since beam actions run as users.
    Verify, then drop it from `scotty`.
-5. Security clean-up: rotate the GitHub token that was pasted into an earlier
-   Codex conversation. Rotate the Slack tokens if they were ever shared. Delete
-   the old `secrets/plugin-identity`. Remove `beam-user` from the
-   `access-plugin-impersonator` role, which is no longer needed.
+5. Security clean-up for the live deployment is tracked in the private
+   repository.
 
 ## Security notes
 
