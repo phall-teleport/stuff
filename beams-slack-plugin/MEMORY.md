@@ -301,13 +301,20 @@ json; plan mode was chosen so the whole plan is approved at once.
 
 Demo skits (`beams_demo.go`, `demo_skits`, off by default): "zendesk" +
 "ticket" replies with a made-up ticket number (no Zendesk call). "live
-website ... down" lists apps (`tsh apps ls` as the user), takes the one with a
-`hosted-on` label, runs `tsh ssh <demo_ssh_login>@<host> "systemctl
-is-active nginx || true"`, and if not active writes
+website ... down" runs tsh inside a beam (thread's, newest, or a new one;
+`demoTSH` = `tsh beams exec <beam> "'tsh' ..."`, since tsh in a beam is
+logged in as the owner via a delegation session; Paul wanted beams used, not
+the plugin's own tsh): `tsh apps ls`, takes the app with a `hosted-on`
+label, runs `tsh ssh <demo_ssh_login>@<host> "systemctl is-active nginx ||
+true"`, and if not active writes
 `threads/<key>.demo-fix` and offers to start it; the next message in the
 thread ("yes"/"no") consumes it: `systemctl start nginx` (sudo -n if the
 login isn't root), then is-active and `curl -w %{http_code}` of the app URI
-from the server. Runs before delete/list/chat in Handle.
+from the server. "notify ... owner" DMs `demo_service_owner` (looked up
+with FindPeople) "There's an issue with the live website." and records them
+in `threads/<key>.demo-owner`; a successful fix in that thread DMs "The
+issue was resolved." plus the reason (nginx had stopped on <host>, with the
+systemctl status saved in the fix). Runs before delete/list/chat in Handle.
 
 Telling people (`beams_tell.go`): the chat model and coding agents can emit
 `BEAMS_BOT_ACTION: tell <person> :: <message>` (`tellInstructions` in both
