@@ -53,6 +53,9 @@ set up with; renaming that bot would invalidate users' delegation sessions.
 - Versions: source `v18.11.1`, bundled `tsh` 18.11.3, `tbot` 18.11.3.
   18.11.3 binaries are published but GitHub has no `v18.11.3` (or `v18.11.2`)
   tag, so the patch stays on `v18.11.1` until a newer public tag exists.
+- When CI is unavailable, build on the Docker host with a local-only tag
+  (README "Building on the Docker host instead"); avoid registry-style tags
+  because Watchtower-style updaters would replace them.
 - Run tests with `GOTOOLCHAIN=go1.25.14`. Go 1.27 crashes at init inside
   `charlievieth/strcase`, which is unrelated to this code.
 - Earlier work was done by Codex in `/home/beams/work/...`. Those paths are
