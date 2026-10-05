@@ -281,6 +281,16 @@ sends up to 2 images of 3.5 MB (Teleport's model proxy caps requests at
 history keeps "[attached name]". Otherwise the request goes to a beam and
 files are copied with `tsh beams scp` into `/tmp/slack-attachments/`.
 
+Demo skits (`beams_demo.go`, `demo_skits`, off by default): "zendesk" +
+"ticket" replies with a made-up ticket number (no Zendesk call). "live
+website ... down" lists apps (`tsh apps ls` as the user), takes the one with a
+`hosted-on` label, runs `tsh ssh <demo_ssh_login>@<host> "systemctl
+is-active nginx || true"`, and if not active writes
+`threads/<key>.demo-fix` and offers to start it; the next message in the
+thread ("yes"/"no") consumes it: `systemctl start nginx` (sudo -n if the
+login isn't root), then is-active and `curl -w %{http_code}` of the app URI
+from the server. Runs before delete/list/chat in Handle.
+
 Telling people (`beams_tell.go`): the chat model and coding agents can emit
 `BEAMS_BOT_ACTION: tell <person> :: <message>` (`tellInstructions` in both
 prompts). `<person>` is a name or `<@ID>`; `FindSlackPeople` uses `users.info`
