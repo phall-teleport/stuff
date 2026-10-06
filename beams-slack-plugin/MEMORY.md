@@ -299,6 +299,12 @@ Without --dangerously-skip-permissions and without plan mode, -p runs stop at
 the first denied tool and report `permission_denials` in --output-format
 json; plan mode was chosen so the whole plan is approved at once.
 
+Video: `assets/video/teleport-beams-bot.mp4`, linked near the top of the
+README, with the call sidebar's name labels painted over (a Swift
+AVAssetReader/Writer pass filling the label rects with the frame's own
+sidebar colour, audio passed through). GitHub doesn't play a committed mp4
+inline, so the README links it.
+
 Settings renamed 2026-10-06 so the README doesn't read as a demo:
 `demo_skits` -> `incident_response`, `demo_ssh_login` ->
 `incident_ssh_login`, `demo_service_owner` -> `service_owner` (Go fields
