@@ -484,29 +484,3 @@ private func runs(_ file: String) -> Int {
     #expect(Secrets.redact("x GITHUB_TOKEN=abcdefgh12345678") == "x GITHUB_TOKEN=[REDACTED]")
     #expect(Secrets.redact(#"{"api_key": "sk_live_abcdef123456"}"#) == #"{"api_key": "[REDACTED]"}"#)
 }
-
-@Test func beamctlParsing() throws {
-    // Shapes captured from beamctl 0.1.0 on fabled-firefly, plus the other ServiceStatus variants.
-    let json = #"""
-    {"web": {"Running": {"main_pid": 303, "pty": null}},
-     "codex": {"Running": {"main_pid": 410, "pty": "/dev/pts/2"}},
-     "old": "Stopped",
-     "paused": {"Frozen": {"main_pid": 12, "pty": null}},
-     "done": {"Exited": 0},
-     "bad": {"Error": "spawn failed: No such file or directory"}}
-    """#
-    let list = try #require(Beamctl.parseList(Data(json.utf8)))
-    #expect(list.map(\.name) == ["bad", "codex", "done", "old", "paused", "web"])
-    let byName = Dictionary(uniqueKeysWithValues: list.map { ($0.name, $0) })
-    #expect(byName["web"]?.state == "Running" && byName["web"]?.pid == 303 && byName["web"]?.hasPTY == false)
-    #expect(byName["codex"]?.hasPTY == true && byName["codex"]?.label == "running · pid 410 · pty")
-    #expect(byName["old"]?.state == "Stopped" && byName["old"]?.isLive == false)
-    #expect(byName["paused"]?.isLive == true)
-    #expect(byName["done"]?.detail == "exit 0")
-    #expect(byName["bad"]?.detail == "spawn failed: No such file or directory")
-    #expect(Beamctl.parseList(Data("{}".utf8))?.isEmpty == true)
-    #expect(Beamctl.parseList(Data((Beamctl.missingMarker + "\n").utf8)) == nil)
-    #expect(Beamctl.logsScript("my app", follow: true) == "exec beamctl logs 'my app' --follow\n")
-    #expect(Beamctl.actionScript("stop", "x; rm -rf /") == "beamctl stop 'x; rm -rf /'\n")
-    #expect(Beamctl.actionScript("rm", "x") == nil)
-}

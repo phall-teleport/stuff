@@ -192,7 +192,6 @@ struct GitHubPanel: View {
     private func deviceBox(_ code: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(code).font(.system(size: 24, design: .monospaced)).foregroundStyle(Color.accentColor).textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading).copyable(code)
             Text("Enter this code on github.com/login/device. The browser should have opened automatically.")
                 .font(.caption).foregroundStyle(.secondary)
             Button("Open github.com/login/device") { model.open("https://github.com/login/device") }.buttonStyle(.link).font(.caption)
