@@ -122,6 +122,7 @@ struct PermissionCard: View {
             if !request.summary.isEmpty || !request.description.isEmpty {
                 Text(request.summary.isEmpty ? request.description : request.summary)
                     .font(.callout.monospaced()).textSelection(.enabled).lineLimit(6)
+                    .padding(.trailing, 28).copyable(request.summary.isEmpty ? request.description : request.summary)
             }
             Button(showInput.on ? "Hide details" : "Show details") { withAnimation { showInput.on.toggle() } }
                 .buttonStyle(.link).font(.caption)
@@ -194,6 +195,7 @@ struct CodeBlock: View {
         }
         .frame(maxHeight: 320)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .textBackgroundColor)))
+        .copyable(text)
     }
 }
 

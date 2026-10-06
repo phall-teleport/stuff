@@ -16,6 +16,8 @@ struct SettingsView: View {
                 Toggle("Do MFA in the browser (--mfa-mode=browser)", isOn: $m.config.tshMFABrowser)
                 Text(model.tshLoginCommand)
                     .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.trailing, 28)
+                    .copyable(model.tshLoginCommand)
                     .help("The login command the app runs, and hands to the terminal when a password is needed")
                 TextField("tsh binary", text: $m.config.tshBin, prompt: Text("tsh"))
                 Picker("Terminal for password logins", selection: $m.config.terminalApp) {

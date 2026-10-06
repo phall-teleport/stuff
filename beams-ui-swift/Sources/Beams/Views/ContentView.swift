@@ -100,6 +100,7 @@ struct SidebarView: View {
 struct BeamRow: View {
     @Environment(AppModel.self) private var model
     let beam: Beam
+    @Environment(\.openWindow) private var openWindow
     @StateObject private var hover = LocalFlag()
     @StateObject private var pop = HoverPopover()
 
@@ -122,6 +123,7 @@ struct BeamRow: View {
         .onTapGesture { Task { await model.startSession(on: beam) } }
         .contextMenu {
             Button("New session on \(beam.name)") { Task { await model.startSession(on: beam) } }
+            Button("Services and logs…") { openWindow(id: "services", value: beam.id) }
             Divider()
             Button("Delete beam…", role: .destructive) { model.deleteBeam(beam) }
         }

@@ -223,6 +223,24 @@ Not verified: a real MCP app (super-grass has none), `tsh proxy app` on an
 MCP app, Codex MCP flags. `tsh mcp ls` with an expired cert starts a browser
 SSO login by itself, so `loadMCPApps` requires `tsh.loggedIn`.
 
+## beam-init services (2026-10-02)
+
+Beams created since 2026-10 run beam-init as PID 1 with `beamctl` (older
+beams don't; `Beamctl.listScript` prints a marker instead). Sandbox context
+menu → "Services and logs…" opens `ServicesWindow` (a `WindowGroup(id:
+"services", for: String.self)` keyed by beam id): `beamctl --json list`
+(`{"name": "Stopped" | {"Running": {"main_pid", "pty"}} | {"Exited": n} |
+{"Error": "…"} …}`, see beam-init-api ServiceStatus), logs via
+`beamctl logs <name> [--follow]` streamed through `tsh beams exec` (follow
+replays the snapshot first; lines arrive live, verified), and
+restart/stop/freeze/thaw from the row's context menu. Switching service or
+closing the window terminates the follower (gen-checked so tsh's "context
+canceled" isn't shown); no beamctl is left running in the beam. beamctl
+0.1.0 panics with BrokenPipe when its reader goes away (harmless).
+`CopyButton` / `.copyable(text)` (an overlay, never changes layout) is on code
+and tool blocks, permission summaries, the GitHub device code, Settings'
+login command and the logs pane.
+
 ## Persistent session mode (experimental)
 
 `config.persistentSession` (or `BEAMSUI_PERSISTENT=1`) keeps ONE

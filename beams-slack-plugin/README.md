@@ -66,8 +66,7 @@ Here's what you can do, right in Slack:
 - **Get work done.** "@Teleport Beams Bot make a webpage about things to do in
   Ballard and share it." The bot works in one of your beams, shows you its
   plan, and once you say yes, does the work and replies with a link. Mention
-  it in a channel, and it answers in a thread under your message:
-
+  it in a channel, and it answers in a thread under your message.
 
 - **Loop people in.** "tell Anna the website is down" messages Anna for you,
   right away.
