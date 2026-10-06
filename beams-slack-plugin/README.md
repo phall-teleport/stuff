@@ -64,9 +64,6 @@ Here's what you can do, right in Slack:
   plan, and once you say yes, does the work and replies with a link. Mention
   it in a channel, and it answers in a thread under your message:
 
-  <img src="assets/screenshots/bot-ask-in-channel.png" alt="A user mentions @Teleport Beams Bot in a channel asking for a webpage about fun things to do in Seattle" width="560">
-
-  <img src="assets/screenshots/bot-ask-thread.png" alt="Teleport Beams Bot replies in the thread that it is working in the user's beam" width="480">
 
 - **Loop people in.** "tell Anna the website is down" messages Anna for you,
   right away.
