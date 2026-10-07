@@ -50,6 +50,12 @@ struct BeamsApp: App {
             }
         }
 
+        // One window per beam: its beam-init services and their logs.
+        WindowGroup("Services", id: "services", for: String.self) { $beamID in
+            ServicesWindow(beamID: beamID ?? "").environment(model)
+        }
+        .defaultSize(width: 980, height: 620)
+
         Settings {
             SettingsView().environment(model)
         }
