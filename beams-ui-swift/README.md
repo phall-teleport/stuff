@@ -39,6 +39,14 @@ with the Go/Wails version, so both see the same sessions and settings.
 - **Services and logs** — right-click a sandbox for its beam-init services
   (`beamctl`): state, live logs, restart/stop/freeze/thaw. Beams created before
   beam-init became the default don't have it.
+- **Local pi sessions** — the laptop icon opens a folder on this Mac and runs
+  `pi` turns against it directly (`pi --mode json`), no beam or SSH involved;
+  the agent/model picker and the "proxy the agent's Teleport app to this Mac"
+  toggle double as pi's model backend. Experimental: no permission prompts,
+  images, MCP, or GitHub sync yet.
+- **Persistent session mode** (experimental) — keeps one `claude -p` process
+  alive per session instead of spawning a fresh one every turn, preserving
+  context without the per-turn tsh + claude startup cost.
 - **Pick up where you left off** — ⌘O lists sessions synced to the GitHub repo
   and continues one in a new beam, restoring files, memory and the conversation.
 - **Save locally** — save the beam's working directory to a folder on this Mac (⌘S).
@@ -101,16 +109,26 @@ Same as the Go app: `~/Library/Application Support/BeamsUI/` with
 ## Layout
 
 ```
-Sources/Beams/BeamsApp.swift            @main, scenes, menu commands
-Sources/Beams/AppModel.swift            @Observable state + all actions
-Sources/Beams/Models.swift              Beam, Session, Config, stream events → transcript items
-Sources/Beams/Services/ProcessRunner    child processes, PATH fix, streaming lines
-Sources/Beams/Services/TshClient        tsh beams wrapper, status/login, MockClient
-Sources/Beams/Services/Agent            turn script, memory scripts, published-URL detector
-Sources/Beams/Services/Store            config/sessions/transcripts/memory on disk
-Sources/Beams/Services/GitHubSync       gh auth/repos/branches, git clone/commit/push
-Sources/Beams/Views/*                   ContentView, TranscriptView, InspectorViews, SettingsView
-Scripts/bundle.sh, Scripts/test.sh      app bundle and tests without Xcode
+Sources/Beams/BeamsApp.swift             @main, scenes, menu commands
+Sources/Beams/AppModel.swift             @Observable state + all actions
+Sources/Beams/AppModel+Files.swift       save-locally folder picker, workspace download
+Sources/Beams/AppModel+MCP.swift         MCP tunnel/proxy reconciliation, agent proxy
+Sources/Beams/Models.swift               Beam, Session, Config, stream events → transcript items
+Sources/Beams/Services/ProcessRunner     child processes, PATH fix, streaming lines
+Sources/Beams/Services/TshClient         tsh beams wrapper, status/login, MockClient
+Sources/Beams/Services/Agent             Claude turn script, memory scripts, published-URL detector
+Sources/Beams/Services/Codex             codex exec / exec resume, JSONL event mapping
+Sources/Beams/Services/Pi                local pi turns against a folder on this Mac
+Sources/Beams/Services/Beamctl           beam-init services: list/logs/restart/stop/freeze/thaw
+Sources/Beams/Services/MCP               MCP server config, Teleport/laptop server kinds
+Sources/Beams/Services/Supervisor        tunnel/proxy process lifecycle, backoff, health probes
+Sources/Beams/Services/Images            paste/drop image attachments, scaling + encoding
+Sources/Beams/Services/Secrets           exclude/redact patterns for sync and workspace pulls
+Sources/Beams/Services/Store             config/sessions/transcripts/memory on disk
+Sources/Beams/Services/GitHubSync        gh auth/repos/branches, git clone/commit/push, redaction
+Sources/Beams/Views/*                    ContentView, TranscriptView, InspectorViews, SettingsView,
+                                          MCPSettingsView, ServicesWindow, PreviousSessionsViews
+Scripts/bundle.sh, Scripts/test.sh       app bundle and tests without Xcode
 ```
 
 See `CLAUDE.md` for notes future Claude Code sessions should read first.
