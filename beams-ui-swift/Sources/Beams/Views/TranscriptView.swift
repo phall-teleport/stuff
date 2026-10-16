@@ -94,6 +94,7 @@ struct TranscriptRow: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(.separator))
         case .assistant:
             MarkdownText(item.text)
+                .padding(.trailing, 28).copyable(item.text)
         case .tool:
             if let t = item.tool { ToolCard(tool: t) }
         case .systemInit, .thinking:
