@@ -224,6 +224,11 @@ struct Config: Codable, Equatable {
     var persistentSession: Bool = false
     /// MCP servers handed to the agent in every turn (see Services/MCP.swift).
     var mcpServers: [MCPServer] = []
+    /// Keep `tsh proxy app --port <agentProxyPort> <agent>` running on this
+    /// Mac (the Teleport app named after the selected agent, "claude" or
+    /// "codex"), independent of the per-turn MCP config. See `AppModel+MCP.swift`.
+    var agentProxyEnabled: Bool = false
+    var agentProxyPort: Int = 0
     var github: GitHubConfig = GitHubConfig()
 
     init() {}
@@ -245,6 +250,8 @@ struct Config: Codable, Equatable {
         tshMFABrowser = try c.decodeIfPresent(Bool.self, forKey: .tshMFABrowser) ?? false
         persistentSession = try c.decodeIfPresent(Bool.self, forKey: .persistentSession) ?? false
         mcpServers = try c.decodeIfPresent([MCPServer].self, forKey: .mcpServers) ?? []
+        agentProxyEnabled = try c.decodeIfPresent(Bool.self, forKey: .agentProxyEnabled) ?? false
+        agentProxyPort = try c.decodeIfPresent(Int.self, forKey: .agentProxyPort) ?? 0
         github = try c.decodeIfPresent(GitHubConfig.self, forKey: .github) ?? GitHubConfig()
     }
 }
@@ -324,6 +331,8 @@ struct TranscriptItem: Identifiable, Hashable {
     var text: String = ""
     var ok: Bool = true
     var tool: ToolInfo? = nil
+    /// User turns: attached images, relative to the session directory.
+    var images: [String] = []
 }
 
 extension TranscriptItem {
@@ -333,7 +342,8 @@ extension TranscriptItem {
         func nextID() -> String { seq += 1; return "\(seq)" }
         switch ev.type {
         case "beamsui.user":
-            return [TranscriptItem(id: nextID(), kind: .user, text: ev.raw["text"] as? String ?? "")]
+            return [TranscriptItem(id: nextID(), kind: .user, text: ev.raw["text"] as? String ?? "",
+                                   images: ev.raw["images"] as? [String] ?? [])]
         case "beamsui.permission":
             // Our own record of a permission decision, so reloads show it.
             let allowed = ev.raw["allowed"] as? Bool ?? false

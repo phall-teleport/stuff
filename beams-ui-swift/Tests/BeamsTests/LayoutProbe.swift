@@ -14,7 +14,7 @@ import SwiftUI
 //
 // <view>: content | main | transcript | banner | composer | sidebar | inspector | measure
 // Toggles: PROBE_NO_INSPECTOR, PROBE_GITHUB_TAB, PROBE_BEAM_ALIVE, PROBE_NO_ITEMS, PROBE_SSH_BLOCKED,
-//          PROBE_SHORT_TITLE, PROBE_NO_GLOBE.
+//          PROBE_SHORT_TITLE, PROBE_NO_GLOBE, PROBE_IMAGES (=composer|row|1 for both).
 @MainActor @Test func layoutProbe() throws {
     guard let spec = ProcessInfo.processInfo.environment["BEAMS_LAYOUT_PROBE"] else { return }
     let parts = spec.split(separator: "|").map(String.init)
@@ -54,6 +54,15 @@ import SwiftUI
     if env["PROBE_NO_ITEMS"] != nil { model.items[sid] = [] }
     if env["PROBE_SSH_BLOCKED"] != nil { model.tsh.roles = ["access", "beam-admin", "editor"]; model.tsh.logins = [] }
     if env["PROBE_GITHUB_TAB"] != nil { model.inspectorTab = .github }
+    if env["PROBE_IMAGES"] != nil {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 400, pixelsHigh: 300, bitsPerSample: 8, samplesPerPixel: 4,
+                                   hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor.systemTeal.setFill(); NSRect(x: 0, y: 0, width: 400, height: 300).fill(); NSGraphicsContext.restoreGraphicsState()
+        let img = ImageAttachment.make(from: rep.representation(using: .png, properties: [:])!)!
+        if env["PROBE_IMAGES"] != "row" { model.composerImages = [img, ImageAttachment.make(from: img.data)!] }
+        if env["PROBE_IMAGES"] != "composer" { model.items[sid, default: []].append(TranscriptItem(id: "probe-img", kind: .user, text: "what is in this picture?", images: ["images/none.png"])) }
+    }
     let size = NSSize(width: width, height: 600)
     let view: AnyView
     switch which {

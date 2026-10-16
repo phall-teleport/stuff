@@ -50,6 +50,18 @@ struct SettingsView: View {
                     Text("Codex runs with approvals bypassed (beams are sandboxed). Permission prompts don't apply.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Toggle("Also proxy the \(model.config.agent) Teleport app to this Mac", isOn: $m.config.agentProxyEnabled)
+                if model.config.agentProxyEnabled {
+                    TextField("Port on this Mac", text: Binding(
+                        get: { model.config.agentProxyPort == 0 ? "" : String(model.config.agentProxyPort) },
+                        set: { model.config.agentProxyPort = Int($0.trimmingCharacters(in: .whitespaces)) ?? 0 }
+                    ), prompt: Text("e.g. 8931"))
+                    if let st = model.mcpStatus["agentProxy"] {
+                        Text(st).font(.caption).foregroundStyle(st == "running" ? .green : .orange)
+                    }
+                }
+                Text("Keeps `tsh proxy app --port <port> \(model.config.agent)` running on this Mac (`tsh apps login` first), independent of the agent's own MCP tools — restarts on its own and pauses while your tsh login is expired, same as the laptop MCP proxies below.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             MCPSettingsSection()
             Section("Experimental") {
@@ -72,6 +84,9 @@ struct SettingsView: View {
             // Only a change that affects which cluster/profile we talk to needs
             // tsh re-checked, and not on every keystroke (tsh serializes on a lock).
             if old.mcpServers != new.mcpServers { model.reconcileMCP() }
+            if old.agent != new.agent || old.agentProxyEnabled != new.agentProxyEnabled || old.agentProxyPort != new.agentProxyPort {
+                model.reconcileAgentProxy()
+            }
             if old.proxy != new.proxy || old.tshBin != new.tshBin || old.login != new.login {
                 model.scheduleTshRecheck()
             }

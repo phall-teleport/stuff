@@ -32,6 +32,8 @@ final class Store {
 
     // MARK: sessions
 
+    /// Images attached to prompts, referenced from `beamsui.user` lines.
+    func imagesDir(_ id: String) -> URL { sessionDir(id).appendingPathComponent("images", isDirectory: true) }
     func sessionDir(_ id: String) -> URL { root.appendingPathComponent("sessions/\(id)", isDirectory: true) }
     func memoryDir(_ id: String) -> URL { sessionDir(id).appendingPathComponent("memory", isDirectory: true) }
     /// Snapshot of the beam's working directory (the files the agent generated).
@@ -136,7 +138,8 @@ final class Store {
             guard let ev = StreamEvent(line: ln) else { continue }
             switch ev.type {
             case "beamsui.user":
-                md += "## You\n\n\(ev.raw["text"] as? String ?? "")\n\n"
+                let n = (ev.raw["images"] as? [String])?.count ?? 0
+                md += "## You\n\n\(ev.raw["text"] as? String ?? "")\(n > 0 ? "\n\n_(\(n) image\(n == 1 ? "" : "s") attached)_" : "")\n\n"
             case "assistant":
                 for blk in ev.contentBlocks {
                     switch blk["type"] as? String {

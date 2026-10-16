@@ -1,8 +1,8 @@
 # Beams (native)
 
-A fully native SwiftUI port of the Beams app: run **Claude Code inside a
-Teleport Beam** sandbox from a macOS window, stream the conversation, and keep
-the transcript and Claude's memory in **GitHub**. It shares its data directory
+A fully native SwiftUI port of the Beams app: run **Claude Code (or Codex)
+inside a Teleport Beam** sandbox from a macOS window, stream the conversation,
+and keep the transcript, Claude's memory and the generated files in **GitHub**. It shares its data directory
 with the Go/Wails version, so both see the same sessions and settings.
 
 ```
@@ -21,8 +21,26 @@ with the Go/Wails version, so both see the same sessions and settings.
   Each prompt runs Claude Code in the beam in print mode with stream-json
   output, `--session-id` first then `--resume`, so it behaves like a real
   Claude Code session. All agent work happens in the beam.
+- **Agents** — Claude Code (default) or Codex, with a model picker in
+  Settings. Cost shows in dollars for Claude and in tokens for Codex (which
+  doesn't report dollars).
 - **Transcript** — assistant markdown, collapsible tool cards with results,
   per-turn cost footer, stop button (⌘.). Enter sends, ⌥Enter inserts a newline.
+  Copy buttons on code blocks, tool input/output and other copyable text.
+- **Images** — paste (⌘V) or drop images into the chat box to have the agent
+  look at them; thumbnails show before sending and in the transcript.
+- **Permission prompts** — in any mode but bypass, Claude's tool requests
+  appear as Allow / Deny cards in the conversation (Y / N).
+- **MCP servers** — Settings → MCP servers: MCP apps in your Teleport cluster
+  (`tsh mcp ls`; the beam connects with `tsh mcp connect`), or HTTP MCP servers
+  on this Mac, which the app tunnels into the beam (`tsh ssh -R`, optionally
+  fronted by `tsh proxy app`). Tunnels and proxies restart on their own and
+  pause while your login is expired.
+- **Services and logs** — right-click a sandbox for its beam-init services
+  (`beamctl`): state, live logs, restart/stop/freeze/thaw. Beams created before
+  beam-init became the default don't have it.
+- **Pick up where you left off** — ⌘O lists sessions synced to the GitHub repo
+  and continues one in a new beam, restoring files, memory and the conversation.
 - **Save locally** — save the beam's working directory to a folder on this Mac (⌘S).
 - **Memory** — `~/.claude/projects/*/memory` + `CLAUDE.md` are pulled from the
   beam on every sync and put back when a session continues in a new beam
@@ -30,8 +48,10 @@ with the Go/Wails version, so both see the same sessions and settings.
 - **GitHub** — `gh` sign-in state and browser device-flow sign-in with the
   one-time code shown in the panel; searchable list of every repo you can
   access; branch dropdown with "＋ New branch…"; create a private repo; sync
-  commits `<prefix>/sessions/<id>/transcript.{md,jsonl}` and `<prefix>/memory/`
-  over HTTPS using `gh` as the credential helper.
+  commits `<prefix>/sessions/<id>/transcript.{md,jsonl}`, the generated files
+  and `<prefix>/memory/` over HTTPS using `gh` as the credential helper.
+  Credentials are excluded and redacted before anything is committed; sync to a
+  private repo.
 - **Teleport login** — banner when `tsh` is logged out or expired, with a
   username field. SSO tenants finish in the browser; password tenants get
   iTerm2 (or Terminal.app) opened with the exact `tsh login` command and the

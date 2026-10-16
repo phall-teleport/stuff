@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AppKit
 @testable import Beams
 
 // Swift Testing rather than XCTest: XCTest ships only with Xcode, while the
@@ -509,4 +510,62 @@ private func runs(_ file: String) -> Int {
     #expect(Beamctl.logsScript("my app", follow: true) == "exec beamctl logs 'my app' --follow\n")
     #expect(Beamctl.actionScript("stop", "x; rm -rf /") == "beamctl stop 'x; rm -rf /'\n")
     #expect(Beamctl.actionScript("rm", "x") == nil)
+}
+
+private func testPNG(_ w: Int, _ h: Int) -> Data {
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSColor.systemRed.setFill(); NSRect(x: 0, y: 0, width: w, height: h).fill()
+    NSGraphicsContext.restoreGraphicsState()
+    return rep.representation(using: .png, properties: [:])!
+}
+
+@Test func imageAttachmentScalesAndEncodes() throws {
+    let big = try #require(ImageAttachment.make(from: testPNG(3000, 1500)))
+    let rep = try #require(NSBitmapImageRep(data: big.data))
+    #expect(rep.pixelsWide == 1568 && rep.pixelsHigh == 784)
+    #expect(big.mediaType == "image/png" && big.fileName.hasSuffix(".png"))
+    let small = try #require(ImageAttachment.make(from: testPNG(40, 30)))
+    #expect(NSBitmapImageRep(data: small.data)?.pixelsWide == 40)   // never upscaled
+    #expect(ImageAttachment.make(from: Data("not an image".utf8)) == nil)
+}
+
+@MainActor @Test func imagePasteboardRules() throws {
+    let pb = NSPasteboard(name: NSPasteboard.Name("beams-test-\(UUID().uuidString)"))
+    defer { pb.releaseGlobally() }
+    pb.clearContents(); pb.setData(testPNG(20, 20), forType: .png)
+    #expect(ImageAttachment.fromPasteboard(pb)?.count == 1)            // screenshot to clipboard
+    pb.clearContents(); pb.setString("hello", forType: .string)
+    #expect(ImageAttachment.fromPasteboard(pb) == nil)                  // plain text paste
+    pb.clearContents(); pb.declareTypes([.string, .png], owner: nil)
+    pb.setString("caption", forType: .string); pb.setData(testPNG(20, 20), forType: .png)
+    #expect(ImageAttachment.fromPasteboard(pb) == nil)                  // rich text with an image rendition stays text
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("paste-\(UUID().uuidString).png")
+    try testPNG(30, 30).write(to: file)
+    pb.clearContents(); pb.writeObjects([file as NSURL])
+    #expect(ImageAttachment.fromPasteboard(pb)?.count == 1)            // image file copied in Finder
+}
+
+@Test func imageMessagesAndCodexFlags() throws {
+    let img = try #require(ImageAttachment.make(from: testPNG(10, 10)))
+    let line = TurnOptions.userMessage("what is this?", images: [img])
+    let obj = try #require(try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+    let content = try #require((obj["message"] as? [String: Any])?["content"] as? [[String: Any]])
+    #expect(content.map { $0["type"] as? String } == ["image", "text"])
+    let src = try #require(content[0]["source"] as? [String: String])
+    #expect(src["type"] == "base64" && src["media_type"] == "image/png" && Data(base64Encoded: src["data"] ?? "") == img.data)
+    let onlyImage = TurnOptions.userMessage("", images: [img])
+    #expect(!onlyImage.contains(#""type":"text""#))
+    #expect(!TurnOptions.userMessage("hi").contains("image"))
+
+    var t = CodexTurn(workDir: "/w", model: "", prompt: "p", resumeThread: "th")
+    t.imagePaths = ["/w/.beams/images/a.png"]
+    #expect(t.script.contains("resume 'th'") && t.script.contains(" -i '/w/.beams/images/a.png' -- 'p'"))
+    #expect(AgentScripts.writeFile(dir: "/w/.beams/images", name: "a.png") == "mkdir -p '/w/.beams/images' && cat > '/w/.beams/images/a.png'\n")
+
+    var n = 0
+    let ev = try #require(StreamEvent(line: #"{"type":"beamsui.user","text":"","images":["images/a.png"]}"#))
+    #expect(TranscriptItem.items(from: ev, seq: &n).first?.images == ["images/a.png"])
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct TranscriptView: View {
     @Environment(AppModel.self) private var model
@@ -21,7 +22,9 @@ struct TranscriptView: View {
                         }
                         .padding(.leading, 30)
                     }
-                    Color.clear.frame(height: 1).id("bottom")
+                    // Room for the composer's floating image thumbnails (inside the
+                    // scroll content, so it doesn't change the window's layout).
+                    Color.clear.frame(height: model.composerImages.isEmpty ? 1 : 76).id("bottom")
                 }
                 .padding(.horizontal, 28).padding(.vertical, 18)
                 .frame(maxWidth: 900)
@@ -31,6 +34,9 @@ struct TranscriptView: View {
                 withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .onChange(of: model.pendingPermissions[sessionID]?.count ?? 0) { _, _ in
+                withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: model.composerImages.count) { _, _ in
                 withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
             }
             .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
@@ -78,7 +84,10 @@ struct TranscriptRow: View {
     @ViewBuilder private var content: some View {
         switch item.kind {
         case .user:
-            Text(item.text).textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 8) {
+                if !item.images.isEmpty { UserImages(paths: item.images) }
+                if !item.text.isEmpty { Text(item.text).textSelection(.enabled) }
+            }
                 .padding(.horizontal, 14).padding(.vertical, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.5)))
@@ -145,6 +154,30 @@ struct PermissionCard: View {
 }
 
 // MARK: - Tool card
+
+/// Images attached to a user turn, loaded off the main thread (AsyncImage)
+/// from the session's images folder. Click one to open it in Preview.
+struct UserImages: View {
+    @Environment(AppModel.self) private var model
+    let paths: [String]
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(paths, id: \.self) { rel in
+                let url = model.currentID.map { model.store.sessionDir($0).appendingPathComponent(rel) }
+                AsyncImage(url: url) { phase in
+                    if let img = phase.image { img.resizable().scaledToFit() }
+                    else { RoundedRectangle(cornerRadius: 6).fill(.quaternary).overlay(Image(systemName: "photo").foregroundStyle(.secondary))
+                            .frame(width: 120, height: 90) }
+                }
+                .frame(maxWidth: 220, maxHeight: 160)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .onTapGesture { if let url { NSWorkspace.shared.open(url) } }
+                .help("Open in Preview")
+            }
+        }
+    }
+}
 
 struct ToolCard: View {
     let tool: ToolInfo
@@ -290,16 +323,43 @@ struct MarkdownText: View {
 
 // MARK: - Composer
 
+/// Catches ⌘V while the composer has focus: an image on the clipboard is
+/// attached instead of pasted (a text field can't take images). Text pastes
+/// pass through untouched.
+@MainActor
+final class ImagePasteMonitor: ObservableObject {
+    private var token: Any?
+
+    func install(_ model: AppModel) {
+        guard token == nil else { return }
+        token = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak model] ev in
+            guard let model, model.composerFocused, model.current != nil,
+                  ev.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                  ev.charactersIgnoringModifiers == "v",
+                  let imgs = ImageAttachment.fromPasteboard(.general) else { return ev }
+            model.attachImages(imgs)
+            return nil
+        }
+    }
+
+    func remove() {
+        if let token { NSEvent.removeMonitor(token) }
+        token = nil
+    }
+}
+
 struct Composer: View {
     @Environment(AppModel.self) private var model
     @FocusState private var focused: Bool
+    @StateObject private var paste = ImagePasteMonitor()
+    @StateObject private var dropping = LocalFlag()
 
     var body: some View {
         @Bindable var m = model
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .bottom, spacing: 8) {
                 Text("›").font(.body.monospaced()).foregroundStyle(Color.accentColor).padding(.bottom, 6)
-                TextField("Ask Claude to do something in this sandbox… (Enter to send, ⌥Enter for newline)", text: $m.composer, axis: .vertical)
+                TextField("Ask Claude to do something in this sandbox… (⌥Enter for newline; paste or drop images)", text: $m.composer, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...8)
                     .focused($focused)
@@ -311,18 +371,69 @@ struct Composer: View {
                 } else {
                     Button { model.send() } label: { Image(systemName: "return") }
                         .buttonStyle(.borderedProminent).help("Send (Enter)")
-                        .disabled(model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(model.composer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && model.composerImages.isEmpty)
                 }
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.5)))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(focused ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor)))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(dropping.on ? Color.accentColor : focused ? Color.accentColor.opacity(0.6) : Color(nsColor: .separatorColor),
+                                                               lineWidth: dropping.on ? 2 : 1))
+            .onDrop(of: [.fileURL, .image], isTargeted: Binding(get: { dropping.on }, set: { dropping.on = $0 })) { providers in
+                loadDropped(providers); return true
+            }
             Text(model.probeHint).font(.caption2.monospaced()).foregroundStyle(.tertiary).frame(height: 12)
         }
         .padding(.horizontal, 28).padding(.bottom, 12).padding(.top, 6)
         .frame(maxWidth: 956)
         .frame(maxWidth: .infinity)
-        .onAppear { focused = true }
-        .onChange(of: model.currentID) { _, _ in focused = true }
+        // Thumbnails float above the composer as an overlay: inserting them in
+        // the VStack made the composer taller and set off the split view's
+        // layout loop at narrow widths (LayoutProbe PROBE_IMAGES=composer).
+        .overlay(alignment: .topLeading) {
+            if !model.composerImages.isEmpty { attachments.offset(y: -64) }
+        }
+        .onAppear { focused = true; paste.install(model) }
+        .onDisappear { paste.remove(); model.composerFocused = false }
+        .onChange(of: focused) { _, f in model.composerFocused = f }
+        .onChange(of: model.currentID) { _, _ in focused = true; model.composerImages = [] }
+    }
+
+    /// Thumbnails of the images that go with the next prompt.
+    private var attachments: some View {
+        HStack(spacing: 8) {
+            ForEach(model.composerImages) { img in
+                Image(nsImage: img.thumbnail).resizable().scaledToFill()
+                    .frame(width: 56, height: 56).clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(.separator))
+                    .overlay(alignment: .topTrailing) {
+                        Button { model.composerImages.removeAll { $0.id == img.id } } label: {
+                            Image(systemName: "xmark.circle.fill").symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.6))
+                        }
+                        .buttonStyle(.plain).help("Remove image").padding(2)
+                    }
+            }
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.regularMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.separator))
+        .padding(.leading, 52)
+    }
+
+    private func loadDropped(_ providers: [NSItemProvider]) {
+        for p in providers {
+            if p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                _ = p.loadDataRepresentation(for: .fileURL) { data, _ in
+                    guard let data, let url = URL(dataRepresentation: data, relativeTo: nil),
+                          let raw = try? Data(contentsOf: url), let img = ImageAttachment.make(from: raw) else { return }
+                    DispatchQueue.main.async { model.attachImages([img]) }
+                }
+            } else if p.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                _ = p.loadDataRepresentation(for: .image) { data, _ in
+                    guard let data, let img = ImageAttachment.make(from: data) else { return }
+                    DispatchQueue.main.async { model.attachImages([img]) }
+                }
+            }
+        }
     }
 }

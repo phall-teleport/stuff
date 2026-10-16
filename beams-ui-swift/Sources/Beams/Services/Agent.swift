@@ -44,9 +44,13 @@ struct TurnOptions {
         (try? JSONSerialization.data(withJSONObject: obj)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     }
 
-    /// stream-json user message carrying the prompt.
-    static func userMessage(_ text: String) -> String {
-        jsonLine(["type": "user", "message": ["role": "user", "content": [["type": "text", "text": text]]]])
+    /// stream-json user message carrying the prompt, images first (Claude
+    /// reads images before the question about them). Verified 2026-10-08:
+    /// a base64 PNG block over stdin is seen by Claude Code 2.1 in a beam.
+    static func userMessage(_ text: String, images: [ImageAttachment] = []) -> String {
+        var content: [[String: Any]] = images.map(\.claudeBlock)
+        if !text.isEmpty || content.isEmpty { content.append(["type": "text", "text": text]) }
+        return jsonLine(["type": "user", "message": ["role": "user", "content": content]])
     }
 
     /// Replies to a `can_use_tool` control request.

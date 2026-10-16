@@ -92,6 +92,34 @@ extension AppModel {
         }
     }
 
+    /// Settings' standalone "proxy the agent's app to this Mac" checkbox:
+    /// `tsh proxy app --port <port> <agent>`, where `<agent>` is whatever
+    /// `config.agent` ("claude"/"codex") picks — not tied to `mcpServers`,
+    /// so it's never added to the agent's own `--mcp-config`. Reuses the same
+    /// `MCPServer`/Supervisor plumbing as a `.laptop` MCP proxy (see MCP.swift).
+    func reconcileAgentProxy() {
+        guard !isMock else { return }
+        let key = "agentProxy"
+        let agent = config.agent.trimmingCharacters(in: .whitespaces)
+        let port = config.agentProxyPort
+        guard config.agentProxyEnabled, !agent.isEmpty, (1...65535).contains(port) else {
+            stopSupervisor(key)
+            agentProxyParams = nil
+            return
+        }
+        if let p = agentProxyParams, p.agent == agent, p.port == port, mcpSupervisors[key] != nil { return }
+        stopSupervisor(key)
+        agentProxyParams = (agent, port)
+        let s = MCPServer(kind: .laptop, name: agent, port: port, proxyApp: agent)
+        let cmd = resolvedTsh.proxyAppCommand(s)
+        let host = resolvedTsh.proxyHost(s)
+        mcpProxyHosts[key] = host
+        startSupervisor(key, label: "tsh proxy app \(agent)", healthPort: port) { [weak self] in
+            if let why = self?.loginWait(host) { return .failure(why) }
+            return .success(cmd)
+        }
+    }
+
     /// Stops tunnels into beams that no longer exist.
     func pruneMCPTunnels() {
         for key in Array(mcpSupervisors.keys) where key.hasPrefix("tunnel:") {

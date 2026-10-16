@@ -153,7 +153,7 @@ word-anchored with bounded quantifiers (26s total), `pullWorkspace` redacts in
 Symptom: after clicking, the sidebar and inspector go blank and the composer
 disappears; the app stays alive and idle. Cause: a layout feedback loop in the
 split view; AppKit throws `_postWindowNeedsUpdateConstraints` during layout, the
-app swallows it, and the window is left half laid out. Two triggers, found with
+app swallows it, and the window is left half laid out. Triggers found with
 `Tests/BeamsTests/LayoutProbe.swift` (see its header):
 - Window narrower than ~990pt with the inspector open → min width is now 1040.
 - `ContinueBanner` with a second control in its row (Picker, Menu, or button +
@@ -241,6 +241,22 @@ canceled" isn't shown); no beamctl is left running in the beam. beamctl
 and tool blocks, permission summaries, the GitHub device code, Settings'
 login command and the logs pane.
 
+## Images in prompts (2026-10-08)
+
+⌘V in the composer (an `ImagePasteMonitor` keyDown monitor, active while
+`model.composerFocused`) or a drop attaches images; `ImageAttachment.make`
+scales to ≤1568px and encodes PNG (JPEG if > 3.5 MB). A clipboard with a plain
+string stays a text paste unless it holds image FILES (Finder copy). Claude
+gets base64 `image` blocks before the text in the stream-json user message
+(verified in a beam: Claude Code 2.1.258 answered about a pasted PNG). Codex
+gets files uploaded to `<workDir>/.beams/images/` (never synced) and `-i`
+(exec and exec resume both take it; not run end to end). Images are saved to
+`sessions/<id>/images/` and referenced from `beamsui.user` `images`; rows load
+them with AsyncImage (no disk I/O in body). The pending-thumbnail strip is an
+OVERLAY above the composer: putting any row in the composer's VStack made it
+taller and set off the layout loop at 1040pt (`PROBE_IMAGES=composer`).
+Transcript.md notes "(N images attached)"; images aren't committed to GitHub.
+
 ## Persistent session mode (experimental)
 
 `config.persistentSession` (or `BEAMSUI_PERSISTENT=1`) keeps ONE
@@ -286,3 +302,20 @@ BEAMSUI_MOCK=1 .build/debug/Beams
   Paul's running turns and die with the app. Gate the relaunch on the count
   (`ps -Ao command | grep -c '[t]sh --proxy.*beams exec'`), don't just print it.
 - Sentence-case labels ("Sync beam session", "Pull from beam").
+- Paul commits and pushes himself; stage explicit paths, never `git commit -a`
+  (the parent `stuff` repo holds unrelated WIP).
+- Any change to the main column (banners, empty state, composer) gets a
+  LayoutProbe run at 1040 and ~1300pt before shipping; read the PNG.
+
+## Open items (as of 2026-10-13)
+
+Not verified end to end: a real Teleport MCP app (super-grass has none),
+`tsh proxy app` on an MCP app, Codex MCP `-c` flags, Codex image turns (`-i`),
+Codex session resume across beams. Offered, not built: skip/limit huge
+workspaces in sync (one session synced the whole teleport repo, 14.8k files),
+a setting to let `.env` files through "Save locally", `beamctl attach` via
+iTerm, Codex dollar costs (needs a price table). Feedback for beam-init:
+`beamctl logs --follow` 0.1.0 panics on BrokenPipe when its reader exits.
+Security follow-ups for Paul: the private beams-sessions repo history still
+holds the leaked tbot keys/.env from 2026-09-23; rotate the stitch-cluster tbot
+identity and the teleport-monitor `.env` tokens.

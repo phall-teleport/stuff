@@ -56,6 +56,10 @@ final class AppModel {
     private var turnStart: [String: Date] = [:]
     var probeHint = ""
     var composer = ""
+    /// Images pasted or dropped into the composer, sent with the next prompt.
+    var composerImages: [ImageAttachment] = []
+    /// Mirrors the composer's focus so ⌘V can attach images (Composer).
+    var composerFocused = false
 
     // teleport login
     var tsh = TshStatus()
@@ -103,12 +107,16 @@ final class AppModel {
     var mcpApps: [MCPApp] = []
     var mcpLoading = false
     var mcpNote = ""
-    /// Supervisor state by key ("proxy:<server id>", "tunnel:<beam id>").
+    /// Supervisor state by key ("proxy:<server id>", "tunnel:<beam id>",
+    /// "agentProxy" — see reconcileAgentProxy).
     var mcpStatus: [String: String] = [:]
     @ObservationIgnored var mcpSupervisors: [String: Supervisor] = [:]
     @ObservationIgnored var mcpTunnelPorts: [String: [Int]] = [:]
     @ObservationIgnored var mcpLoginWatch: Task<Void, Never>?
     @ObservationIgnored var mcpProxyHosts: [String: String] = [:]
+    /// (agent, port) the running "agentProxy" supervisor was started with, to
+    /// notice a Settings change that needs a restart.
+    @ObservationIgnored var agentProxyParams: (agent: String, port: Int)?
     var confirm: ConfirmRequest? = nil
 
     init() throws {
@@ -146,6 +154,7 @@ final class AppModel {
         if isMock { tsh = TshStatus(tshFound: true, loggedIn: true, proxy: "mock", user: "mock", cluster: "mock", message: "Mock backend"); tshChecked = true }
         await refreshGitHub()
         if await checkTsh() { await loadBeams() } else { beamsNote = "Log in to Teleport to see your sandboxes." }
+        reconcileAgentProxy()
     }
 
     // MARK: toasts & confirm
@@ -303,22 +312,50 @@ final class AppModel {
 
     func send() {
         let prompt = composer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let s = current, !prompt.isEmpty, !busy.contains(s.id) else { return }
+        let images = composerImages
+        guard let s = current, !prompt.isEmpty || !images.isEmpty, !busy.contains(s.id) else { return }
         composer = ""
-        Task { await runTurn(sessionID: s.id, prompt: prompt) }
+        composerImages = []
+        Task { await runTurn(sessionID: s.id, prompt: prompt, images: images) }
+    }
+
+    func attachImages(_ imgs: [ImageAttachment]) {
+        guard current != nil else { return }
+        let room = 8 - composerImages.count
+        if imgs.count > room { toast("Up to 8 images per prompt.", .err) }
+        composerImages += imgs.prefix(max(0, room))
+    }
+
+    /// Keeps a turn's images with the session (shown in the transcript) and
+    /// returns their paths relative to the session directory.
+    private func saveImages(_ sessionID: String, _ images: [ImageAttachment]) -> [String] {
+        guard !images.isEmpty else { return [] }
+        let dir = store.imagesDir(sessionID)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return images.compactMap { img in
+            (try? img.data.write(to: dir.appendingPathComponent(img.fileName))) == nil ? nil : "images/\(img.fileName)"
+        }
+    }
+
+    /// Title for a new session from its first prompt.
+    private func titleFor(_ prompt: String, images: Int) -> String {
+        let t = String(prompt.split(separator: "\n").first.map(String.init)?.prefix(80) ?? "")
+        return t.isEmpty && images > 0 ? "Image" : t
     }
 
     /// Persistent-session mode: keep one Claude process alive per session and
     /// feed each turn to it. Env override `BEAMSUI_PERSISTENT=1` forces it on.
     var usePersistent: Bool { config.persistentSession || ProcessInfo.processInfo.environment["BEAMSUI_PERSISTENT"] == "1" }
 
-    private func recordUserTurn(_ sessionID: String, _ prompt: String) {
+    private func recordUserTurn(_ sessionID: String, _ prompt: String, images: [ImageAttachment] = []) {
         if var s = sessions.first(where: { $0.id == sessionID }) {
-            if s.title.isEmpty { s.title = String(prompt.split(separator: "\n").first.map(String.init)?.prefix(80) ?? "") }
+            if s.title.isEmpty { s.title = titleFor(prompt, images: images.count) }
             s.updated = Date()
             updateSession(sessionID) { $0 = s }
         }
-        let userLine = ["type": "beamsui.user", "text": prompt, "ts": RFC3339.string(Date())]
+        var userLine: [String: Any] = ["type": "beamsui.user", "text": prompt, "ts": RFC3339.string(Date())]
+        let paths = saveImages(sessionID, images)
+        if !paths.isEmpty { userLine["images"] = paths }
         if let d = try? JSONSerialization.data(withJSONObject: userLine), let ln = String(data: d, encoding: .utf8) {
             store.appendTranscript(sessionID, line: ln)
             if let ev = StreamEvent(line: ln) { ingest(sessionID, ev) }
@@ -340,32 +377,24 @@ final class AppModel {
             + ".beams/previous-session.md. Read it first if you need the background.)\n\n" + prompt
     }
 
-    private func runTurn(sessionID: String, prompt: String) async {
+    private func runTurn(sessionID: String, prompt: String, images: [ImageAttachment] = []) async {
         if let s = sessions.first(where: { $0.id == sessionID }), beamGone(s) {
-            composer = prompt   // give the prompt back
+            composer = prompt; composerImages = images   // give the prompt back
             toast("The beam \(s.beamName.isEmpty ? "for this session" : s.beamName) is gone. Continue the session in a beam from the banner above.", .err, seconds: 7)
             return
         }
-        guard sshAllowed() else { composer = prompt; return }
+        guard sshAllowed() else { composer = prompt; composerImages = images; return }
         if let s = sessions.first(where: { $0.id == sessionID }) { prepareMCP(beamID: s.beamId) }
-        if config.agent == "codex" { runCodexTurn(sessionID: sessionID, prompt: prompt); return }
-        if usePersistent { runTurnPersistent(sessionID: sessionID, prompt: prompt); return }
-        guard var s = sessions.first(where: { $0.id == sessionID }) else { return }
+        if config.agent == "codex" { runCodexTurn(sessionID: sessionID, prompt: prompt, images: images); return }
+        if usePersistent { runTurnPersistent(sessionID: sessionID, prompt: prompt, images: images); return }
+        guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
         busy.insert(sessionID)
-        if s.title.isEmpty { s.title = String(prompt.split(separator: "\n").first.map(String.init)?.prefix(80) ?? "") }
-        s.updated = Date()
-        updateSession(sessionID) { $0 = s }
         turnStart[sessionID] = Date()
-
-        let userLine = ["type": "beamsui.user", "text": prompt, "ts": RFC3339.string(Date())]
-        if let d = try? JSONSerialization.data(withJSONObject: userLine), let ln = String(data: d, encoding: .utf8) {
-            store.appendTranscript(sessionID, line: ln)
-            if let ev = StreamEvent(line: ln) { ingest(sessionID, ev) }
-        }
+        recordUserTurn(sessionID, prompt, images: images)
 
         let opts = TurnOptions(sessionID: sessionID, resume: s.turns > 0 && !s.needsFreshStart, workDir: config.workDir, prompt: prompt,
                                permissionMode: config.permissionMode, model: config.model, mcpServers: config.mcpServers)
-        let firstMessage = TurnOptions.userMessage(promptToSend(s, prompt))
+        let firstMessage = TurnOptions.userMessage(promptToSend(s, prompt), images: images)
         var errMsg = ""
         do {
             // The prompt travels as the first stream-json message on stdin; the
@@ -408,12 +437,12 @@ final class AppModel {
     /// One long-lived Claude process per session; turns are stream-json user
     /// messages sent to it (no per-turn tsh/claude startup). Verified that a
     /// single `claude -p --input-format stream-json` handles turns in sequence.
-    private func runTurnPersistent(sessionID: String, prompt: String) {
+    private func runTurnPersistent(sessionID: String, prompt: String, images: [ImageAttachment] = []) {
         guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
         busy.insert(sessionID)
         turnStart[sessionID] = Date()
-        recordUserTurn(sessionID, prompt)
-        let msg = TurnOptions.userMessage(promptToSend(s, prompt))
+        recordUserTurn(sessionID, prompt, images: images)
+        let msg = TurnOptions.userMessage(promptToSend(s, prompt), images: images)
 
         // Process already alive → just send the next turn.
         if persistentActive.contains(sessionID), let p = running[sessionID] {
@@ -458,17 +487,26 @@ final class AppModel {
     /// Runs one `codex exec` turn (OpenAI Codex CLI). Codex has no interactive
     /// permission protocol — beams are externally sandboxed, so approvals are
     /// bypassed. Context continues via the thread id captured on thread.started.
-    private func runCodexTurn(sessionID: String, prompt: String) {
+    private func runCodexTurn(sessionID: String, prompt: String, images: [ImageAttachment] = []) {
         guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
         busy.insert(sessionID)
         turnStart[sessionID] = Date()
-        recordUserTurn(sessionID, prompt)
-        let turn = CodexTurn(workDir: config.workDir, model: config.model, prompt: promptToSend(s, prompt),
+        recordUserTurn(sessionID, prompt, images: images)
+        // Codex reads images from files: they go to <workDir>/.beams/images
+        // first (.beams is never synced) and are passed with -i.
+        let imageDir = config.workDir + "/.beams/images"
+        var turn = CodexTurn(workDir: config.workDir, model: config.model,
+                             prompt: promptToSend(s, prompt.isEmpty ? "Look at the attached image." : prompt),
                              resumeThread: s.needsFreshStart ? "" : s.codexThread, mcpServers: config.mcpServers)
+        turn.imagePaths = images.map { imageDir + "/" + $0.fileName }
         Task { [weak self] in
             guard let self else { return }
             var errMsg = ""
             do {
+                for img in images {
+                    try await self.client.run(id: s.beamId, script: AgentScripts.writeFile(dir: imageDir, name: img.fileName), stdin: img.data,
+                                              interactiveStdin: false, onStdoutLine: nil, onStderrLine: nil, register: nil)
+                }
                 try await self.client.run(id: s.beamId, script: turn.script, stdin: nil, interactiveStdin: false,
                     onStdoutLine: { line in Task { @MainActor in self.handleCodexLine(sessionID, line) } },
                     onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },

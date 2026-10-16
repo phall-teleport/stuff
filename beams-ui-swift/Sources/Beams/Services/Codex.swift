@@ -18,6 +18,8 @@ struct CodexTurn {
     var prompt: String
     var resumeThread: String   // empty = start a new thread
     var mcpServers: [MCPServer] = []
+    /// Image files already uploaded into the beam, passed with `-i`.
+    var imagePaths: [String] = []
 
     var script: String {
         var s = "set -e\n"
@@ -33,6 +35,7 @@ struct CodexTurn {
         // already plain. --json is accepted by both exec and exec resume.
         s += " --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check"
         if !model.isEmpty { s += " -m \(Shell.quote(model))" }
+        for p in imagePaths { s += " -i \(Shell.quote(p))" }
         s += " -- \(Shell.quote(prompt))\n"
         return s
     }
