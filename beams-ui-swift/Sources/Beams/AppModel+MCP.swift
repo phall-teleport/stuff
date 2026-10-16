@@ -93,14 +93,17 @@ extension AppModel {
     }
 
     /// Settings' standalone "proxy the agent's app to this Mac" checkbox:
-    /// `tsh proxy app --port <port> <agent>`, where `<agent>` is whatever
-    /// `config.agent` ("claude"/"codex") picks — not tied to `mcpServers`,
-    /// so it's never added to the agent's own `--mcp-config`. Reuses the same
-    /// `MCPServer`/Supervisor plumbing as a `.laptop` MCP proxy (see MCP.swift).
+    /// `tsh proxy app --port <port> <app>`, where `<app>` is the Teleport app
+    /// for whatever `config.agent` ("claude"/"codex") picks — see
+    /// `PublishedURLs.serviceApp(for:)` ("claude" → "anthropic", "codex" →
+    /// "openai") — not tied to `mcpServers`, so it's never added to the
+    /// agent's own `--mcp-config`. Reuses the same `MCPServer`/Supervisor
+    /// plumbing as a `.laptop` MCP proxy (see MCP.swift).
     func reconcileAgentProxy() {
         guard !isMock else { return }
         let key = "agentProxy"
         let agent = config.agent.trimmingCharacters(in: .whitespaces)
+        let app = PublishedURLs.serviceApp(for: agent)
         let port = config.agentProxyPort
         guard config.agentProxyEnabled, !agent.isEmpty, (1...65535).contains(port) else {
             stopSupervisor(key)
@@ -110,11 +113,11 @@ extension AppModel {
         if let p = agentProxyParams, p.agent == agent, p.port == port, mcpSupervisors[key] != nil { return }
         stopSupervisor(key)
         agentProxyParams = (agent, port)
-        let s = MCPServer(kind: .laptop, name: agent, port: port, proxyApp: agent)
+        let s = MCPServer(kind: .laptop, name: app, port: port, proxyApp: app)
         let cmd = resolvedTsh.proxyAppCommand(s)
         let host = resolvedTsh.proxyHost(s)
         mcpProxyHosts[key] = host
-        startSupervisor(key, label: "tsh proxy app \(agent)", healthPort: port) { [weak self] in
+        startSupervisor(key, label: "tsh proxy app \(app)", healthPort: port) { [weak self] in
             if let why = self?.loginWait(host) { return .failure(why) }
             return .success(cmd)
         }

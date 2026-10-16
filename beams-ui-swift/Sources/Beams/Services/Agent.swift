@@ -238,6 +238,12 @@ enum PublishedURLs {
     /// proxies, see ANTHROPIC_BASE_URL / OPENAI_BASE_URL) and are not apps.
     static let serviceHosts: Set<String> = ["anthropic", "openai"]
 
+    /// Teleport app name for `config.agent`'s API proxy: "claude" →
+    /// "anthropic", "codex" → "openai" (see `serviceHosts` above).
+    static func serviceApp(for agent: String) -> String {
+        agent == "codex" ? "openai" : "anthropic"
+    }
+
     /// A published beam app's host is `<beam-alias>-<number>.<tenant>`, e.g.
     /// mild-moon-7727.super-grass.beams.sh. Other subdomains (API proxies,
     /// regular Teleport apps) must not become 🌐 buttons.

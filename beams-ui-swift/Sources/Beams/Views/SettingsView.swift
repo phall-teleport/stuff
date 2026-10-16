@@ -50,7 +50,7 @@ struct SettingsView: View {
                     Text("Codex runs with approvals bypassed (beams are sandboxed). Permission prompts don't apply.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Toggle("Also proxy the \(model.config.agent) Teleport app to this Mac", isOn: $m.config.agentProxyEnabled)
+                Toggle("Also proxy the \(PublishedURLs.serviceApp(for: model.config.agent)) Teleport app to this Mac", isOn: $m.config.agentProxyEnabled)
                 if model.config.agentProxyEnabled {
                     TextField("Port on this Mac", text: Binding(
                         get: { model.config.agentProxyPort == 0 ? "" : String(model.config.agentProxyPort) },
@@ -60,7 +60,7 @@ struct SettingsView: View {
                         Text(st).font(.caption).foregroundStyle(st == "running" ? .green : .orange)
                     }
                 }
-                Text("Keeps `tsh proxy app --port <port> \(model.config.agent)` running on this Mac (`tsh apps login` first), independent of the agent's own MCP tools — restarts on its own and pauses while your tsh login is expired, same as the laptop MCP proxies below.")
+                Text("Keeps `tsh proxy app --port <port> \(PublishedURLs.serviceApp(for: model.config.agent))` running on this Mac (`tsh apps login` first), independent of the agent's own MCP tools — restarts on its own and pauses while your tsh login is expired, same as the laptop MCP proxies below.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             MCPSettingsSection()
