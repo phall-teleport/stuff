@@ -60,11 +60,16 @@ struct Session: Codable, Identifiable, Hashable {
     /// reports tokens, not dollars, and each turn.completed carries the
     /// thread's running total, so the latest value per thread is kept.
     var codexUsage: [String: [Int]] = [:]
+    /// A local pi session: no beam, no SSH, runs `pi --mode json` directly
+    /// on this Mac against `localWorkDir`. beamId/beamName are unused.
+    var isLocal: Bool = false
+    /// Folder on this Mac a local session runs in (its pi "project" dir).
+    var localWorkDir: String = ""
 
     // Explicit because providing both init(from:) and encode(to:) disables synthesis.
     enum CodingKeys: String, CodingKey {
         case id, beamId, beamName, title, created, updated, turns, costUsd, lastSync, lastError, publishedUrls, codexThread,
-             codexSessionRel, needsFreshStart, localFolder, localSaved, codexUsage
+             codexSessionRel, needsFreshStart, localFolder, localSaved, codexUsage, isLocal, localWorkDir
     }
 
     init(id: String, beamId: String, beamName: String) {
@@ -91,6 +96,8 @@ struct Session: Codable, Identifiable, Hashable {
         localFolder = try c.decodeIfPresent(String.self, forKey: .localFolder) ?? ""
         localSaved = try c.decodeIfPresent(String.self, forKey: .localSaved) ?? ""
         codexUsage = try c.decodeIfPresent([String: [Int]].self, forKey: .codexUsage) ?? [:]
+        isLocal = try c.decodeIfPresent(Bool.self, forKey: .isLocal) ?? false
+        localWorkDir = try c.decodeIfPresent(String.self, forKey: .localWorkDir) ?? ""
     }
 
     func encode(to encoder: Encoder) throws {
@@ -112,6 +119,8 @@ struct Session: Codable, Identifiable, Hashable {
         try c.encode(localFolder, forKey: .localFolder)
         try c.encode(localSaved, forKey: .localSaved)
         if !codexUsage.isEmpty { try c.encode(codexUsage, forKey: .codexUsage) }
+        if isLocal { try c.encode(isLocal, forKey: .isLocal) }
+        if !localWorkDir.isEmpty { try c.encode(localWorkDir, forKey: .localWorkDir) }
     }
 }
 

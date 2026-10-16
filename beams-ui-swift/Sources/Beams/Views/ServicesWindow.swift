@@ -76,7 +76,7 @@ final class ServicesState: ObservableObject {
     func act(_ action: String, _ model: AppModel, beamID: String) async {
         guard let name = selected, let script = Beamctl.actionScript(action, name), model.sshAllowed() else { return }
         do {
-            try await model.client.run(id: beamID, script: script)
+            _ = try await model.client.run(id: beamID, script: script)
             model.toast("\(action.capitalized) \(name)", .ok)
         } catch {
             model.fail(error)

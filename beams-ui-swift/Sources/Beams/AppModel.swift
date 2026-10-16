@@ -246,6 +246,8 @@ final class AppModel {
                 guard let ev = StreamEvent(line: ln) else { continue }
                 if CodexEvents.isCodexLine(ev) {
                     list += CodexEvents.items(from: ev, seq: &seqN).items
+                } else if PiEvents.isPiLine(ev) {
+                    list += PiEvents.items(from: ev, seq: &seqN)
                 } else {
                     list += TranscriptItem.items(from: ev, seq: &seqN)
                     TranscriptItem.attachToolResults(from: ev, into: &list)
@@ -271,6 +273,10 @@ final class AppModel {
             sessions.removeAll { $0.id == s.id }
             items[s.id] = nil
             if currentID == s.id { currentID = nil }
+        }
+        if s.isLocal {
+            ask("Remove \(name)?", "This only removes the transcript; \(s.localWorkDir) on this Mac is untouched.", ok: "Remove session", destructive: true, removeLocal)
+            return
         }
         let beamExists = beams.contains { $0.id == s.beamId }
         guard beamExists else {
@@ -363,9 +369,10 @@ final class AppModel {
     }
 
     /// A session's beam is gone once the beam list has loaded and doesn't
-    /// contain it (beams expire; imported sessions start without one).
+    /// contain it (beams expire; imported sessions start without one). Local
+    /// sessions have no beam at all, so they're never "gone".
     func beamGone(_ s: Session) -> Bool {
-        beamsLoaded && !beams.contains(where: { $0.id == s.beamId })
+        !s.isLocal && beamsLoaded && !beams.contains(where: { $0.id == s.beamId })
     }
 
     /// First prompt after moving a session to a beam without its conversation
@@ -378,13 +385,19 @@ final class AppModel {
     }
 
     private func runTurn(sessionID: String, prompt: String, images: [ImageAttachment] = []) async {
-        if let s = sessions.first(where: { $0.id == sessionID }), beamGone(s) {
+        guard let session0 = sessions.first(where: { $0.id == sessionID }) else { return }
+        if session0.isLocal {
+            if !images.isEmpty { toast("Images aren't sent to local pi sessions yet.", .info) }
+            runPiTurn(sessionID: sessionID, prompt: prompt)
+            return
+        }
+        if beamGone(session0) {
             composer = prompt; composerImages = images   // give the prompt back
-            toast("The beam \(s.beamName.isEmpty ? "for this session" : s.beamName) is gone. Continue the session in a beam from the banner above.", .err, seconds: 7)
+            toast("The beam \(session0.beamName.isEmpty ? "for this session" : session0.beamName) is gone. Continue the session in a beam from the banner above.", .err, seconds: 7)
             return
         }
         guard sshAllowed() else { composer = prompt; composerImages = images; return }
-        if let s = sessions.first(where: { $0.id == sessionID }) { prepareMCP(beamID: s.beamId) }
+        prepareMCP(beamID: session0.beamId)
         if config.agent == "codex" { runCodexTurn(sessionID: sessionID, prompt: prompt, images: images); return }
         if usePersistent { runTurnPersistent(sessionID: sessionID, prompt: prompt, images: images); return }
         guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
@@ -544,6 +557,84 @@ final class AppModel {
                 $0.turns += 1; $0.updated = Date(); $0.needsFreshStart = false
                 if let usage { $0.codexUsage[$0.codexThread] = usage }
             }
+        }
+    }
+
+    // MARK: Local pi sessions
+
+    /// Creates a new "Local" session: picks a folder on this Mac, then opens
+    /// it. No beam, no SSH — turns run `pi --mode json` directly against the
+    /// folder. v1 scope only (see Services/Pi.swift): no permission UI, no
+    /// GitHub sync, no memory pull, no image attachments.
+    func createLocalSession() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use Folder"
+        panel.message = "Choose a folder on this Mac for pi to work in."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        var local = Session(id: UUID().uuidString.lowercased(), beamId: "", beamName: "Local")
+        local.isLocal = true
+        local.localWorkDir = url.path
+        do { try store.saveSession(local) } catch { fail(error); return }
+        sessions.insert(local, at: 0)
+        openSession(local.id)
+    }
+
+    /// Runs one local `pi --mode json` turn (no beam, no SSH). Images aren't
+    /// forwarded yet — v1 scope.
+    private func runPiTurn(sessionID: String, prompt: String) {
+        guard let s = sessions.first(where: { $0.id == sessionID }) else { return }
+        guard config.agentProxyEnabled else {
+            composer = prompt
+            toast("Enable \"Also proxy the \(PublishedURLs.serviceApp(for: config.agent)) Teleport app to this Mac\" in Settings for local pi sessions.", .err, seconds: 7)
+            return
+        }
+        reconcileAgentProxy()
+        busy.insert(sessionID)
+        turnStart[sessionID] = Date()
+        recordUserTurn(sessionID, prompt)
+        // Same agent/model Settings already picks for beam turns, routed to
+        // the pi provider named for it (e.g. "teleport-anthropic") instead of
+        // a separate pi-specific setting.
+        let provider = "teleport-" + PublishedURLs.serviceApp(for: config.agent)
+        // pi requires --model whenever --provider is given; Settings' model
+        // picker starts blank until touched, so fall back to its first option.
+        let defaultModel = (config.agent == "codex" ? SettingsView.codexModels : SettingsView.claudeModels).first ?? ""
+        let model = config.model.isEmpty ? defaultModel : config.model
+        let turn = PiTurn(workDir: s.localWorkDir, sessionID: sessionID, prompt: prompt, provider: provider, model: model)
+        Task { [weak self] in
+            guard let self else { return }
+            var errMsg = ""
+            do {
+                try await Shell.run(turn.argv, cwd: s.localWorkDir,
+                    onStdoutLine: { line in Task { @MainActor in self.handlePiLine(sessionID, line) } },
+                    onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },
+                    register: { p in Task { @MainActor in self.running[sessionID] = p } })
+            } catch { errMsg = self.running[sessionID] == nil ? "stopped" : error.localizedDescription }
+            await MainActor.run {
+                self.running[sessionID] = nil
+                _ = self.busy.remove(sessionID)
+                self.logTurnLatency(sessionID)
+                if !errMsg.isEmpty, errMsg != "stopped" {
+                    self.appendItem(sessionID, TranscriptItem(id: self.nextSeq(sessionID), kind: .result, text: errMsg, ok: false))
+                }
+            }
+        }
+    }
+
+    private func handlePiLine(_ id: String, _ line: String) {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        guard t.hasPrefix("{"), let ev = StreamEvent(line: t) else { appendStderr(id, t); return }
+        store.appendTranscript(id, line: t)
+        var n = seq[id, default: 0]
+        let newItems = PiEvents.items(from: ev, seq: &n)
+        seq[id] = n
+        items[id, default: []] += newItems
+        if ev.type == "agent_settled" {
+            updateSession(id) { $0.turns += 1; $0.updated = Date() }
         }
     }
 
@@ -959,18 +1050,19 @@ final class AppModel {
         guard !ghLoggingIn else { return }
         ghLoggingIn = true; ghDeviceCode = "····-····"
         syncLog.append("Starting GitHub sign-in (browser device flow)…")
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             do {
-                try await GitHubSync.login { [weak self] line in
+                try await GitHubSync.login { line in
                     Task { @MainActor in
-                        self?.syncLog.append(line)
-                        if let r = line.range(of: #"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"#, options: .regularExpression) { self?.ghDeviceCode = String(line[r]) }
+                        self.syncLog.append(line)
+                        if let r = line.range(of: #"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"#, options: .regularExpression) { self.ghDeviceCode = String(line[r]) }
                     }
                 }
-                await refreshGitHub()
-                toast("Signed in to GitHub as \(gh.user)", .ok)
-            } catch { fail(error) }
-            ghLoggingIn = false; ghDeviceCode = nil
+                await self.refreshGitHub()
+                self.toast("Signed in to GitHub as \(self.gh.user)", .ok)
+            } catch { self.fail(error) }
+            self.ghLoggingIn = false; self.ghDeviceCode = nil
         }
     }
 
@@ -1171,18 +1263,19 @@ final class AppModel {
         rememberUser()
         tshLoggingIn = true
         tshPending = "Starting: $ \(tshLoginCommand)\nSSO clusters open your browser; password clusters open \(terminalAppName)."
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             do {
-                try await tshClient.runLogin(user: user) { [weak self] l in Task { @MainActor in self?.tshPending = l } }
-                if await checkTsh() { toast("Logged in to \(tsh.cluster) as \(tsh.user)", .ok); await loadBeams() }
+                try await self.tshClient.runLogin(user: user) { l in Task { @MainActor in self.tshPending = l } }
+                if await self.checkTsh() { self.toast("Logged in to \(self.tsh.cluster) as \(self.tsh.user)", .ok); await self.loadBeams() }
             } catch TshError.needsTerminal {
                 do {
-                    try openTerminalLogin()
-                    tshPending = "This cluster uses password login, so \(terminalAppName) was opened with:\n$ \(tshLoginCommand)\nFinish there; this screen updates by itself."
-                    startTshPoll()
-                } catch { fail(error); tshPending = "Run this in a terminal, then click ⟳:\n$ \(tshLoginCommand)" }
-            } catch { fail(error); tshPending = nil; _ = await checkTsh() }
-            tshLoggingIn = false
+                    try self.openTerminalLogin()
+                    self.tshPending = "This cluster uses password login, so \(self.terminalAppName) was opened with:\n$ \(self.tshLoginCommand)\nFinish there; this screen updates by itself."
+                    self.startTshPoll()
+                } catch { self.fail(error); self.tshPending = "Run this in a terminal, then click ⟳:\n$ \(self.tshLoginCommand)" }
+            } catch { self.fail(error); self.tshPending = nil; _ = await self.checkTsh() }
+            self.tshLoggingIn = false
         }
     }
 

@@ -59,7 +59,7 @@ struct SidebarView: View {
                     Button { Task { await model.loadBeams() } } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help("Refresh")
                     Button { Task { await model.createBeam() } } label: { Image(systemName: "plus") }
-                        .buttonStyle(.borderless).help("New beam")
+                        .buttonStyle(.borderless).help("New hosted beam — a Teleport sandbox, not local")
                 }
             }
 
@@ -74,8 +74,10 @@ struct SidebarView: View {
                 HStack {
                     Text("Sessions")
                     Spacer()
+                    Button { model.createLocalSession() } label: { Image(systemName: "laptopcomputer") }
+                        .buttonStyle(.borderless).help("New local session — runs pi on this Mac, not a hosted beam")
                     Button { model.openFromGitHub() } label: { Image(systemName: "tray.and.arrow.down") }
-                        .buttonStyle(.borderless).help("Open a previous session from GitHub (⌘O)")
+                        .buttonStyle(.borderless).help("Open a previous session (local or hosted beam) from GitHub (⌘O)")
                 }
             }
         }
@@ -176,6 +178,9 @@ struct SessionRow: View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 8) {
                 Circle().fill(model.busy.contains(session.id) ? .orange : .green).frame(width: 7, height: 7)
+                Image(systemName: session.isLocal ? "laptopcomputer" : "server.rack")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .help(session.isLocal ? "Local pi session — runs on this Mac" : "Hosted beam session — runs in a Teleport sandbox")
                 Text(session.title.isEmpty ? "New session" : session.title).lineLimit(1)
                 Spacer()
                 if hover.on {
@@ -193,7 +198,7 @@ struct SessionRow: View {
     }
 
     private var meta: String {
-        var parts = [session.beamName, "\(session.turns) turns", session.costShort, session.updated.relativeShort]
+        var parts = [session.isLocal ? "Local" : session.beamName, "\(session.turns) turns", session.costShort, session.updated.relativeShort]
         if !session.lastSync.isEmpty { parts.append("synced") }
         if !session.publishedUrls.isEmpty { parts.append("🌐") }
         return parts.joined(separator: " · ")
@@ -217,9 +222,11 @@ struct MainView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.tshChecked && !model.tsh.loggedIn { AuthBanner() }
-            else if let reason = model.sshBlockedReason { SSHAccessBanner(reason: reason) }
-            if let s = model.current, model.beamGone(s), model.sshBlockedReason == nil { ContinueBanner(session: s) }
+            if model.current?.isLocal != true {
+                if model.tshChecked && !model.tsh.loggedIn { AuthBanner() }
+                else if let reason = model.sshBlockedReason { SSHAccessBanner(reason: reason) }
+                if let s = model.current, model.beamGone(s), model.sshBlockedReason == nil { ContinueBanner(session: s) }
+            }
             if let s = model.current {
                 TranscriptView(sessionID: s.id)
                 Composer()
@@ -241,7 +248,7 @@ struct MainView: View {
                     }
                     .help(s.publishedUrls.joined(separator: "\n"))
                 }
-                if let s = model.current {
+                if let s = model.current, !s.isLocal {
                     Text(s.costLong).font(.caption.monospaced()).foregroundStyle(.secondary)
                         .help(s.usesTokens ? "Codex reports tokens, not dollars" : "Cost reported by Claude Code")
                 }
@@ -269,6 +276,7 @@ struct EmptyState: View {
                 feature("square.and.arrow.down", "Save locally", "Copy what the agent made in the beam to a folder on this Mac (⌘S).")
                 feature("tray.and.arrow.down", "Pick up where you left off", "Open a session synced to GitHub and continue it in a new beam (⌘O).")
                 feature("cpu", "Claude Code or Codex", "Choose the agent and model in Settings. Permission prompts appear right in the conversation.")
+                feature("laptopcomputer", "Local pi sessions", "Click the laptop icon above to run pi directly on this Mac against a folder you pick — no beam, no SSH. Enable \"Also proxy the agent's Teleport app to this Mac\" in Settings so pi has a model backend.")
             }
             .frame(maxWidth: 520, alignment: .leading)
             .padding(.top, 8)

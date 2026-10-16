@@ -266,6 +266,38 @@ sequence with context preserved, removing per-turn tsh+claude startup.
 `runTurnPersistent` starts it once; `result` clears per-turn state without
 closing stdin; `endPersistent` tears it down. Codex always runs per-turn.
 
+## Local pi sessions (experimental, 2026-10-16)
+
+The laptop icon on the Sessions header (`createLocalSession`) picks a folder
+on this Mac and opens a `Session` with `isLocal = true`, `localWorkDir` set.
+No beam, no SSH, no `ContinueBanner`/auth banners (`MainView` skips them for
+`model.current?.isLocal`): turns run `pi --mode json --session-id <id>`
+directly against that folder via `Shell.run` (`AppModel.runPiTurn`,
+`Services/Pi.swift`). `PiEvents.items` maps pi's JSON stream
+(`message_end`, `tool_execution_end`, `agent_settled`, …) onto the shared
+`TranscriptItem` model, same as `CodexEvents`.
+
+Reuses the existing "Also proxy the agent's Teleport app to this Mac" toggle
+(Settings, `config.agentProxyEnabled`/`agentProxyPort`,
+`AppModel+MCP.swift reconcileAgentProxy`) as pi's model backend instead of a
+separate pi setting: `runPiTurn` passes `--provider teleport-<serviceApp>
+--model <config.model>`, where `<serviceApp>` is `PublishedURLs.serviceApp(for:
+config.agent)` ("claude" → "anthropic", "codex" → "openai") — same
+agent/model Settings already drives beam turns. That provider name must
+already exist in pi's own config
+(`~/.pi/agent/models.json` → `providers.teleport-anthropic`: `baseUrl
+http://127.0.0.1:<agentProxyPort>`, `api: "anthropic-messages"`, `apiKey:
+"dummy"`, matching model ids); this app never writes pi's config, so the port
+there and `agentProxyPort` here must be kept in sync by hand. `runPiTurn`
+refuses to start (toasts, gives the prompt back) if `agentProxyEnabled` is
+off; it does not turn the toggle on for you.
+
+v1 scope only: no permission-prompt UI (pi doesn't gate tool calls behind one
+in `--mode json`), no image attachments, no MCP wiring, no GitHub sync, no
+memory pull. Not verified end to end against a real pi turn through the
+proxy — only that `pi --help` lists `--provider`/`--model` and that the
+`teleport-anthropic` provider already exists locally.
+
 ## Architecture
 
 - `AppModel` (`@MainActor @Observable`) owns all state and actions; views are
