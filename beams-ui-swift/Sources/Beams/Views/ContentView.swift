@@ -74,6 +74,12 @@ struct SidebarView: View {
                 HStack {
                     Text("Sessions")
                     Spacer()
+                    Button { model.updatePi() } label: {
+                        if model.updatingPi { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "arrow.triangle.2.circlepath") }
+                    }
+                    .buttonStyle(.borderless).disabled(model.updatingPi)
+                    .help("Check for pi & extension updates and install them")
                     Button { model.createLocalSession() } label: { Image(systemName: "laptopcomputer") }
                         .buttonStyle(.borderless).help("New local session — runs pi on this Mac, not a hosted beam")
                     Button { model.openFromGitHub() } label: { Image(systemName: "tray.and.arrow.down") }

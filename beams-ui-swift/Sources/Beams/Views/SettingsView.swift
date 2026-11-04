@@ -3,8 +3,18 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
 
-    static let claudeModels = ["claude-sonnet-5", "claude-opus-5[1m]", "claude-opus-4-6[1m]"]
-    static let codexModels = ["gpt-5-codex", "gpt-5", "o4-mini"]
+    /// Built-in model lists (not fetched: the beam's API proxy doesn't serve
+    /// /v1/models). Any other ID can be typed in the Model ID field.
+    /// `claudeModels.first` is the fallback for local pi sessions, so it must
+    /// also be listed in ~/.pi/agent/models.json.
+    static let claudeModels = ["claude-sonnet-5-5", "claude-opus-5-5", "claude-sonnet-5", "claude-opus-5[1m]", "claude-opus-4-6[1m]"]
+    /// From Codex's /model menu (display names → IDs; verify in ~/.codex/config.toml).
+    static let codexModels = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
+                              "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+
+    private var suggestedModels: [String] {
+        model.config.agent == "codex" ? Self.codexModels : Self.claudeModels
+    }
 
     var body: some View {
         @Bindable var m = model
@@ -44,8 +54,17 @@ struct SettingsView: View {
                 .onChange(of: model.config.agent) { _, _ in model.config.model = "" }
                 Picker("Model", selection: $m.config.model) {
                     Text(model.config.agent == "codex" ? "Codex default" : "Beam default").tag("")
-                    ForEach(model.config.agent == "codex" ? Self.codexModels : Self.claudeModels, id: \.self) { Text($0).tag($0) }
+                    ForEach(suggestedModels, id: \.self) { Text($0).tag($0) }
+                    // A custom ID typed below gets its own entry so the picker's
+                    // selection always matches a tag.
+                    if !model.config.model.isEmpty && !suggestedModels.contains(model.config.model) {
+                        Text("\(model.config.model) (custom)").tag(model.config.model)
+                    }
                 }
+                TextField("Model ID", text: $m.config.model, prompt: Text("blank = default; any ID the CLI accepts"))
+                    .font(.callout.monospaced())
+                Text("Passed as-is to `\(model.config.agent == "codex" ? "codex -m" : "claude --model")`, so a model that isn't listed yet still works.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if model.config.agent == "codex" {
                     Text("Codex runs with approvals bypassed (beams are sandboxed). Permission prompts don't apply.")
                         .font(.caption).foregroundStyle(.secondary)
