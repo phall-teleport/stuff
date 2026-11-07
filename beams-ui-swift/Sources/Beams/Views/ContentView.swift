@@ -56,7 +56,9 @@ struct SidebarView: View {
                 HStack {
                     Text("Sandboxes")
                     Spacer()
-                    Button { Task { await model.loadBeams() } } label: { Image(systemName: "arrow.clockwise") }
+                    Button {
+                        Task { await model.loadBeams(); await PhaseCenter.shared.refresh(model) }
+                    } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help("Refresh")
                     Button { Task { await model.createBeam() } } label: { Image(systemName: "plus") }
                         .buttonStyle(.borderless).help("New hosted beam — a Teleport sandbox, not local")
@@ -88,6 +90,9 @@ struct SidebarView: View {
             }
         }
         .listStyle(.sidebar)
+        // Phases tell the sidebar which beams are build beams. Re-run on login
+        // changes; refresh() does nothing while logged out (tsh would start a login).
+        .task(id: model.tsh.loggedIn) { await PhaseCenter.shared.refresh(model) }
         .safeAreaInset(edge: .bottom) {
             HStack {
                 Label("Beams", systemImage: "sparkles").font(.headline).foregroundStyle(Color.accentColor)
@@ -111,12 +116,22 @@ struct BeamRow: View {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var hover = LocalFlag()
     @StateObject private var pop = HoverPopover()
+    @ObservedObject private var phases = PhaseCenter.shared
 
     var body: some View {
+        let snapshotting = phases.snapshotting.contains(beam.id)
+        let building = phases.buildPhase(for: beam)
         HStack(spacing: 8) {
             Circle().fill(.green).frame(width: 7, height: 7)
             Text(beam.name).lineLimit(1)
+            if let building {
+                Image(systemName: "hammer").font(.caption).foregroundStyle(.blue)
+                    .help("Build beam for phase \(building.name)")
+            }
             Spacer()
+            if snapshotting {
+                ProgressView().controlSize(.small).help("Saving a phase snapshot…")
+            }
             Text(beam.raw["region"] ?? beam.state).font(.caption).foregroundStyle(.tertiary)
             if hover.on {
                 Button { model.deleteBeam(beam) } label: { Image(systemName: "xmark") }
@@ -126,12 +141,20 @@ struct BeamRow: View {
         .contentShape(Rectangle())
         .onHover { h in hover.on = h; if h { pop.enter() } else { pop.exit() } }
         .popover(isPresented: Binding(get: { pop.shown }, set: { if !$0 { pop.exit() } }), arrowEdge: .trailing) {
-            BeamInfoPopover(beam: beam)
+            BeamInfoPopover(beam: beam, building: building?.name)
         }
         .onTapGesture { Task { await model.startSession(on: beam) } }
         .contextMenu {
             Button("New session on \(beam.name)") { Task { await model.startSession(on: beam) } }
             Button("Services and logs…") { openWindow(id: "services", value: beam.id) }
+            Divider()
+            if let building {
+                Button("Save Snapshot to \(building.name)") { Task { await phases.snapshot(beam, final: false, model: model) } }
+                    .disabled(snapshotting)
+                Button("Final Snapshot and Delete Beam…") { Task { await phases.snapshot(beam, final: true, model: model) } }
+                    .disabled(snapshotting)
+            }
+            Button("Manage Phases…") { openWindow(id: "phases") }
             Divider()
             Button("Delete beam…", role: .destructive) { model.deleteBeam(beam) }
         }
@@ -151,9 +174,11 @@ struct BeamRow: View {
     }
 }
 
-/// Region and expiration shown when hovering a sandbox row.
+/// Region, expiration and phase shown when hovering a sandbox row.
 struct BeamInfoPopover: View {
     let beam: Beam
+    /// Phase this beam is building, if it's a build beam.
+    var building: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -161,6 +186,9 @@ struct BeamInfoPopover: View {
             row("Region", beam.raw["region"] ?? "unknown")
             row("Expires", BeamRow.expiry(beam.raw["expires"]))
             if let owner = beam.raw["owner"], !owner.isEmpty { row("Owner", owner) }
+            // `phase` in `beams ls` is the image the beam started from.
+            if let base = beam.raw["phase"], !base.isEmpty { row("Phase", base) }
+            if let building { row("Building", building) }
             row("ID", beam.id)
         }
         .padding(12)
@@ -278,6 +306,7 @@ struct EmptyState: View {
             Text("Create or pick a sandbox on the left. Each session runs Claude Code (or another model choosable from Settings) in the beam, streams the conversation here, and can commit the transcript and memory to GitHub.")
                 .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 520)
             VStack(alignment: .leading, spacing: 8) {
+                feature("square.stack.3d.up", "New: Phases", "Save a beam's /home (tools, project, memory and conversation) as a reusable image. Open File → Phases… (⇧⌘P) to create one, snapshot its build beam from the right-click menu, and start new beams from it. Sessions on a phase continue from its snapshot when their beam expires. Needs tsh 18.11.9 or newer.")
                 feature("server.rack", "MCP servers", "In Settings, add MCP servers from your Teleport cluster, or ones running on this Mac. Local servers are tunneled into the beam for the agent to use.")
                 feature("square.and.arrow.down", "Save locally", "Copy what the agent made in the beam to a folder on this Mac (⌘S).")
                 feature("tray.and.arrow.down", "Pick up where you left off", "Open a session synced to GitHub and continue it in a new beam (⌘O).")

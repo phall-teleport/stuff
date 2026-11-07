@@ -63,7 +63,10 @@ extension AppModel {
         let cmd = resolvedTsh.tunnelArgs(nodeUUID: uuid, login: beamLogin, ports: ports)
         let host = hostOnly(config.proxy)
         mcpTunnelPorts[key] = ports
-        startSupervisor(key, label: "MCP tunnel", healthPort: nil) { [weak self] in
+        // Probing one of the Mac's own forwarded ports catches "ssh is still
+        // running but the forward is dead" the same way a proxy app's health
+        // check does — see Supervisor.probe.
+        startSupervisor(key, label: "MCP tunnel", healthPort: ports.first) { [weak self] in
             if let why = self?.loginWait(host) { return .failure(why) }
             return .success(cmd)
         }

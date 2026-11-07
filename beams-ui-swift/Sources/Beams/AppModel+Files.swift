@@ -19,7 +19,7 @@ extension AppModel {
         savingLocal.insert(id)
         defer { savingLocal.remove(id) }
         do {
-            let res = try await client.run(id: s.beamId, script: AgentScripts.workspaceDownload(workDir: config.workDir))
+            let res = try await client.run(id: s.beamId, script: AgentScripts.workspaceDownload(workDir: config.workDir), timeout: 120)
             guard !res.stdout.isEmpty else { toast("\(config.workDir) in \(s.beamName) is empty"); return }
             let count = try await Self.extract(res.stdout, into: folder)
             updateSession(id) { $0.localFolder = folder; $0.localSaved = RFC3339.string(Date()) }

@@ -21,7 +21,7 @@ final class ServicesState: ObservableObject {
         loading = true
         defer { loading = false }
         do {
-            let res = try await model.client.run(id: beamID, script: Beamctl.listScript)
+            let res = try await model.client.run(id: beamID, script: Beamctl.listScript, timeout: 30)
             if String(decoding: res.stdout, as: UTF8.self).contains(Beamctl.missingMarker) {
                 noBeamctl = true; services = []; return
             }
@@ -51,7 +51,7 @@ final class ServicesState: ObservableObject {
         let gen = logGen, follow = following
         Task { [weak self] in
             do {
-                try await model.client.run(id: beamID, script: Beamctl.logsScript(name, follow: follow), stdin: nil, interactiveStdin: false,
+                try await model.client.run(id: beamID, script: Beamctl.logsScript(name, follow: follow), stdin: nil, interactiveStdin: false, timeout: nil,
                     onStdoutLine: { line in Task { @MainActor in self?.append(Shell.stripANSI(line), gen) } },
                     onStderrLine: { line in Task { @MainActor in self?.append("[stderr] " + Shell.stripANSI(line), gen) } },
                     register: { p in Task { @MainActor in if self?.logGen == gen { self?.logProc = p } else { p.terminate() } } })
@@ -76,7 +76,7 @@ final class ServicesState: ObservableObject {
     func act(_ action: String, _ model: AppModel, beamID: String) async {
         guard let name = selected, let script = Beamctl.actionScript(action, name), model.sshAllowed() else { return }
         do {
-            _ = try await model.client.run(id: beamID, script: script)
+            _ = try await model.client.run(id: beamID, script: script, timeout: 30)
             model.toast("\(action.capitalized) \(name)", .ok)
         } catch {
             model.fail(error)

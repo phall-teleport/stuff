@@ -148,8 +148,16 @@ extension TshClient {
     /// this Mac's 127.0.0.1:<port>. `tsh beams ssh` has no -R, but beams are
     /// OpenSSH nodes named by their uuid, so plain `tsh ssh` reaches them.
     /// Verified 2026-09-30: curl in the beam fetched a laptop-only server.
+    /// Keepalives so a connection that goes dead (Mac sleep, network blip)
+    /// without the process ever exiting is actually noticed: ssh sends a
+    /// keepalive every 15s and exits after 3 unanswered (~45s), which feeds
+    /// the Supervisor's normal restart-on-exit path instead of leaving a
+    /// zombie tunnel that looks "running" forever.
     func tunnelArgs(nodeUUID: String, login: String, ports: [Int]) -> [String] {
-        var a = mcpArgs(["ssh", "-N"])
+        var a = mcpArgs(["ssh", "-N",
+                         "-o", "ServerAliveInterval=15",
+                         "-o", "ServerAliveCountMax=3",
+                         "-o", "ExitOnForwardFailure=yes"])
         for p in ports { a += ["-R", "\(p):127.0.0.1:\(p)"] }
         return a + ["\(login)@\(nodeUUID)"]
     }

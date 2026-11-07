@@ -11,6 +11,8 @@ struct Beam: Identifiable, Hashable {
 
     /// Maps a `tsh beams ls -f json` row (id, uuid, owner, expires, region…)
     /// onto Beam, tolerating field names from other server versions.
+    /// `phase` in a row is the image the beam started from (e.g. "default:v1"),
+    /// not a lifecycle state, so it's kept in `raw` and exposed as `phase`.
     init(row: [String: Any]) {
         func str(_ keys: String...) -> String {
             for k in keys { if let s = row[k] as? String, !s.isEmpty { return s } }
@@ -18,7 +20,8 @@ struct Beam: Identifiable, Hashable {
         }
         id = str("id", "name", "uuid")
         name = str("alias", "name", "id")
-        state = str("state", "status", "phase").isEmpty ? "running" : str("state", "status", "phase")
+        let st = str("state", "status")
+        state = st.isEmpty ? "running" : st
         created = str("created", "created_at", "expires")
         var r: [String: String] = [:]
         for (k, v) in row { if let s = v as? String { r[k] = s } else { r[k] = String(describing: v) } }
@@ -28,6 +31,9 @@ struct Beam: Identifiable, Hashable {
     init(id: String, name: String, state: String = "running", created: String = "", raw: [String: String] = [:]) {
         self.id = id; self.name = name; self.state = state; self.created = created; self.raw = raw
     }
+
+    /// The Phase image this beam started from ("default:v1", "x", …); empty if not reported.
+    var phase: String { raw["phase"] ?? "" }
 }
 
 // MARK: - Sessions (same JSON layout as the Go app, so data is shared)
@@ -65,11 +71,16 @@ struct Session: Codable, Identifiable, Hashable {
     var isLocal: Bool = false
     /// Folder on this Mac a local session runs in (its pi "project" dir).
     var localWorkDir: String = ""
+    /// Phase this session's /home is snapshotted to. When set, continuing
+    /// starts the new beam with `tsh beams add --phase=<phase>`, which brings
+    /// back the workspace, memory and agent conversation without manual
+    /// restores. Empty = no phase (the GitHub/tarball restore path).
+    var phase: String = ""
 
     // Explicit because providing both init(from:) and encode(to:) disables synthesis.
     enum CodingKeys: String, CodingKey {
         case id, beamId, beamName, title, created, updated, turns, costUsd, lastSync, lastError, publishedUrls, codexThread,
-             codexSessionRel, needsFreshStart, localFolder, localSaved, codexUsage, isLocal, localWorkDir
+             codexSessionRel, needsFreshStart, localFolder, localSaved, codexUsage, isLocal, localWorkDir, phase
     }
 
     init(id: String, beamId: String, beamName: String) {
@@ -98,6 +109,7 @@ struct Session: Codable, Identifiable, Hashable {
         codexUsage = try c.decodeIfPresent([String: [Int]].self, forKey: .codexUsage) ?? [:]
         isLocal = try c.decodeIfPresent(Bool.self, forKey: .isLocal) ?? false
         localWorkDir = try c.decodeIfPresent(String.self, forKey: .localWorkDir) ?? ""
+        phase = try c.decodeIfPresent(String.self, forKey: .phase) ?? ""
     }
 
     func encode(to encoder: Encoder) throws {
@@ -121,6 +133,7 @@ struct Session: Codable, Identifiable, Hashable {
         if !codexUsage.isEmpty { try c.encode(codexUsage, forKey: .codexUsage) }
         if isLocal { try c.encode(isLocal, forKey: .isLocal) }
         if !localWorkDir.isEmpty { try c.encode(localWorkDir, forKey: .localWorkDir) }
+        if !phase.isEmpty { try c.encode(phase, forKey: .phase) }
     }
 }
 
@@ -239,6 +252,10 @@ struct Config: Codable, Equatable {
     var agentProxyEnabled: Bool = false
     var agentProxyPort: Int = 0
     var github: GitHubConfig = GitHubConfig()
+    /// Phase new beams start from (`tsh beams add --phase=…`); empty = the
+    /// cluster default image. Swift-only: the Go app drops it if it rewrites
+    /// the shared file, which just resets it to empty.
+    var defaultPhase: String = ""
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -262,6 +279,7 @@ struct Config: Codable, Equatable {
         agentProxyEnabled = try c.decodeIfPresent(Bool.self, forKey: .agentProxyEnabled) ?? false
         agentProxyPort = try c.decodeIfPresent(Int.self, forKey: .agentProxyPort) ?? 0
         github = try c.decodeIfPresent(GitHubConfig.self, forKey: .github) ?? GitHubConfig()
+        defaultPhase = try c.decodeIfPresent(String.self, forKey: .defaultPhase) ?? ""
     }
 }
 

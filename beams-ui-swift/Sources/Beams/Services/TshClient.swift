@@ -8,17 +8,21 @@ protocol BeamClient {
     func create() async throws -> Beam
     func delete(id: String) async throws
     /// Runs `sh -lc <script>` in the beam. Streams stdout lines when
-    /// `onStdoutLine` is given, otherwise returns stdout as Data.
+    /// `onStdoutLine` is given, otherwise returns stdout as Data. `timeout`
+    /// bounds the whole call (nil = unbounded, used for agent turns which can
+    /// legitimately run for minutes); short administrative scripts (restore,
+    /// pull, probe) should pass one so a beam that never becomes reachable
+    /// fails loudly instead of hanging the caller forever.
     @discardableResult
-    func run(id: String, script: String, stdin: Data?, interactiveStdin: Bool,
+    func run(id: String, script: String, stdin: Data?, interactiveStdin: Bool, timeout: TimeInterval?,
              onStdoutLine: ((String) -> Void)?, onStderrLine: ((String) -> Void)?,
              register: ((RunningProcess) -> Void)?) async throws -> ProcessResult
     func copyTo(id: String, local: String, remote: String, recursive: Bool) async throws
 }
 
 extension BeamClient {
-    func run(id: String, script: String) async throws -> ProcessResult {
-        try await run(id: id, script: script, stdin: nil, interactiveStdin: false, onStdoutLine: nil, onStderrLine: nil, register: nil)
+    func run(id: String, script: String, timeout: TimeInterval? = nil) async throws -> ProcessResult {
+        try await run(id: id, script: script, stdin: nil, interactiveStdin: false, timeout: timeout, onStdoutLine: nil, onStderrLine: nil, register: nil)
     }
 }
 
@@ -119,11 +123,11 @@ struct TshClient: BeamClient {
 
     /// tsh joins the remaining args with spaces for the remote shell, so the
     /// script is single-quoted to arrive intact.
-    func run(id: String, script: String, stdin: Data?, interactiveStdin: Bool,
+    func run(id: String, script: String, stdin: Data?, interactiveStdin: Bool, timeout: TimeInterval?,
              onStdoutLine: ((String) -> Void)?, onStderrLine: ((String) -> Void)?,
              register: ((RunningProcess) -> Void)?) async throws -> ProcessResult {
         try await Shell.run(args(["beams", "exec", id, "--", "sh", "-lc", Shell.quote(script)]),
-                            stdin: stdin, interactiveStdin: interactiveStdin, extraEnv: Self.env,
+                            stdin: stdin, interactiveStdin: interactiveStdin, extraEnv: Self.env, timeout: timeout,
                             onStdoutLine: onStdoutLine, onStderrLine: onStderrLine, register: register)
     }
 
@@ -241,7 +245,7 @@ final class MockClient: BeamClient {
     func delete(id: String) async throws { beams.removeAll { $0.id == id } }
     func copyTo(id: String, local: String, remote: String, recursive: Bool) async throws {}
 
-    func run(id: String, script: String, stdin: Data?, interactiveStdin: Bool,
+    func run(id: String, script: String, stdin: Data?, interactiveStdin: Bool, timeout: TimeInterval?,
              onStdoutLine: ((String) -> Void)?, onStderrLine: ((String) -> Void)?,
              register: ((RunningProcess) -> Void)?) async throws -> ProcessResult {
         if script.contains("claude -p") {

@@ -161,7 +161,10 @@ final class Supervisor {
         }
     }
 
-    /// Any HTTP response counts as alive; only connection failures don't.
+    /// Any non-5xx HTTP response counts as alive; connection failures and 5xx
+    /// don't. A 5xx can mean the local listener (e.g. `tsh proxy app`) is up
+    /// but its upstream is broken, which a plain "got a response" check would
+    /// miss — the lenient version let that case look "healthy" forever.
     static func probe(port: Int) async -> Bool {
         guard let url = URL(string: "http://127.0.0.1:\(port)/") else { return false }
         var req = URLRequest(url: url, timeoutInterval: 3)
@@ -170,7 +173,9 @@ final class Supervisor {
         cfg.connectionProxyDictionary = [:]
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel() }
-        return (try? await session.data(for: req)) != nil
+        guard let (_, resp) = try? await session.data(for: req) else { return false }
+        guard let http = resp as? HTTPURLResponse else { return true }
+        return http.statusCode < 500
     }
 
     /// tsh output that means it started a login instead of doing its job.

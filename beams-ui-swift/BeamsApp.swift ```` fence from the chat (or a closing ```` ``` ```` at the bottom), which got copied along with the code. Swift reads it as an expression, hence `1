@@ -1,0 +1,6 @@
+
+## Check
+
+```bash
+head -3 Sources/Beams/BeamsApp.swift
+tail -3 Sources/Beams/BeamsApp.swift

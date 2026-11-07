@@ -24,6 +24,21 @@ struct ConfirmRequest: Identifiable {
 
 enum InspectorTab: String, CaseIterable { case files = "Save locally", github = "GitHub" }
 
+/// Where an agent's conversation file lives in a beam, relative to $HOME, so
+/// a beam started from a phase can be checked for it before `--resume`.
+enum PhaseRestore {
+    /// nil when there's nothing to look for (a Codex session without a saved rollout path).
+    static func conversationPath(sessionID: String, isCodex: Bool, codexRel: String, workDir: String) -> String? {
+        if isCodex { return codexRel.isEmpty ? nil : ".codex/" + codexRel }
+        return ".claude/projects/\(ClaudePaths.projectSlug(workDir))/\(sessionID).jsonl"
+    }
+
+    /// Prints "present" or "missing".
+    static func checkScript(_ relPath: String) -> String {
+        "test -f \"$HOME\"/\(Shell.quote(relPath)) && echo present || echo missing\n"
+    }
+}
+
 /// All app state and actions. Views observe it; services do the work.
 @MainActor
 @Observable
@@ -60,6 +75,8 @@ final class AppModel {
     var composerImages: [ImageAttachment] = []
     /// Mirrors the composer's focus so ⌘V can attach images (Composer).
     var composerFocused = false
+    /// True while `pi update --all` is running (Sessions header button).
+    var updatingPi = false
 
     // teleport login
     var tsh = TshStatus()
@@ -132,6 +149,20 @@ final class AppModel {
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.stopAllMCP() }
         }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleWake() }
+        }
+    }
+
+    /// After a Mac sleep, SSH tunnels/proxies are almost certainly dead even
+    /// before keepalives or health probes would notice — the sleep itself is
+    /// the trigger, not just a network blip. Force every supervised process
+    /// to restart and re-check login state immediately rather than waiting
+    /// out ServerAliveInterval/health-probe thresholds.
+    private func handleWake() {
+        guard !isMock else { return }
+        for sup in mcpSupervisors.values where sup.isRunning { sup.restart() }
+        Task { [weak self] in _ = await self?.checkTsh() }
     }
 
     var current: Session? { sessions.first { $0.id == currentID } }
@@ -188,7 +219,14 @@ final class AppModel {
             beamsLoaded = true
             pruneMCPTunnels()
             beamsNote = beams.isEmpty ? "No sandboxes. Click ＋ to create one." : ""
-            if continueBeamID.isEmpty || !beams.contains(where: { $0.id == continueBeamID }) { continueBeamID = beams.first?.id ?? "" }
+            // Don't move the Continue sheet's selection while it's open (an empty
+            // selection there means "a new beam"); only drop a beam that vanished.
+            if continueSheetSessionID == nil {
+                if continueBeamID.isEmpty || !beams.contains(where: { $0.id == continueBeamID }) { continueBeamID = beams.first?.id ?? "" }
+            } else if !continueBeamID.isEmpty, !beams.contains(where: { $0.id == continueBeamID }) {
+                continueBeamID = ""
+            }
+            for s in sessions where s.phase.isEmpty && !s.isLocal { adoptBuildPhase(s.id) }
         } catch {
             beams = []
             beamsLoaded = false
@@ -202,7 +240,15 @@ final class AppModel {
         }
     }
 
+    /// ＋ New Beam: starts from the default phase when one is set (Phases
+    /// window → Use for New Beams), else the cluster's default image.
     func createBeam() async {
+        if !config.defaultPhase.isEmpty,
+           let b = await beamFromPhase(config.defaultPhase, fallback: "Creating a plain beam instead.") {
+            toast("Beam \(b.name) ready from phase \(config.defaultPhase)", .ok)
+            await startSession(on: b)
+            return
+        }
         toast("Creating beam…")
         do {
             let b = try await client.create()
@@ -221,18 +267,65 @@ final class AppModel {
         }
     }
 
+    // MARK: phases
+
+    /// A session on a build beam belongs to the phase that beam is building:
+    /// its /home is what gets snapshotted, so continuing later can start from
+    /// that phase. No-op if the session already has a phase or the beam isn't
+    /// a build beam (or the phase list hasn't loaded yet; later calls catch up).
+    /// Beams merely *started* from a phase don't count: their work isn't
+    /// snapshotted into it.
+    func adoptBuildPhase(_ sessionID: String) {
+        guard let s = sessions.first(where: { $0.id == sessionID }), s.phase.isEmpty, !s.isLocal,
+              let beam = beams.first(where: { $0.id == s.beamId }),
+              let p = PhaseCenter.shared.buildPhase(for: beam) else { return }
+        updateSession(sessionID) { $0.phase = p.name }
+    }
+
+    /// `tsh beams add --phase=<phase>`; nil (after a toast ending in
+    /// `fallback`) if that's not possible, so the caller can fall back.
+    private func beamFromPhase(_ phase: String, fallback: String) async -> Beam? {
+        guard !isMock, let tsh = client as? TshClient else { return nil }
+        toast("Starting a beam from phase \(phase)…")
+        do {
+            let id = try await tsh.beamAddFromPhase(phase)
+            await loadBeams()
+            return beams.first { $0.id == id || $0.raw["uuid"] == id } ?? Beam(id: id, name: id)
+        } catch {
+            let msg = PhaseText.clean(error.localizedDescription)
+            let why = PhaseError.isUnsupportedCommand(msg)
+                ? "tsh at \(tsh.bin) is too old for Phase; it needs v\(TshVersion.phaseMinimum) or newer"
+                : String(msg.prefix(200))
+            toast("Couldn't start a beam from phase \(phase) (\(why)). \(fallback)", .err, seconds: 9)
+            return nil
+        }
+    }
+
+    /// Whether the agent's conversation file for `s` is already in the beam
+    /// (it is when the phase snapshot was taken after the session's turns).
+    private func conversationInBeam(_ s: Session, _ beamID: String) async -> Bool {
+        guard let path = PhaseRestore.conversationPath(sessionID: s.id, isCodex: !s.codexThread.isEmpty,
+                                                       codexRel: s.codexSessionRel, workDir: config.workDir),
+              let res = try? await runInBeam(beamID, PhaseRestore.checkScript(path), timeout: 60) else { return false }
+        return res.stdoutText.contains("present")
+    }
+
     // MARK: sessions
 
     func startSession(on beam: Beam) async {
+        let id: String
         // Reuse an untouched session on this beam instead of piling up empties.
         if let empty = sessions.first(where: { $0.beamId == beam.id && $0.turns == 0 && $0.title.isEmpty && !busy.contains($0.id) }) {
+            id = empty.id
             openSession(empty.id)
         } else {
             let s = Session(id: UUID().uuidString.lowercased(), beamId: beam.id, beamName: beam.name)
             do { try store.saveSession(s) } catch { fail(error); return }
             sessions.insert(s, at: 0)
+            id = s.id
             openSession(s.id)
         }
+        adoptBuildPhase(id)
         await probe(beam.id)
     }
 
@@ -303,7 +396,7 @@ final class AppModel {
         guard sshBlockedReason == nil else { probeHint = "can't reach the beam with this Teleport login"; return }
         do {
             var lines: [String] = []
-            try await client.run(id: beamID, script: AgentScripts.probe, stdin: nil, interactiveStdin: false, onStdoutLine: { lines.append($0) }, onStderrLine: nil, register: nil)
+            try await client.run(id: beamID, script: AgentScripts.probe, stdin: nil, interactiveStdin: false, timeout: 60, onStdoutLine: { lines.append($0) }, onStderrLine: nil, register: nil)
             if lines.count >= 2 { probeHint = "\(lines[0])@\(lines[1]) · \(lines.count > 2 ? lines[2] : "")" }
         } catch { noteSSHFailure(error.localizedDescription); probeHint = "probe failed: \(error.localizedDescription)" }
     }
@@ -397,6 +490,7 @@ final class AppModel {
             return
         }
         guard sshAllowed() else { composer = prompt; composerImages = images; return }
+        adoptBuildPhase(sessionID)
         prepareMCP(beamID: session0.beamId)
         if config.agent == "codex" { runCodexTurn(sessionID: sessionID, prompt: prompt, images: images); return }
         if usePersistent { runTurnPersistent(sessionID: sessionID, prompt: prompt, images: images); return }
@@ -412,7 +506,7 @@ final class AppModel {
         do {
             // The prompt travels as the first stream-json message on stdin; the
             // same pipe carries our answers to permission requests.
-            try await client.run(id: s.beamId, script: opts.script, stdin: nil, interactiveStdin: true,
+            try await client.run(id: s.beamId, script: opts.script, stdin: nil, interactiveStdin: true, timeout: nil,
                                  onStdoutLine: { [weak self] line in Task { @MainActor in self?.handleLine(sessionID, line) } },
                                  onStderrLine: { [weak self] line in Task { @MainActor in self?.appendStderr(sessionID, line) } },
                                  register: { [weak self] p in
@@ -471,7 +565,7 @@ final class AppModel {
             guard let self else { return }
             var errMsg = ""
             do {
-                try await self.client.run(id: s.beamId, script: opts.script, stdin: nil, interactiveStdin: true,
+                try await self.client.run(id: s.beamId, script: opts.script, stdin: nil, interactiveStdin: true, timeout: nil,
                     onStdoutLine: { line in Task { @MainActor in self.handleLine(sessionID, line) } },
                     onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },
                     register: { p in Task { @MainActor in self.running[sessionID] = p; p.send(line: msg) } })
@@ -518,9 +612,9 @@ final class AppModel {
             do {
                 for img in images {
                     try await self.client.run(id: s.beamId, script: AgentScripts.writeFile(dir: imageDir, name: img.fileName), stdin: img.data,
-                                              interactiveStdin: false, onStdoutLine: nil, onStderrLine: nil, register: nil)
+                                              interactiveStdin: false, timeout: 60, onStdoutLine: nil, onStderrLine: nil, register: nil)
                 }
-                try await self.client.run(id: s.beamId, script: turn.script, stdin: nil, interactiveStdin: false,
+                try await self.client.run(id: s.beamId, script: turn.script, stdin: nil, interactiveStdin: false, timeout: nil,
                     onStdoutLine: { line in Task { @MainActor in self.handleCodexLine(sessionID, line) } },
                     onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },
                     register: { p in Task { @MainActor in self.running[sessionID] = p } })
@@ -580,6 +674,61 @@ final class AppModel {
         do { try store.saveSession(local) } catch { fail(error); return }
         sessions.insert(local, at: 0)
         openSession(local.id)
+    }
+
+    /// Checks for and applies pi/extension updates (Sessions header button).
+    /// pi has no dry-run/check-only mode — `pi update --all` IS the check: a
+    /// no-op when everything's already current, so running it on demand is
+    /// safe. Toasts a condensed one-line summary of what (if anything)
+    /// changed instead of pi's fairly verbose, npm-flavored output.
+    func updatePi() {
+        guard !isMock, !updatingPi else { return }
+        updatingPi = true
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let res = try await Shell.run(["pi", "update", "--all"], timeout: 120, check: false)
+                await MainActor.run {
+                    self.toast(Self.summarizePiUpdate(res.stdoutText), res.ok ? .ok : .err)
+                    self.updatingPi = false
+                }
+            } catch {
+                await MainActor.run {
+                    self.toast("pi update failed: \(error.localizedDescription)", .err)
+                    self.updatingPi = false
+                }
+            }
+        }
+    }
+
+    /// Best-effort parse of `pi update --all`'s output into one line. pi
+    /// always prints an "Updated packages" section header, listing changed
+    /// extensions underneath it (empty when none changed) followed by pi's
+    /// own status line ("pi is already up to date (vX)" or "Updated pi to
+    /// vX"). Not a stable CLI contract — just enough to avoid dumping raw
+    /// npm chatter into a toast.
+    static func summarizePiUpdate(_ output: String) -> String {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        func isPiStatusLine(_ s: String) -> Bool {
+            s.contains("pi is already up to date") || s.lowercased().hasPrefix("updated pi")
+        }
+        var updatedExtensions: [String] = []
+        if let headerIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "Updated packages" }) {
+            for line in lines[(headerIdx + 1)...] {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.isEmpty { continue }
+                if isPiStatusLine(t) { break }
+                updatedExtensions.append(t)
+            }
+        }
+        let piStatus = lines.last(where: isPiStatusLine)?.trimmingCharacters(in: .whitespaces)
+        guard !updatedExtensions.isEmpty else {
+            return piStatus?.replacingOccurrences(of: "pi is already up to date", with: "pi and extensions are up to date")
+                ?? "pi update finished"
+        }
+        let noun = updatedExtensions.count == 1 ? "extension" : "extensions"
+        let base = piStatus ?? "pi update finished"
+        return "\(base) · updated \(updatedExtensions.count) \(noun): \(updatedExtensions.joined(separator: ", "))"
     }
 
     /// Runs one local `pi --mode json` turn (no beam, no SSH). Images aren't
@@ -817,7 +966,7 @@ final class AppModel {
         guard let id = id ?? currentID, let s = sessions.first(where: { $0.id == id }) else { return }
         guard quiet ? sshBlockedReason == nil : sshAllowed() else { return }
         do {
-            let res = try await client.run(id: s.beamId, script: AgentScripts.memoryPull)
+            let res = try await client.run(id: s.beamId, script: AgentScripts.memoryPull, timeout: 120)
             if !res.stdout.isEmpty { try await store.replaceMemory(id, tarGz: res.stdout); invalidateRestorePlan(id) }
             if !quiet { toast("Pulled \(store.listMemory(id).count) memory files", .ok) }
         } catch { noteSSHFailure(error.localizedDescription); if quiet { syncLog.append("memory pull failed: \(error.localizedDescription)") } else { fail(error) } }
@@ -829,7 +978,7 @@ final class AppModel {
         guard let id = id ?? currentID, let s = sessions.first(where: { $0.id == id }) else { return }
         guard quiet ? sshBlockedReason == nil : sshAllowed() else { return }
         do {
-            let res = try await client.run(id: s.beamId, script: AgentScripts.workspacePull(workDir: config.workDir))
+            let res = try await client.run(id: s.beamId, script: AgentScripts.workspacePull(workDir: config.workDir), timeout: 120)
             if !res.stdout.isEmpty {
                 try await store.replaceWorkspace(id, tarGz: res.stdout)
                 invalidateRestorePlan(id)
@@ -849,9 +998,13 @@ final class AppModel {
         } catch { noteSSHFailure(error.localizedDescription); if quiet { syncLog.append("workspace pull failed: \(error.localizedDescription)") } else { fail(error) } }
     }
 
+    /// For short administrative scripts (restore/pull), not agent turns — so
+    /// a beam that's registered but never actually becomes reachable (e.g.
+    /// stuck pending on cluster capacity) fails with a clear timeout instead
+    /// of hanging `continueSession`'s spinner forever.
     @discardableResult
-    private func runInBeam(_ beamID: String, _ script: String, stdin: Data? = nil) async throws -> ProcessResult {
-        try await client.run(id: beamID, script: script, stdin: stdin, interactiveStdin: false,
+    private func runInBeam(_ beamID: String, _ script: String, stdin: Data? = nil, timeout: TimeInterval? = 90) async throws -> ProcessResult {
+        try await client.run(id: beamID, script: script, stdin: stdin, interactiveStdin: false, timeout: timeout,
                              onStdoutLine: nil, onStderrLine: nil, register: nil)
     }
 
@@ -978,9 +1131,34 @@ final class AppModel {
                            hasTranscript: store.hasFile(store.transcriptURL(s.id)))
     }
 
+    /// Puts the agent's conversation back in `beamID` from the saved copy.
+    /// Returns true when there was none, so the next turn starts fresh (with
+    /// the previous transcript left in the beam for context).
+    private func restoreConversation(_ s: Session, _ plan: RestorePlan, into beamID: String) async throws -> Bool {
+        guard s.turns > 0 else { return false }
+        var fresh = false
+        if !s.codexThread.isEmpty {
+            if plan.resumable, let data = try? Data(contentsOf: store.codexSessionURL(s.id)) {
+                try await runInBeam(beamID, AgentScripts.codexSessionRestore(relPath: s.codexSessionRel), stdin: data)
+            } else { fresh = true }
+        } else if plan.resumable, let data = try? Data(contentsOf: store.claudeSessionURL(s.id)) {
+            try await runInBeam(beamID, AgentScripts.claudeSessionRestore(sessionID: s.id, workDir: config.workDir), stdin: data)
+        } else { fresh = true }
+        if fresh && plan.hasTranscript {
+            // No conversation file to resume: leave the agent the old transcript.
+            let md = store.renderMarkdown(s, lines: store.readTranscript(s.id))
+            try await runInBeam(beamID, AgentScripts.previousSessionWrite(workDir: config.workDir), stdin: Data(md.utf8))
+        }
+        return fresh
+    }
+
     /// Moves a session whose beam is gone into another beam (the one picked in
-    /// the banner, or a new one): restores its files, memory and the agent's
-    /// conversation, then rebinds the session so the next turn continues there.
+    /// the banner, or a new one), then rebinds the session so the next turn
+    /// continues there. A new beam for a session with a phase starts from that
+    /// phase's snapshot, which already has the files, memory and (if taken
+    /// after the turns) the conversation. Otherwise a new beam starts from the
+    /// default phase (if set) or the cluster image, and everything is restored
+    /// by hand on top.
     func continueSession(_ id: String) async {
         guard let s = sessions.first(where: { $0.id == id }), !restoring.contains(id) else { return }
         guard sshAllowed() else { return }
@@ -988,37 +1166,51 @@ final class AppModel {
         defer { restoring.remove(id) }
         let plan = restorePlan(s)
         do {
-            let beam: Beam
+            var beam: Beam
+            var fromPhase = false
             if let b = beams.first(where: { $0.id == continueBeamID }) {
+                beam = b
+            } else if !s.phase.isEmpty, let b = await beamFromPhase(s.phase, fallback: "Restoring the saved copy instead.") {
+                beam = b
+                fromPhase = true
+            } else if !config.defaultPhase.isEmpty,
+                      let b = await beamFromPhase(config.defaultPhase, fallback: "Creating a plain beam instead.") {
+                // The default phase brings tools, not this session's work: still restore.
                 beam = b
             } else {
                 toast("Creating a beam…")
                 beam = try await client.create()
                 await loadBeams()
             }
-            if plan.files > 0 {
-                let (data, _) = try await store.tarGz(directory: store.workspaceDir(id))
-                try await runInBeam(beam.id, AgentScripts.workspaceRestore(workDir: config.workDir), stdin: data)
-            }
-            if plan.memory {
-                let (data, _) = try await store.tarGz(directory: store.memoryDir(id))
-                try await runInBeam(beam.id, AgentScripts.memoryRestore, stdin: data)
-            }
+
             var fresh = false
-            if s.turns > 0 {
-                if !s.codexThread.isEmpty {
-                    if plan.resumable, let data = try? Data(contentsOf: store.codexSessionURL(id)) {
-                        try await runInBeam(beam.id, AgentScripts.codexSessionRestore(relPath: s.codexSessionRel), stdin: data)
-                    } else { fresh = true }
-                } else if plan.resumable, let data = try? Data(contentsOf: store.claudeSessionURL(id)) {
-                    try await runInBeam(beam.id, AgentScripts.claudeSessionRestore(sessionID: id, workDir: config.workDir), stdin: data)
-                } else { fresh = true }
+            var what: [String] = []
+            if fromPhase {
+                what.append("phase \(s.phase)")
+                if s.turns > 0 {
+                    if await conversationInBeam(s, beam.id) {
+                        what.append("conversation")
+                    } else {
+                        // Snapshot predates the conversation: use the saved copy.
+                        fresh = try await restoreConversation(s, plan, into: beam.id)
+                        what.append(fresh ? "previous transcript" : "saved conversation")
+                    }
+                }
+            } else {
+                if plan.files > 0 {
+                    let (data, _) = try await store.tarGz(directory: store.workspaceDir(id))
+                    try await runInBeam(beam.id, AgentScripts.workspaceRestore(workDir: config.workDir), stdin: data)
+                    what.append("\(plan.files) files")
+                }
+                if plan.memory {
+                    let (data, _) = try await store.tarGz(directory: store.memoryDir(id))
+                    try await runInBeam(beam.id, AgentScripts.memoryRestore, stdin: data)
+                    what.append("memory")
+                }
+                fresh = try await restoreConversation(s, plan, into: beam.id)
+                if s.turns > 0 { what.append(fresh ? "previous transcript" : "conversation") }
             }
-            if fresh && plan.hasTranscript {
-                // No conversation file to resume: leave the agent the old transcript.
-                let md = store.renderMarkdown(s, lines: store.readTranscript(id))
-                try await runInBeam(beam.id, AgentScripts.previousSessionWrite(workDir: config.workDir), stdin: Data(md.utf8))
-            }
+
             updateSession(id) {
                 $0.beamId = beam.id; $0.beamName = beam.name
                 $0.needsFreshStart = fresh
@@ -1026,8 +1218,6 @@ final class AppModel {
             }
             invalidateRestorePlan(id)
             endPersistent(id)
-            let what = [plan.files > 0 ? "\(plan.files) files" : nil, plan.memory ? "memory" : nil,
-                        s.turns > 0 ? (fresh ? "previous transcript" : "conversation") : nil].compactMap { $0 }
             toast("Continuing in \(beam.name)\(what.isEmpty ? "" : " with " + what.joined(separator: ", "))", .ok, seconds: 7)
             await probe(beam.id)
         } catch {
@@ -1182,7 +1372,15 @@ final class AppModel {
         tsh = await tshClient.status()
         if tsh.profileExpiry != previousProfiles { mcpLoginsChanged(from: previousProfiles) }
         tshChecked = true
-        if tsh.loggedIn { tshPending = nil }
+        if tsh.loggedIn {
+            tshPending = nil
+            // Deterministically re-establish any proxy/tunnel Settings wants
+            // running, rather than relying only on mcpLoginsChanged's delta
+            // detection above (which needs a supervisor to already exist).
+            // Both calls are cheap no-ops when nothing needs to change.
+            reconcileAgentProxy()
+            reconcileMCP()
+        }
         // A new certificate (fresh login) or one that grants the login clears
         // an earlier "access denied".
         if tsh.validUntil != previousCert || (tsh.logins?.contains(beamLogin) ?? false) { sshDenied = nil }

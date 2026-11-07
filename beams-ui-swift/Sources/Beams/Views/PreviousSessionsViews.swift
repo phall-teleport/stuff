@@ -82,6 +82,7 @@ struct RemoteSessionRow: View {
                 Text(details).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 HStack(spacing: 6) {
                     if session.isCodex { badge("Codex", .purple) }
+                    if let phase = session.meta?.phase, !phase.isEmpty { badge("phase \(phase)", .indigo) }
                     if session.hasWorkspace { badge("files", .blue) }
                     if session.hasMemory { badge("memory", .teal) }
                     if session.resumable { badge("resumable", .green) }
@@ -130,12 +131,16 @@ struct ContinueBanner: View {
         let busy = model.restoring.contains(session.id)
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "arrow.triangle.branch").foregroundStyle(.blue).padding(.top, 2)
+                Image(systemName: session.phase.isEmpty ? "arrow.triangle.branch" : "square.stack.3d.up")
+                    .foregroundStyle(.blue).padding(.top, 2)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(session.beamName.isEmpty ? "This session isn't in a beam yet"
                                                   : "The beam \(session.beamName) for this session is gone")
                         .font(.headline).lineLimit(2)
-                    Text(ContinueText.summary(plan, turns: session.turns)).font(.callout).foregroundStyle(.secondary).lineLimit(4)
+                    // The sheet preselects a new beam for phase sessions, so
+                    // describe that path here.
+                    Text(ContinueText.summary(plan, session: session, newBeam: true))
+                        .font(.callout).foregroundStyle(.secondary).lineLimit(4)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -162,17 +167,24 @@ struct ContinueSheet: View {
     var body: some View {
         @Bindable var m = model
         let plan = model.restorePlan(session)
+        let newBeam = model.continueBeamID.isEmpty
+        let hasPhase = !session.phase.isEmpty
         VStack(alignment: .leading, spacing: 14) {
             Text("Continue “\(session.title.isEmpty ? "this session" : session.title)”")
                 .font(.title3.weight(.semibold)).lineLimit(2)
-            Text(ContinueText.summary(plan, turns: session.turns)).foregroundStyle(.secondary)
+            Text(ContinueText.summary(plan, session: session, newBeam: newBeam)).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Picker("Continue in", selection: $m.continueBeamID) {
                 ForEach(model.beams) { b in Text(b.name).tag(b.id) }
-                Text("A new beam").tag("")
+                Text(hasPhase ? "A new beam from phase \(session.phase)" : "A new beam").tag("")
             }
             .pickerStyle(.radioGroup)
-            if !model.continueBeamID.isEmpty, plan.files > 0 {
+            if hasPhase && !newBeam {
+                Text("An existing beam doesn't use the phase: the saved copy of the files, memory and conversation is restored into it instead.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !newBeam, plan.files > 0 {
                 Text("Files go into \(model.config.workDir) on that beam; files with the same names are replaced.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -189,6 +201,8 @@ struct ContinueSheet: View {
         }
         .padding(20)
         .frame(width: 440)
+        // A phase session continues best in a new beam started from the phase.
+        .onAppear { if hasPhase { model.continueBeamID = "" } }
     }
 }
 
@@ -201,6 +215,17 @@ enum ContinueText {
         let head = bring.isEmpty ? "Pick a beam to keep going." : "Continuing brings \(joined(bring))."
         guard turns > 0, !p.resumable else { return head }
         return head + " The agent's conversation wasn't saved, so it starts fresh with the old transcript to read."
+    }
+
+    /// Like `summary(_:turns:)`, but describes starting from the session's
+    /// phase when it has one and a new beam is chosen.
+    static func summary(_ p: AppModel.RestorePlan, session s: Session, newBeam: Bool) -> String {
+        guard !s.phase.isEmpty, newBeam else { return summary(p, turns: s.turns) }
+        let head = "Continuing starts a new beam from phase \(s.phase), which brings back your files, memory and tools from its latest snapshot."
+        guard s.turns > 0 else { return head }
+        let fallback = p.resumable ? "the saved copy is restored"
+                                   : "the agent starts fresh with the old transcript to read"
+        return head + " The conversation comes from the snapshot if it was taken after these turns; otherwise \(fallback)."
     }
 
     private static func joined(_ xs: [String]) -> String {

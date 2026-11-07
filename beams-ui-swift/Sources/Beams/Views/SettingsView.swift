@@ -2,6 +2,9 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+    /// Phase list and tsh version check, shared with the Phases window.
+    @ObservedObject private var phases = PhaseCenter.shared
 
     /// Built-in model lists (not fetched: the beam's API proxy doesn't serve
     /// /v1/models). Any other ID can be typed in the Model ID field.
@@ -82,6 +85,7 @@ struct SettingsView: View {
                 Text("Keeps `tsh proxy app --port <port> \(PublishedURLs.serviceApp(for: model.config.agent))` running on this Mac (`tsh apps login` first), independent of the agent's own MCP tools — restarts on its own and pauses while your tsh login is expired, same as the laptop MCP proxies below.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            phasesSection
             MCPSettingsSection()
             Section("Experimental") {
                 Toggle("Persistent session — keep one agent process alive per session (faster turns)", isOn: $m.config.persistentSession)
@@ -97,6 +101,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 560)
+        .task { await phases.refresh(model) }
         .onChange(of: model.config) { old, new in
             model.saveConfig()
             model.tshUser = new.teleportUser.isEmpty ? model.osUser : new.teleportUser
@@ -109,6 +114,44 @@ struct SettingsView: View {
             if old.proxy != new.proxy || old.tshBin != new.tshBin || old.login != new.login {
                 model.scheduleTshRecheck()
             }
+        }
+    }
+
+    /// The phase ＋ New Beam starts from. Same setting as the Phases window's
+    /// "Use for New Beams", so the two stay in sync.
+    private var phasesSection: some View {
+        @Bindable var m = model
+        let current = model.config.defaultPhase
+        let listed = phases.phases.contains { $0.name == current }
+        let usable = phases.tshProblem.isEmpty
+        return Section("Phases") {
+            HStack {
+                Picker("Phase for new beams", selection: $m.config.defaultPhase) {
+                    Text("Cluster default image").tag("")
+                    ForEach(phases.phases) { p in
+                        Text(p.isBuilding ? "\(p.name) (building)" : p.name).tag(p.name)
+                    }
+                    // Keep the selection matching a tag before the list loads,
+                    // or if the phase was deleted elsewhere.
+                    if !current.isEmpty && !listed {
+                        Text("\(current) (not listed)").tag(current)
+                    }
+                }
+                .disabled(!usable)
+                if phases.loading { ProgressView().controlSize(.small) }
+                Button { Task { await phases.refresh(model, recheck: true) } } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Re-check tsh and reload phases")
+            }
+            if !usable {
+                Label(phases.tshProblem, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            } else if !current.isEmpty && !listed && !phases.loading && !phases.phases.isEmpty {
+                Text("Phase \(current) isn't in tsh phase ls anymore. New beams will fall back to the cluster image if it can't be used.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Text("＋ New Beam and ⌘N start from this phase's latest snapshot of /home, including any .env files or credentials saved in it. Sessions continued in a new beam use their own phase when they have one.")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("Manage Phases…") { openWindow(id: "phases") }
         }
     }
 }

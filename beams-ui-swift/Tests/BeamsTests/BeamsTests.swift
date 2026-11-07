@@ -317,7 +317,9 @@ import AppKit
     ])
     let tc = TshClient(bin: "tsh", proxy: "super-grass.beams.sh", login: "beams")
     #expect(tc.tunnelArgs(nodeUUID: "u-1", login: "beams", ports: [1, 2]) ==
-            ["tsh", "--proxy=super-grass.beams.sh", "ssh", "-N", "-R", "1:127.0.0.1:1", "-R", "2:127.0.0.1:2", "beams@u-1"])
+            ["tsh", "--proxy=super-grass.beams.sh", "ssh", "-N",
+             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes",
+             "-R", "1:127.0.0.1:1", "-R", "2:127.0.0.1:2", "beams@u-1"])
     let px = MCPServer(kind: .laptop, name: "g", port: 7000, proxyApp: "grafana-mcp", proxyCluster: "other.example.com")
     #expect(tc.proxyAppArgs(px) == ["tsh", "--proxy=other.example.com", "proxy", "app", "--browser=none", "--port", "7000", "grafana-mcp"])
     #expect(tc.proxyAppCommand(px)[2] == "'tsh' '--proxy=other.example.com' 'apps' 'login' 'grafana-mcp' >&2 && exec 'tsh' '--proxy=other.example.com' 'proxy' 'app' '--browser=none' '--port' '7000' 'grafana-mcp'")
