@@ -196,15 +196,13 @@ runs the whole response in the thread:
    you name, as in "live website is down, tell Paul Hall") a direct message,
    "There's an issue with the live website.", and replies "I contacted the
    service owner on your behalf."
-2. **Opens a ticket.** It replies with a Zendesk ticket number. This step
-   isn't connected to Zendesk yet, so no ticket is actually created.
-3. **Diagnoses the problem from one of your beams** (the thread's, your newest,
+2. **Diagnoses the problem from one of your beams** (the thread's, your newest,
    or a new one). `tsh` in a beam is signed in as you, so every step is
    audited as you. The bot lists apps with `tsh apps ls`, takes the one with a
    `hosted-on` label, connects to that server with `tsh ssh` as
    `incident_ssh_login`, and checks `systemctl is-active nginx`. If nginx is
    down, it says so and offers to start it.
-4. **Fixes it when you say yes.** Reply "yes" in the thread and it runs
+3. **Fixes it when you say yes.** Reply "yes" in the thread and it runs
    `systemctl start nginx` (with `sudo -n` for a login other than root),
    checks the app's URL with `curl` from the server, tells the service owner
    "The issue was resolved." and why the site was down, and updates the
@@ -212,7 +210,6 @@ runs the whole response in the thread:
 
 Reply "no" to leave the server as it is.
 
-<img src="assets/screenshots/bot-incident-response.png" alt="Asked 'the live website is down', Teleport Beams Bot contacts the service owner, opens a ticket, finds the livewebsite app hosted on webserver, connects from the user's beam as paul_hall and finds nginx inactive, then after the user replies yes starts nginx, gets HTTP 200, tells the service owner it's resolved, and updates the ticket" width="560">
 
 ### Telling people
 
