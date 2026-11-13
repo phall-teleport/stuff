@@ -79,8 +79,6 @@ Here's what you can do, right in Slack:
 - **Pick your agent.** Teleport Beams Bot uses Claude Code unless you say "use
   codex" (or "use claude" to switch back):
 
-  <img src="assets/screenshots/bot-codex.png" alt="A request ending in 'use codex' gets 'Using Codex for this thread.' and Codex's answer" width="480">
-
 - **Ask how to do something.** Quick questions, like the `curl` command to
   check a site, are answered in seconds without starting a beam. These go
   through Teleport too, so they're in the audit log under your name.
