@@ -30,9 +30,28 @@ resource "docker_image" "tbot" {
   keep_locally = true
 }
 
+# With plugin_image unset, build the image from this repository on the target
+# Docker host. Changing the plugin source, patch, or Dockerfile rebuilds it.
+locals {
+  plugin_src = abspath("${path.module}/..")
+  plugin_src_hash = sha1(join("", [
+    for f in concat(["Dockerfile", "upstream.patch"], tolist(fileset(local.plugin_src, "plugin/*.go"))) :
+    filesha1("${local.plugin_src}/${f}")
+  ]))
+}
+
 resource "docker_image" "plugin" {
-  name         = var.plugin_image
+  name         = coalesce(var.plugin_image, "beams-slack-plugin:local-${substr(local.plugin_src_hash, 0, 12)}")
   keep_locally = true
+
+  dynamic "build" {
+    for_each = var.plugin_image == null ? [1] : []
+    content {
+      context = local.plugin_src
+    }
+  }
+
+  triggers = var.plugin_image == null ? { source = local.plugin_src_hash } : {}
 }
 
 # New volumes are owned by root; hand them to the UID both containers run as.

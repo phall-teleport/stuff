@@ -1,21 +1,23 @@
 # syntax=docker/dockerfile:1.7
+#
+# Builds Teleport's Slack plugin with the Beams app wired in: clone Teleport at
+# TELEPORT_REF, apply upstream.patch, drop in plugin/*.go, build, and bundle
+# tsh. Build context is this directory.
 
-ARG TELEPORT_REF=v18.11.1
-ARG TSH_VERSION=18.11.3
-ARG GO_IMAGE=golang:1.25.14-bookworm
+ARG TELEPORT_REF=v18.11.10
+ARG TSH_VERSION=18.11.10
+ARG GO_IMAGE=golang:1.26.10-bookworm
 
 FROM ${GO_IMAGE} AS build
 ARG TELEPORT_REF
 ARG TSH_VERSION
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y git \
-    && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
 WORKDIR /src
-RUN git clone --filter=blob:none https://github.com/gravitational/teleport.git . \
-    && git checkout "${TELEPORT_REF}" \
-    && test "$(git describe --tags --exact-match HEAD)" = "${TELEPORT_REF}"
-COPY teleport.patch /tmp/teleport.patch
-RUN git apply /tmp/teleport.patch
+RUN git clone --quiet --depth 1 --branch "${TELEPORT_REF}" \
+      https://github.com/gravitational/teleport.git .
+COPY upstream.patch /tmp/upstream.patch
+COPY plugin/ integrations/access/slack/
+RUN git apply /tmp/upstream.patch
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build \
@@ -24,7 +26,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -o /out/teleport-slack \
       ./integrations/access/slack/cmd/teleport-slack
 RUN curl -fsSL \
-      "https://cdn.teleport.dev/teleport-v${TSH_VERSION}-linux-amd64-bin.tar.gz" \
+      "https://cdn.teleport.dev/teleport-v${TSH_VERSION}-linux-${TARGETARCH}-bin.tar.gz" \
       -o /tmp/teleport.tar.gz \
     && tar -xzf /tmp/teleport.tar.gz -C /tmp \
     && install -m 0755 /tmp/teleport/tsh /out/tsh

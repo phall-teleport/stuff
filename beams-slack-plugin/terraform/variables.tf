@@ -57,14 +57,15 @@ variable "registry_auth" {
 }
 
 variable "plugin_image" {
-  description = "Plugin image you built and pushed (README \"Build and host the image\"). Prefer an immutable tag such as sha-<commit>."
+  description = "Prebuilt plugin image to run, such as registry.example.com/beams-slack-plugin:sha-<commit>. Leave unset to build it from this repository on the Docker host."
   type        = string
+  default     = null
 }
 
 variable "tbot_image" {
   description = "tbot image."
   type        = string
-  default     = "public.ecr.aws/gravitational/tbot-distroless:18.11.3"
+  default     = "public.ecr.aws/gravitational/tbot-distroless:18.11.10"
 }
 
 variable "name_prefix" {

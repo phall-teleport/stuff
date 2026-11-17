@@ -1,5 +1,5 @@
 # Create the Slack app from this manifest: https://api.slack.com/apps ->
-# Create New App -> From a manifest. Then upload assets/slack-beams-bot.png as
+# Create New App -> From a manifest. Then upload assets/icon.png as
 # the app icon, install the app, and create an app-level token with
 # connections:write (see README).
 display_information:
