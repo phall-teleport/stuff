@@ -1,0 +1,62 @@
+name: serverlife-swift
+
+on:
+  push:
+    paths: ["serverlife-swift/**", ".github/workflows/serverlife-swift.yml"]
+  pull_request:
+    paths: ["serverlife-swift/**", ".github/workflows/serverlife-swift.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: serverlife-swift-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: serverlife-swift
+
+jobs:
+  build:
+    # Xcode 27 image (macOS 27 SDK, Swift 6.4) — matches the local toolchain.
+    # The code is still built with plain SwiftPM; Xcode is just where swift lives.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          swift --version
+          xcrun --show-sdk-version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            serverlife-swift/.build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('serverlife-swift/Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ hashFiles('serverlife-swift/Package.resolved') }}-
+
+      - name: Build
+        run: swift build 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+        shell: bash
+
+      - name: Test
+        # Live suites skip themselves unless SL_LIVE_HOST / SL_CONN_LIVE are set.
+        run: Scripts/test.sh
+
+      - name: Bundle
+        run: |
+          Scripts/bundle.sh release
+          ditto -c -k --keepParent build/ServerLife.app build/ServerLife.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: serverlife-swift
+          if-no-files-found: ignore
+          path: |
+            serverlife-swift/build.log
+            serverlife-swift/build/swift-build.log
+            serverlife-swift/build/ServerLife.zip

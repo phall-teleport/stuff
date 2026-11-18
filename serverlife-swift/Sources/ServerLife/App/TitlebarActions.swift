@@ -24,10 +24,23 @@ struct TitlebarActionsView: View {
                    active: window.dockVisible && window.dockTab == "multiexec") {
                 window.showDock("multiexec")
             }
+            if Actions.shared.isRegistered("toggle-ai") {
+                aiButton
+            }
             button("toggle-transfers", "arrow.down.to.line", "Transfers (⌘J)",
                    active: window.dockVisible)
             button("toggle-sidebar", "sidebar.left", "Sidebar (⌘B)", active: window.sidebarVisible)
         }
+    }
+
+    /// ✦ — "AI assistant — show or hide the panel on the right" (index.html).
+    private var aiButton: some View {
+        Button { Actions.shared.perform("toggle-ai", window: window) } label: {
+            Text("\u{2726}").font(.system(size: 13))
+        }
+        .buttonStyle(IconButtonStyle(size: 26, active: Slots.rightPanelShown(window)))
+        .help("AI assistant — show or hide the panel on the right")
+        .tourAnchor("toggle-ai")
     }
 
     private func filesMenuItems() -> [NSMenuItem] {

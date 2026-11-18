@@ -1,7 +1,11 @@
 # ServerLife (Swift) — instructions for agents
 
 A native macOS port, **feature for feature**, of the Electron app in
-`/Users/paul/git/teleport-toys-internal/serverlife` ("the original"). The
+`/Users/paul/git/serverlife-upstream/serverlife` ("the original" — a
+worktree of teleport-toys-internal at `origin/main`, 0.39.0). The port was
+complete at 0.15.2 (`ce8d055`); the 0.16.0 → 0.39.0 delta is being ported now
+— see `UPSTREAM-SYNC.md` and `Briefs/<owner>.md`. To see what changed in a
+file: `git -C /Users/paul/git/serverlife-upstream diff ce8d055 HEAD -- serverlife/src/…`. The
 original's GUIDE.md (copied to `Resources/GUIDE.md`) is the spec; its source is
 the reference for every behaviour, string, default and edge case. When the two
 disagree, the source wins. Read the JS for your area **in full** before writing
@@ -155,6 +159,10 @@ SFTP, test against a local `/usr/libexec/sftp-server` over stdin/stdout.
 | consoles | Devices/UI/ | tmux.js, vnc.js, serial/telnet/RDP panes and forms |
 | city | City/ | city3d.js, cityarch.js, cityactors.js, cityprocs.js, cityscan.js, procscan.js |
 | misc | Misc/ | settings dialog (index.js `openSettings`), themes.js, guide.js, tour.js, changelog.js, versions.js, ui.js leftovers, backup.js UI, about |
+| ai | AI/ | ai.js, aiclients.js, aiwaiting.js (assistant panel, saved prompts/responses) |
+| kube-service | Kube/Service/ | kube*.js in src/main, jsonpath-lite.js |
+| kube-ui | Kube/UI/ | kubebrowser.js, kubepanel.js, kube3d.js, kubecloud.js, kubeconfigedit.js, kubeheartbeat.js, kubelogviewer.js, kubenamespaces.js, alerts.js, yamlform.js, yamlpath.js |
+| phases | Teleport/Phases/ | phasesetup.js, phasebuilder.js, phaseaddins.js, phasepicker.js (Phase parts of beams.js stay with teleport-*) |
 | automation | Automation/ | control.js, mcp/serverlife-mcp.mjs (as `ServerLife --mcp`), automation.js, s3.js (both), awscreds.js, awsproxy.js |
 
 Each owner documents its public API in `<dir>/README.md` (types, functions,
@@ -214,5 +222,26 @@ Cross-feature ids (args in `ActionContext.args`):
 - `open-on-connection` [sessions] — open a pane on an existing `connId`.
 - Stand-in files for unpublished owners must have owner-unique names
   (`_<Owner>DataStandIn.swift`): SwiftPM rejects duplicate file names.
+- Query-style actions (asking another owner for a value or a view) pass
+  `reply: (Any?) -> Void` in args; the handler calls it synchronously.
+- Slots added for 0.39: `Slots.rightPanel` / `Slots.rightPanelShown` (the AI
+  panel, [ai]); `Slots.sidebarSections["kube"]` (Kubernetes rows, [kube-ui],
+  drawn by [sidebar]). The ✦ titlebar button performs `toggle-ai`.
+- New for 0.39 (owner registers; others call):
+  `toggle-ai`, `ai-open` (args `name`), `ai-ask` (args `text`, `title`, host —
+  "Ask the AI about this"), `ai-type-request` [ai] ·
+  `search-everything` [misc] ·
+  `kube-browser` (args `context`, `profileId`), `kube-host-menu` (args `menu`
+  NSMenu, `context`), `kube-pod-exec`, `kube-pod-logs`, `kube-port-forward`
+  [kube-ui] · `kube-refresh`, `kube-contexts` (reply) [kube-service] ·
+  `phase-builder` (args `path`, `cluster`), `phase-picker` (reply), `phase-addins`,
+  `phase-new-build` [phases] ·
+  `ssh-options` (host), `ssh-config-edit` (args `path`, `host`) [hosts] ·
+  `live-stats-toggle` (paneId) [sessions] · `pane-style-menu` (args `menu`) [sessions] ·
+  `macro-record-start`, `macro-record-stop` [fleet] ·
+  `tsh-env-edit` (args `cluster`, `proxy`) [teleport-ui] ·
+  `vnet-start`, `vnet-stop` (args `cluster`) [teleport-service] ·
+  `sockets` [nettools] · `add-to-teleport` (host) [sidebar].
+  Name further ids `<owner-area>-<verb>` and list them in your README.
 - `city-open` [city] — args `explorer` (the explorer model), optional `on` Bool.
 - `city-panel` [city] — development-only stand-alone city window.

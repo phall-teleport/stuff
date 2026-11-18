@@ -37,6 +37,10 @@ let package = Package(
                 "City/README.md",
                 "Misc/README.md",
                 "Automation/README.md",
+                "AI/README.md",
+                "Kube/Service/README.md",
+                "Kube/UI/README.md",
+                "Teleport/Phases/README.md",
             ],
             swiftSettings: [.unsafeFlags(["-parse-as-library"])]
         ),

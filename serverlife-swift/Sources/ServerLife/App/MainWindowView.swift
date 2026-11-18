@@ -15,6 +15,14 @@ enum Slots {
     static var workspace: (WindowModel) -> AnyView = { _ in AnyView(SlotPlaceholder(text: "No sessions")) }
     /// The dock along the bottom (transfers, multi-exec, tunnels, log, downloads, watch).
     static var dock: (WindowModel) -> AnyView = { _ in AnyView(SlotPlaceholder(text: "Dock")) }
+    /// A panel on the right of the workspace (the AI assistant, ai.js). Draw
+    /// nothing (`EmptyView`) when hidden; the owner sizes it and its resizer.
+    static var rightPanel: (WindowModel) -> AnyView = { _ in AnyView(EmptyView()) }
+    /// Whether the right panel is showing (lights the ✦ titlebar button).
+    static var rightPanelShown: (WindowModel) -> Bool = { _ in false }
+    /// Extra sections at the foot of the Hosts list, keyed by owner (e.g. "kube"
+    /// draws the Kubernetes rows, kubepanel.js). Drawn by the sidebar owner in key order.
+    static var sidebarSections: [String: (WindowModel) -> AnyView] = [:]
     /// Things drawn over the whole window: the tour, floating monitor pane …
     static var overlays: [(WindowModel) -> AnyView] = []
 }
@@ -48,8 +56,11 @@ struct MainWindowView: View {
                     }
                 }
                 VStack(spacing: 0) {
+                  HStack(spacing: 0) {
                     Slots.workspace(window)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Slots.rightPanel(window)
+                  }
                     if window.dockVisible {
                         Resizer(axis: .horizontal) { delta in
                             // 108pt up to half the window, wherever it is opened (index.js).
