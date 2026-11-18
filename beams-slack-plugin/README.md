@@ -13,9 +13,9 @@ it changes anything.
 
 > @Teleport Beams Bot build a status page for our API and publish it
 
-Every action runs **as the person who asked**. The bot works through a
-Teleport delegation that each user grants, so it can only reach what that user
-can reach, beams it creates belong to that user, and every step is recorded in
+Every action is **traceable to a human user**. The bot works through a
+Teleport identity delegation that each user grants, so it can only reach what
+that user can reach, beams it creates belong to that user, and every step is recorded in
 Teleport's audit log under their name.
 
 > [!NOTE]
