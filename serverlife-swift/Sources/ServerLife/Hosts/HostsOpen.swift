@@ -9,8 +9,12 @@ enum HostsOpen {
     /// sessions.js `openHost(host, opts)` → `open-host`.
     static func openHost(_ host: Host, window: WindowModel? = nil, login: String? = nil,
                          startupCommand: String? = nil, remoteStartPath: String? = nil,
-                         localStartPath: String? = nil, profileId: String? = nil, split: String? = nil) {
+                         localStartPath: String? = nil, profileId: String? = nil, split: String? = nil,
+                         filesOnly: Bool = false, profileSshOptions: String? = nil) {
         var args: [String: Any] = [:]
+        if filesOnly { args["filesOnly"] = true }
+        // The profile's own ssh options, on top of the host's (main.js withHostPrefs).
+        if let profileSshOptions, !profileSshOptions.isEmpty { args["profileSshOptions"] = profileSshOptions }
         if let login, !login.isEmpty { args["login"] = login }
         if let startupCommand, !startupCommand.isEmpty { args["startupCommand"] = startupCommand }
         if let remoteStartPath, !remoteStartPath.isEmpty { args["remoteStartPath"] = remoteStartPath }

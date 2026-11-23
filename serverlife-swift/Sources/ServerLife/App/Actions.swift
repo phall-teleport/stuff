@@ -41,12 +41,22 @@ final class Actions {
     /// Optional "is it available right now" checks, used to grey menu items.
     private var validators: [String: @MainActor (ActionContext) -> Bool] = [:]
 
+    /// Events rather than commands: every owner that registers one is called,
+    /// in registration order, and nobody registering is not an error.
+    /// `app-will-quit` — the app is ending (Quit, or SIGTERM/SIGINT): stop
+    /// helpers (`tsh proxy kube`, VNet, log streams, watches) synchronously.
+    /// `app-resume` — the Mac woke or the screen was unlocked
+    /// (powerMonitor resume / unlock-screen): repaint terminals, re-check.
+    static let broadcastIds: Set<String> = ["app-will-quit", "app-resume"]
+    private var listeners: [String: [Handler]] = [:]
+
     func register(_ id: String, enabled: (@MainActor (ActionContext) -> Bool)? = nil, _ handler: @escaping Handler) {
+        if Actions.broadcastIds.contains(id) { listeners[id, default: []].append(handler); return }
         handlers[id] = handler
         if let enabled { validators[id] = enabled }
     }
 
-    func isRegistered(_ id: String) -> Bool { handlers[id] != nil }
+    func isRegistered(_ id: String) -> Bool { handlers[id] != nil || listeners[id]?.isEmpty == false }
 
     func isEnabled(_ id: String, _ ctx: ActionContext? = nil) -> Bool {
         guard handlers[id] != nil else { return false }
@@ -55,6 +65,10 @@ final class Actions {
 
     func perform(_ id: String, _ context: ActionContext? = nil) {
         let ctx = context ?? ActionContext()
+        if Actions.broadcastIds.contains(id) {
+            for h in listeners[id] ?? [] { h(ctx) }
+            return
+        }
         guard let h = handlers[id] else {
             StatusBus.shared.show("“\(id)” is not available in this build", kind: .warn)
             return
@@ -75,7 +89,8 @@ final class Actions {
 final class StatusBus {
     static let shared = StatusBus()
 
-    enum Kind: String { case info, ok, warn, error }
+    /// `.login`: a login in flight — also shown in the login banner (below).
+    enum Kind: String { case info, ok, warn, error, login }
 
     struct Message: Identifiable, Equatable {
         let id = UUID()
@@ -86,16 +101,45 @@ final class StatusBus {
 
     /// The current status-bar message.
     private(set) var message: Message?
+    /// The login banner's text (ui.js #login-banner), nil when hidden.
+    private(set) var loginBanner: String?
     /// Toasts: short-lived notices drawn over the window's corner.
     private(set) var toasts: [Message] = []
     @ObservationIgnored private var clearWork: DispatchWorkItem?
+    @ObservationIgnored private var loginWork: DispatchWorkItem?
 
     /// Show a status message; it fades after `seconds` (0 = stays). 4 s, as ui.js `status`.
     func show(_ text: String, kind: Kind = .info, seconds: Double = 4) {
-        message = Message(text: text, kind: kind)
+        message = text.isEmpty ? nil : Message(text: text, kind: kind)
+        /*
+         * A login in flight gets a box of its own, fixed low on the right —
+         * the status bar's 11px text is too easy to miss for the one message
+         * that means "something just started, hold on". Only a call that owns
+         * the banner (kind .login) may touch it: status messages arrive
+         * constantly, and any of them mid-login — which can take real
+         * seconds, an SSO browser round trip among them — must not hide it.
+         * `show("", kind: .login)` takes it down.
+         */
+        if kind == .login {
+            loginBanner = text.isEmpty ? nil : text
+            loginWork?.cancel()
+            if seconds > 0 && !text.isEmpty {
+                // Its own timer: an unrelated message must not cancel the banner's expiry either.
+                let w = DispatchWorkItem { [weak self] in
+                    MainActor.assumeIsolated { if self?.loginBanner == text { self?.loginBanner = nil } }
+                }
+                loginWork = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
+            }
+        }
         clearWork?.cancel()
         guard seconds > 0 else { return }
-        let w = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.message = nil } }
+        let w = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.message?.text == text { self.message = nil }
+            }
+        }
         clearWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
     }

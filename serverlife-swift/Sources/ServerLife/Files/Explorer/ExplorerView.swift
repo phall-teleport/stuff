@@ -129,7 +129,7 @@ private struct XPHeader: View {
                         active: ex.compare != nil) {
                         if ex.compare != nil { ex.clearCompare() } else { Task { await ex.compareWith() } }
                     }
-                    if !ex.isS3 {
+                    if !ex.isS3 && !ex.isKube {
                         btn("\u{21C6}", "Synchronize with the other list…") { Task { await ex.syncWith() } }
                         // Permissions and owner as columns — a view setting, not a per-pane one.
                         btn("≣", "Show permissions and owner", active: s.xpShowDetails) {
@@ -138,7 +138,7 @@ private struct XPHeader: View {
                         }
                     }
                     // Only the explorer bound to its own pane's session can follow that shell.
-                    if ex.source.pinnedConnId == nil && !ex.isLocal && !ex.isS3 {
+                    if ex.source.pinnedConnId == nil && !ex.isLocal && !ex.isS3 && !ex.isKube {
                         btn("⇲", "Follow the terminal’s folder", active: s.xpFollowTerminal) {
                             s.xpFollowTerminal.toggle()
                             // Switching it back on means "go to where the shell is".
@@ -335,7 +335,7 @@ private struct XPColumnHead: View {
 
     var body: some View {
         let p = Theme.shared.p
-        let details = Store.shared.xpShowDetails && !ex.isS3
+        let details = Store.shared.xpShowDetails && !ex.isS3 && !ex.isKube
         HStack(spacing: widths.tight ? 5 : 7) {
             Color.clear.frame(width: 10, height: 1)
             Color.clear.frame(width: 15, height: 1)
@@ -408,7 +408,7 @@ private struct XPList: View {
                 .xpOnRightClick { ex.showContextMenu(for: nil) }
         } else {
             let rows = ex.rows()
-            let details = Store.shared.xpShowDetails && !ex.isS3
+            let details = Store.shared.xpShowDetails && !ex.isS3 && !ex.isKube
             if rows.isEmpty { XPEmptyNotice(ex: ex).frame(maxWidth: .infinity).padding(.vertical, 22) }
             ForEach(rows) { r in
                 switch r.kind {
@@ -567,16 +567,25 @@ private enum XPNotice {
                     }
                 })
             }
-            // MFA host, nothing loaded yet: ask before spending an approval.
-            if conn.transport == "tsh" && view.path == nil && conn.needsMfaApproval {
+            // A host dialled over `tsh` — a leaf cluster, no local ssh client,
+            // a duplicate hostname by id, or one actually known to need
+            // per-session MFA — nothing loaded yet: ask before spending an
+            // approval rather than silently trying and going quiet if the
+            // channel is waiting on one. Only once a load attempt has settled
+            // (mid-attempt is not yet "nothing happened"); the wording says
+            // "may need MFA" when this cannot tell for sure.
+            if conn.transport == "tsh" && view.path == nil && !view.firstLoading && !view.loading {
+                let known = XP.isMfaHost(conn.hostId)
                 let leaf = conn.transportForced == "leaf"
+                let noSsh = conn.transportForced == "no-ssh"
                 return AnyView(VStack(spacing: 5) {
                     dim(view.mfaFailed ? "Could not open the file channel."
-                        : leaf ? "Files open on a second tsh channel." : "This host asks for MFA per session.")
-                    Text(leaf ? "This node is in a leaf cluster, so files go through tsh rather than the terminal’s own channel."
-                              : "Opening files needs one more approval, separate from the terminal.")
+                        : known ? "This host asks for MFA per session." : "This host may ask for MFA per session.")
+                    Text(leaf ? "It is also in a leaf cluster, so files go through tsh rather than the terminal’s own channel."
+                         : noSsh ? "No local ssh client was found either, so files go through tsh rather than the terminal’s own channel."
+                         : "Opening files needs one more approval, separate from the terminal.")
                         .font(.system(size: 11)).foregroundStyle(p.muted).opacity(0.75).multilineTextAlignment(.center)
-                    Button(view.mfaFailed ? "Try again" : leaf ? "Load files" : "Load files (approve MFA)") {
+                    Button(view.mfaFailed ? "Try again" : known ? "Load files (approve MFA)" : "Load files (may need MFA)") {
                         view.mfaFailed = false
                         Task { await ex.ensureLoaded(force: true, user: true) }
                     }
@@ -634,7 +643,15 @@ private struct XPStatusBar: View {
     var body: some View {
         let p = Theme.shared.p
         let s = ex.statusLine
-        HStack {
+        HStack(spacing: 0) {
+            if !s.error, !s.text.isEmpty, ex.statusOverride == nil, let d = ex.view.disk {
+                let b = XP.diskBadge(d)
+                Text(b.text)
+                    .foregroundStyle(b.level == "danger" ? p.red : b.level == "warn" ? p.amber : p.muted)
+                    .fontWeight(b.level.isEmpty ? .regular : .semibold)
+                    .lineLimit(1).fixedSize()
+                    .help(b.tooltip)
+            }
             Text(s.text).foregroundStyle(s.error ? p.red : p.muted).lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 0)
         }

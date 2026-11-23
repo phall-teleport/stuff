@@ -49,7 +49,13 @@ extension Profiles {
     }
 
     /// Open a saved connection — whatever kind it is.
-    static func launch(_ p: JSON, window: WindowModel?) async {
+    ///
+    /// An sftp profile is a plain ssh-with-`direct` host underneath, but lands
+    /// in the file browser by default — WinSCP-like — rather than a terminal;
+    /// `forceTerminal` is the escape hatch back to one ("Open with a
+    /// terminal"). `split` ("right"/"down") opens beside or below the focused
+    /// pane instead of in a tab of its own.
+    static func launch(_ p: JSON, window: WindowModel?, forceTerminal: Bool = false, split: String? = nil) async {
         let type = p["type"].string ?? "ssh"
         let name = p["name"].stringish ?? ""
         let id = p["id"].string
@@ -70,6 +76,24 @@ extension Profiles {
             do { try await HostsOpen.openDevice(type, o, window: window) } catch { HToast.error(hostsErrorText(error)) }
             StatusBus.shared.clear()
             HostsData.markUsed(id)
+            return
+        }
+        // A Kubernetes profile opens its cluster's browser — checked first, the
+        // way a restored kube tab is: logged out offers tsh kube login, gone
+        // says so (kube-ui's reopenKubeBrowser behind `kube-browser`).
+        if type == "kube" {
+            let kube = p["kube"]
+            guard let ctxName = kube["spec"]["contextName"].string, !ctxName.isEmpty else {
+                HToast.error("\(name) has no kubeconfig context set"); return
+            }
+            let reply: (Any?) -> Void = { ok in
+                if (ok as? Bool) == true { HostsData.markUsed(id) }
+            }
+            Actions.shared.perform("kube-browser", window: window, args: [
+                "context": ctxName, "spec": kube["spec"], "title": name,
+                "view": kube["view"], "namespace": kube["namespace"].string as Any,
+                "profileId": id as Any, "reply": reply,
+            ])
             return
         }
         if type == "vnc" {
@@ -96,7 +120,9 @@ extension Profiles {
         StatusBus.shared.show("Connecting to \(name)…")
         HostsOpen.openHost(host(for: p), window: window, login: p["login"].string,
                            startupCommand: p["startupCommand"].string, remoteStartPath: p["remoteStartPath"].string,
-                           profileId: id)
+                           profileId: id, split: split,
+                           filesOnly: type == "sftp" && !forceTerminal,
+                           profileSshOptions: p["sshExtraOptions"].string)
         if let path = p["localStartPath"].string?.nilIfEmpty {
             Actions.shared.perform("files-local-path", window: window, args: ["path": path])
         }

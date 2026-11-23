@@ -114,15 +114,18 @@ enum SessionsFeature {
         return out
     }
 
-    private static let termKeys = ["fontSize", "fontFamily", "scrollback", "cursorBlink"]
+    private static let termKeys = ["fontSize", "fontFamily", "scrollback", "cursorBlink", "cursorStyle"]
+    private static let statsKeys = ["liveStats", "quietRemote", "localStats", "statsOncePerTab"]
     private static let highlightKeys = ["highlight", "highlightRules", "hiddenHighlightRules", "highlightHosts"]
 
     /// Only what changed is applied: a settings write about something else
     /// (a window moved, a login remembered) leaves the terminals alone — a
     /// cursor shape the program set must survive it.
     private static func applySettings() {
-        let changed = changedKeys(termKeys + highlightKeys + ["refreshSeconds", "showShellInTitle"])
+        let changed = changedKeys(termKeys + highlightKeys + statsKeys + ["refreshSeconds", "showShellInTitle"])
         if changed.isEmpty { return }
+        // Live stats on or off, for the panes already open.
+        if !changed.isDisjoint(with: statsKeys) { PaneStats.shared.applySetting() }
         if changed.contains("refreshSeconds") { startCwdLoop() }
         let fs = Store.shared.settingJSON("fontSize").double ?? 13
         let sizeChanged = changed.contains("fontSize")
@@ -136,6 +139,7 @@ enum SessionsFeature {
                 if changed.contains("showShellInTitle") { p.titleRevision += 1 }
             }
         }
+        if termChanged { PaneStyle.applyAll() }
     }
 
     /// Terminals carry their own palette and must be told when it changes.
@@ -147,6 +151,9 @@ enum SessionsFeature {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     for s in SessionsCore.allWindows() { for p in s.panes.values { p.term?.applyTheme() } }
+                    // A pane with a look of its own keeps it; one that
+                    // follows the app takes the new one.
+                    PaneStyle.applyAll()
                     observeTheme()
                 }
             }
@@ -267,16 +274,24 @@ enum SessionsFeature {
         }
         a.register("open-backend") { ctx in
             guard let s = sw(ctx), let b = ctx.arg("backend", as: TerminalBackend.self) else { return }
-            s.openBackend(b, title: ctx.arg("title") ?? b.kind, host: ctx.host ?? ctx.arg("host"),
-                          split: splitDir(ctx.arg("split")),
-                          reconnect: ctx.arg("reconnect", as: (() async throws -> TerminalBackend).self),
-                          greeting: ctx.arg("greeting"))
+            let p = s.openBackend(b, title: ctx.arg("title") ?? b.kind, host: ctx.host ?? ctx.arg("host"),
+                                  split: splitDir(ctx.arg("split")),
+                                  reconnect: ctx.arg("reconnect", as: (() async throws -> TerminalBackend).self),
+                                  greeting: ctx.arg("greeting"))
+            // createPane's `explorerSource`: what the pane's file browser
+            // shows instead of this machine (a pod's filesystem, for kube
+            // exec). Read by the explorer from the pane's attachments.
+            if let src = ctx.args["explorerSource"] { p.attachments["explorerSource"] = src }
+            // A program with no filesystem of its own to browse (kubectl logs -f).
+            if ctx.arg("explorer", as: Bool.self) == false { s.setExplorerVisible(p, false) }
+            if let k: String = ctx.arg("kubeKind") { p.attachments["kubeKind"] = k }
         }
         a.register("open-view-pane") { ctx in
             guard let s = sw(ctx), let view = ctx.arg("view", as: (() -> AnyView).self) else { return }
-            s.openViewPane(title: ctx.arg("title") ?? "", host: ctx.host ?? ctx.arg("host"), split: splitDir(ctx.arg("split")),
-                           isHosts: ctx.arg("isHosts", as: Bool.self) ?? false, hostsGroup: ctx.arg("hostsGroup"),
-                           view: view, onClose: ctx.arg("onClose", as: (() -> Void).self))
+            let p = s.openViewPane(title: ctx.arg("title") ?? "", host: ctx.host ?? ctx.arg("host"), split: splitDir(ctx.arg("split")),
+                                   isHosts: ctx.arg("isHosts", as: Bool.self) ?? false, hostsGroup: ctx.arg("hostsGroup"),
+                                   view: view, onClose: ctx.arg("onClose", as: (() -> Void).self))
+            if let k: String = ctx.arg("kubeKind") { p.attachments["kubeKind"] = k }
         }
         a.register("open-on-connection") { ctx in
             guard let s = sw(ctx), let c = ctx.connId ?? ctx.arg("connId") else { return }
@@ -290,6 +305,26 @@ enum SessionsFeature {
             let p = (ctx.paneId.flatMap { SessionsCore.owner(ofPane: $0)?.pane($0) }) ?? s.activePane
             guard let p, let owner = p.owner else { StatusBus.shared.toast("Open a session first", kind: .error); return }
             owner.sendToPane(p, text + ((ctx.arg("enter", as: Bool.self) ?? false) ? "\r" : ""))
+        }
+        // Live stats (monitor.js): the pane menu's switch, and the tmux
+        // panes the consoles owner opens and ends.
+        func ctxPane(_ ctx: ActionContext) -> SessionPane? {
+            ctx.paneId.flatMap { SessionsCore.owner(ofPane: $0)?.pane($0) } ?? sw(ctx)?.activePane
+        }
+        // After sleep or a locked screen, terminals repaint (repaintAllTerminals).
+        a.register("app-resume") { _ in
+            for w in SessionsCore.allWindows() { for p in w.panes.values { p.term?.redraw() } }
+        }
+        a.register("live-stats-toggle") { ctx in if let p = ctxPane(ctx) { PaneStats.shared.toggle(p) } }
+        a.register("live-stats-attach") { ctx in if let p = ctxPane(ctx) { PaneStats.shared.attach(p) } }
+        a.register("live-stats-detach") { ctx in if let p = ctxPane(ctx) { PaneStats.shared.detach(p) } }
+        // The host menu's "Pane style" for a host whose look is remembered
+        // (panestyle.js hostStyleMenu): args `menu` NSMenu, `key` (a host id,
+        // or "local"; defaults to ctx.host's id). Adds nothing when none is saved.
+        a.register("pane-style-menu") { ctx in
+            guard let m: NSMenu = ctx.arg("menu") else { return }
+            let k: String = ctx.arg("key") ?? ctx.host?.id ?? ""
+            if !k.isEmpty { PaneStyle.addHostMenu(m, key: k) }
         }
         a.register("send-text-all") { ctx in
             guard let s = sw(ctx), let text: String = ctx.arg("text") else { return }

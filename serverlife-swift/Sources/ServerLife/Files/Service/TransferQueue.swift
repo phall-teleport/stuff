@@ -7,8 +7,10 @@ struct TransferJobView: Identifiable, Equatable, Sendable, Codable {
     /// "upload" | "download" | "cross"
     var kind: String
     var label: String
-    /// "queued" | "running" | "paused" | "done" | "error" | "cancelled".
-    /// Paused is a state of its own to anything watching, even though the job
+    /// "planning" | "queued" | "running" | "paused" | "done" | "error" | "cancelled".
+    /// "planning" precedes "queued": the directory walk that fills in the
+    /// file list has not finished yet (the panel says "reading the file
+    /// list…" and offers Cancel). Paused is a state of its own to anything watching, even though the job
     /// is still sitting inside its run.
     var status: String
     var paused: Bool
@@ -160,10 +162,11 @@ final class TransferQueue {
         let lock = NSLock()
         let id: String
         let kind: String
-        let label: String
-        let items: [Transfers.Item]
-        let dirs: [String]
-        let roots: [String]
+        // Filled in by finishPlanning() for a job that started as a placeholder.
+        var label: String
+        var items: [Transfers.Item]
+        var dirs: [String]
+        var roots: [String]
         let customRun: (@Sendable (TransferRunContext) async throws -> Void)?
         var totalBytes: Int64
         var doneBytes: Int64 = 0
@@ -256,12 +259,68 @@ final class TransferQueue {
         return id
     }
 
+    /// A placeholder job, visible (and cancellable) immediately — before the
+    /// directory walk that fills in its file list has even started. The walk
+    /// for a big tree can take a real stretch of time with nothing in
+    /// `add()`'s shape to show for it yet; this is that shape's "nothing to
+    /// show" state, made visible instead of invisible. Call finishPlanning()
+    /// once the walk completes to turn it into a real queued job, or
+    /// failPlanning() if it errors out instead. Returns the new job's id and
+    /// its own cancellation check — not the job record itself, so callers
+    /// never reach into the queue's own internals to get at it.
+    func addPlanning(kind: String, label: String) -> (id: String, isCancelled: @Sendable () -> Bool) {
+        Self.jobSeq += 1
+        let id = "job\(Self.jobSeq)"
+        let rec = Job(id: id, spec: TransferJobSpec(kind: kind, label: label, items: []))
+        rec.status = "planning"            // see TransferJobView.status — this precedes "queued"
+        records[id] = rec
+        order.append(id)
+        emit()
+        return (id, { rec.isAborted })
+    }
+
+    /// The walk behind a planning job finished — turn it into a real, runnable
+    /// job. A no-op if it's gone, or already cancelled, while planning.
+    func finishPlanning(_ id: String, label: String? = nil, items: [Transfers.Item] = [],
+                        dirs: [String] = [], roots: [String] = []) {
+        guard let j = records[id], j.with({ $0.status }) == "planning" else { return }
+        let held = allPaused
+        j.with {
+            if let label { $0.label = label }
+            $0.items = items
+            $0.dirs = dirs
+            $0.roots = roots
+            $0.totalBytes = items.reduce(0) { $0 + $1.size }
+            $0.fileCount = items.count
+            $0.status = "queued"
+            if held { $0.paused = true }
+        }
+        emit()
+        pump()
+    }
+
+    /// The walk itself failed (a permission error partway through a tree,
+    /// say) — surfaced the same way a failed byte-transfer already is, not a
+    /// silent disappearance.
+    func failPlanning(_ id: String, _ message: String?) {
+        guard let j = records[id], j.with({ $0.status }) == "planning" else { return }
+        let now = nowMs()
+        j.with {
+            $0.status = "error"
+            $0.error = message?.nilIfEmpty ?? "Could not read the file list"
+            $0.endedAt = now
+        }
+        emit()
+    }
+
     func cancel(_ id: String) {
         guard let j = records[id] else { return }
         // A paused job is waiting on its gate; let it go so it can see the abort.
         j.with { $0.paused = false; $0.aborted = true }
         j.release()
-        j.with { if $0.status == "queued" { $0.status = "cancelled"; $0.endedAt = nowMs() } }
+        j.with {
+            if $0.status == "queued" || $0.status == "planning" { $0.status = "cancelled"; $0.endedAt = nowMs() }
+        }
         emit()
     }
 
@@ -345,8 +404,8 @@ final class TransferQueue {
         return order.compactMap { records[$0]?.view(limit: l) }
     }
 
-    /// Whether anything is queued or running.
-    var isBusy: Bool { jobs.contains { ["queued", "running", "paused"].contains($0.status) } }
+    /// Whether anything is planning, queued or running.
+    var isBusy: Bool { jobs.contains { ["planning", "queued", "running", "paused"].contains($0.status) } }
 
     // MARK: - Running
 

@@ -191,7 +191,7 @@ enum ConsolesTmux {
             var o = PaneOverlay(title: "Could not open tmux", sub: label, error: message, showLog: true)
             o.retry = {
                 let w = owner()
-                w.closePane(pane.id)
+                closeQuietly(w, pane.id)
                 Task { await ConsolesTmux.open(host, login: login, session: session, window: w.window ?? window) }
             }
             owner().showOverlay(pane, o)
@@ -224,7 +224,7 @@ enum ConsolesTmux {
         let probe = await TmuxService.shared.probe(th)
         guard alive() else { return nil }
         if !probe.ok {
-            owner().closePane(pane.id)
+            closeQuietly(owner(), pane.id)
             StatusBus.shared.clear()
             await explainMissingTmux(host, probe, window: window)
             return nil
@@ -283,6 +283,23 @@ enum ConsolesTmux {
         // Any further windows get tabs of their own.
         showWindows(rec, Array(windows.dropFirst()), in: owner())
         sendSize(rec)
+        /*
+         * Back to the tab this was opened in, with the keyboard in it.
+         *
+         * Each further window's tab takes the front as it is built, which left
+         * you on the last window rather than the one you asked for, and nothing
+         * here gave the terminal focus — so what was typed next went nowhere,
+         * most plainly after Reattach, whose button is gone by then. Only when
+         * one of this session's tabs is in front: if you went elsewhere during
+         * a slow attach, you stay there.
+         */
+        let home = owner()
+        if let active = home.activeTabId, active == tab.id || rec.tabs.values.contains(active),
+           home.tab(tab.id) != nil {
+            home.setActiveTab(tab.id)
+            home.changed()
+            home.focusActivePane()
+        }
         StatusBus.shared.show("tmux \(attached.version ?? "") on \(label) — \(ConsolesText.plural(windows.count, "window"))")
         return rec
     }
@@ -355,6 +372,10 @@ enum ConsolesTmux {
         let s = p.owner ?? SessionsCore.owner(ofPane: p.id)
         s?.attach(p, backend)
         p.applyHighlightSettings()
+        // The pane was built before it had a connection, so its pinned buttons
+        // were drawn as a plain host's; a beam's own buttons only appear once
+        // it knows.
+        PaneHeaderItems.shared.revision += 1
         /*
          * One file browser per session. Every pane in a tmux session is on the
          * same host, so a second browser shows the same server again and takes
@@ -368,6 +389,14 @@ enum ConsolesTmux {
             }
             if another { s.setExplorerVisible(p, false) }
         }
+        // Live stats for the host, from the same one command as any pane on it.
+        Actions.shared.perform("live-stats-attach", ActionContext(window: s?.window, host: p.host, paneId: p.id))
+    }
+
+    /// Close a pane that never became a session (a failed or refused attach)
+    /// without the close animation (`closePane(id, { animate: false })`).
+    static func closeQuietly(_ s: SessionsWindow, _ paneId: String) {
+        s.closePane(paneId)
     }
 
     /*
@@ -508,6 +537,10 @@ enum ConsolesTmux {
             for pid in s.panesOf(tabId) {
                 guard let p = s.pane(pid), info(p)?.sessionId == id else { continue }
                 p.tmuxEnded = e.word
+                // Still on screen with its last output, but nothing is running
+                // on the host for it now: it stops counting towards the host's
+                // live stats.
+                Actions.shared.perform("live-stats-detach", ActionContext(window: s.window, host: p.host, paneId: p.id))
                 let b = p.backend as? TmuxPaneBackend
                 s.endPaneSession(p)
                 b?.finish(reason: e.word)
@@ -550,6 +583,71 @@ enum ConsolesTmux {
         if anyLeft { return }
         records.removeValue(forKey: rec.id)
         Task { await TmuxService.shared.detach(rec.id) }
+    }
+
+    // MARK: Closing by hand, and saving for a layout
+
+    /*
+     * Close a tmux pane as a person closing it means: in tmux too.
+     *
+     * Closing a pane here used to close only the view of it, leaving the shell
+     * running in tmux with nothing showing it — and tmux's own layout would
+     * put it straight back the next time anything resized. So a pane closed by
+     * hand is killed in tmux (`kill-pane`), and tmux's next layout takes it
+     * off the screen the same way it does a pane closed on the far side. The
+     * last pane of the session ends the session, so that one is asked first.
+     * Closing a tab or quitting still only detaches: the session is still
+     * there to come back to.
+     *
+     * Answers whether it was handled; false means "not attached — close the
+     * view" (`killTmuxPane`).
+     */
+    static func killPane(_ p: SessionPane, window: WindowModel?) async -> Bool {
+        guard let rec = record(of: p), let i = info(p), p.tmuxEnded == nil else { return false }
+        let bound = rec.panes.values.filter { SessionsCore.owner(ofPane: $0) != nil }.count
+        if bound <= 1 && rec.tabs.count <= 1 {
+            let ok = await MiscUI.confirm(window ?? p.owner?.window, title: "Close the last pane?",
+                                          message: ConsolesText.lastPaneMessage(session: rec.name),
+                                          detail: "Detach instead (the tmux menu) to leave it running.",
+                                          confirmLabel: "Close it and end the session", danger: true)
+            if !ok { return true }
+        }
+        do {
+            try await rec.session.command("kill-pane -t \(i.pane)")
+        } catch {
+            StatusBus.shared.toast("tmux would not close the pane: \(error.localizedDescription)", kind: .error)
+            return false
+        }
+        return true
+    }
+
+    /*
+     * What a saved layout needs to attach this pane's session again: the
+     * host, the login and the session's name (`tmuxRestoreOf`). Nil once the
+     * session has ended or detached — there is nothing to attach to then.
+     */
+    static func restoreOf(_ p: SessionPane) -> JSON? {
+        guard let rec = record(of: p) else { return nil }
+        return ConsolesText.tmuxRestore(host: rec.host, local: rec.isLocal, login: rec.login, session: rec.name)
+    }
+
+    /// The host a saved tmux entry is attached on again: this machine, a beam
+    /// rebuilt from its id (and the tsh home it was saved with, else its
+    /// proxy's), or whatever `SessionHooks.hostById` finds.
+    static func restoreHost(_ j: JSON) -> Host? {
+        if j["local"].bool == true { return Host.localMachine }
+        guard let id = j["hostId"].string, !id.isEmpty else { return nil }
+        if id.hasPrefix("beam:") {
+            // Saved (even as null) wins; an older entry without it uses the
+            // home of the proxy's tsh profile.
+            let home: String? = j.object?.keys.contains("home") == true
+                ? j["home"].string
+                : ConsolesText.beamHost(id: id, home: nil).flatMap { b in
+                    Inventory.shared.profiles.first { $0.proxy == b.proxy }?.homeDir.nilIfEmpty
+                }
+            if let b = ConsolesText.beamHost(id: id, home: home) { return b }
+        }
+        return SessionHooks.hostById?(id)
     }
 
     // MARK: Commands from this side

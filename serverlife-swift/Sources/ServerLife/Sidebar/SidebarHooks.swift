@@ -21,6 +21,31 @@ enum SidebarHooks {
 
     /// fleet (macros.js): the macro list on Saved → Macros.
     static var macros: SidebarMacroSource?
+
+    // MARK: kube-ui (kubepanel.js / kubeheartbeat.js / kubecloud.js)
+
+    /// `kubeHostsForProfile(p)`: a Teleport cluster's kube clusters, host-shaped
+    /// (`extra["kind"] = "kube"`, id `kube:…`) so they fall into the same
+    /// folders, filter and cap as the SSH nodes beside them. A requestable one
+    /// carries `extra["requestable"] = true` (and `requestableInfo`).
+    static var kubeHostsForProfile: ((TeleportProfile) -> [Host])?
+
+    /// `kubeContextRow` / `availableClusterRow`: the row (or tree) for a
+    /// logged-in or available kube cluster. nil draws its bare name.
+    static var kubeClusterRow: ((_ host: Host, _ ctx: SBKubeRowContext, WindowModel) -> AnyView?)?
+
+    /// `kubeMarks(host)` + `listedBeatTag(proxy, name)`: the ☸ and the
+    /// cluster's heartbeat tag after a kube row's name.
+    static var kubeMarks: ((Host) -> AnyView?)?
+
+    /// `cloudMenuItem(host)`: the cloud-provider entry of a kube row's menu.
+    static var kubeCloudMenuItem: ((Host, WindowModel) -> CtxItem?)?
+
+    /// `kubeGroupCount()` and `kubeGroupRows()`: contexts with no Teleport
+    /// cluster behind them (raw EKS/GKE/kind), in their own “☸ Local
+    /// kubeconfigs” group. The rows are drawn from
+    /// `Slots.sidebarSections["kube"]`; 0 (or unset) leaves the group out.
+    static var kubeLocalCount: (() -> Int)?
 }
 
 /// What the Saved → Macros list needs from macros.js. Macros are JSON in the
@@ -57,4 +82,11 @@ protocol SidebarMacroSource: AnyObject {
     func restoreBuiltins() async
     /// `moveCategory(category, delta)`: true when it moved.
     func moveCategory(_ category: String, _ delta: Int) async -> Bool
+    /// `moveMacro(id, targetId, { after })`: true when it moved. Dropped in
+    /// another category, the user's own macro moves into it; a built-in stays.
+    func moveMacro(_ id: String, _ targetId: String, after: Bool) async -> Bool
+}
+
+extension SidebarMacroSource {
+    func moveMacro(_ id: String, _ targetId: String, after: Bool) async -> Bool { false }
 }

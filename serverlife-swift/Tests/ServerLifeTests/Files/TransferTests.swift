@@ -122,7 +122,69 @@ import Testing
         #expect(one.files == [Transfers.Item(local: "/tmp/x/index.html", remote: dir + "/site/index.html", size: 1)])
     }
 
+    @Test func planningStopsAtTheNextDirectoryOnceCancelled() async throws {
+        let dir = try scratchDir("plancancel"); defer { cleanup(dir) }
+        for i in 0..<5 { try writeFile(dir + "/t/d\(i)/f", "x") }
+        let calls = Transfers.Counter()
+        // Cancelled after the first check: the walk throws PlanCancelled, not
+        // a real error, and stops rather than walking the rest.
+        await #expect(throws: Transfers.PlanCancelled.self) {
+            _ = try await Transfers.planUpload(dir + "/t", remoteDir: "/srv", isCancelled: { calls.add(1) > 1 })
+        }
+        #expect(calls.value == 2)
+        let c = try await localSFTP(); defer { c.destroy() }
+        await #expect(throws: Transfers.PlanCancelled.self) {
+            _ = try await Transfers.planDownload(c, remotePath: dir + "/t", localDir: "/tmp/x", isCancelled: { true })
+        }
+        // A plain file needs no walk, so there is nothing to stop.
+        let one = try await Transfers.planUpload(dir + "/t/d0/f", remoteDir: "/srv", isCancelled: { true })
+        #expect(one.files.count == 1)
+    }
+
     // MARK: - The queue
+
+    @Test @MainActor func planningJobsAreVisibleCancellableAndBecomeRealJobs() async throws {
+        let dir = try scratchDir("planq"); defer { cleanup(dir) }
+        try writeFile(dir + "/a", "abc")
+        let (q, box) = makeQueue(); defer { box.value?.destroy() }
+        let p = q.addPlanning(kind: "download", label: "a → out")
+        var v = try #require(q.jobs.first { $0.id == p.id })
+        #expect(v.status == "planning" && v.fileCount == 0 && v.totalBytes == 0 && !p.isCancelled())
+        #expect(q.isBusy)
+        q.finishPlanning(p.id, items: [Transfers.Item(local: dir + "/out/a", remote: dir + "/a", size: 3)],
+                         dirs: [dir + "/out"], roots: [dir + "/a"])
+        v = try #require(q.jobs.first { $0.id == p.id })
+        #expect(v.fileCount == 1 && v.totalBytes == 3 && v.status != "planning")
+        await waitFor { q.jobs.first?.status == "done" }
+        #expect(readData(dir + "/out/a") == Data("abc".utf8))
+
+        // Cancelled while planning: the walk sees it, and a late finish is ignored.
+        let c = q.addPlanning(kind: "upload", label: "c")
+        q.cancel(c.id)
+        #expect(c.isCancelled())
+        v = try #require(q.jobs.first { $0.id == c.id })
+        #expect(v.status == "cancelled" && v.endedAt != nil)
+        q.finishPlanning(c.id, items: [Transfers.Item(local: "/x", remote: "/y", size: 1)])
+        #expect(q.jobs.first { $0.id == c.id }?.status == "cancelled")
+        #expect(q.jobs.first { $0.id == c.id }?.fileCount == 0)
+
+        // A walk that failed is an error row with the walk's own words.
+        let f = q.addPlanning(kind: "upload", label: "f")
+        q.failPlanning(f.id, "EACCES: permission denied, scandir '/root'")
+        #expect(q.jobs.first { $0.id == f.id }?.error == "EACCES: permission denied, scandir '/root'")
+        let g = q.addPlanning(kind: "upload", label: "g")
+        q.failPlanning(g.id, nil)
+        #expect(q.jobs.first { $0.id == g.id }?.status == "error")
+        #expect(q.jobs.first { $0.id == g.id }?.error == "Could not read the file list")
+
+        // Planned while everything is held: it waits with the rest.
+        q.pauseAll()
+        let h = q.addPlanning(kind: "download", label: "h")
+        q.finishPlanning(h.id, items: [Transfers.Item(local: dir + "/out/h", remote: dir + "/a", size: 3)])
+        #expect(q.jobs.first { $0.id == h.id }?.status == "paused")
+        q.clearFinished()
+        #expect(q.jobs.map(\.id) == [h.id])
+    }
 
     @MainActor
     private func makeQueue() -> (TransferQueue, Box<SFTPClient?>) {

@@ -131,4 +131,8 @@ final class FleetSidebarMacros: SidebarMacroSource {
     func delete(_ m: JSON, window: WindowModel) async -> Bool { await ms.delete(macro(m), window: window) }
     func restoreBuiltins() async { ms.restoreBuiltins() }
     func moveCategory(_ category: String, _ delta: Int) async -> Bool { ms.moveCategory(category, delta) }
+    /// `moveMacro(id, targetId, { after })`: drop a macro before or after
+    /// another (a built-in stays in its category). Not yet in
+    /// `SidebarMacroSource`; sidebar can call it with `as? FleetSidebarMacros`.
+    func moveMacro(_ id: String, _ targetId: String, after: Bool) async -> Bool { ms.moveMacro(id, targetId, after: after) }
 }

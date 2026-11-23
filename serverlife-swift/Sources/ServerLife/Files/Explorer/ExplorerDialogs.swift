@@ -28,6 +28,7 @@ enum XPDialogs {
     static func label(for e: ExplorerModel, s3: Bool) -> String {
         if e.isS3 { return "S3: " + (e.s3Id.flatMap { XPS3.bucketName($0) } ?? e.s3Id ?? "") }
         if e.isLocal { return s3 ? "Local machine" : "This machine" }
+        if e.isKube { return "Pod: " + (e.kubeSpec?.podName ?? "") }
         return e.conn?.label ?? (s3 ? "session" : "Session")
     }
 
@@ -188,18 +189,21 @@ enum XPDialogs {
         let text: String
         do {
             if local { text = try await LocalFS.readText(entry.path).text }
+            else if ex.isKube, let src = ex.fileSource { text = try await src.readText(entry.path, maxBytes: Int.max) }
             else {
                 guard let connId = ex.connId else { return }
                 text = try await FilesService.shared.readFile(connId, entry.path)
             }
         } catch { xpToast(errorText(error), "error"); return }
         let connId = ex.connId
+        let kubeSource = ex.isKube ? ex.fileSource : nil
         let buf = Local(text)
         _ = await XPDialog.present(ex.window, title: entry.name, width: 920, height: 640, resizable: true,
                                    autosave: "explorer-editor") { (done: @escaping (Bool?) -> Void) in
             AnyView(EditorView(name: entry.name, path: entry.path, buf: buf, done: done) {
                 do {
                     if local { try LocalFS.writeText(entry.path, buf.value) }
+                    else if let kubeSource { try await kubeSource.writeText(entry.path, buf.value) }
                     else if let connId { try await FilesService.shared.writeFile(connId, entry.path, buf.value) }
                     xpStatus("Saved " + entry.name)
                     done(true)

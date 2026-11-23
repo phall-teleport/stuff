@@ -30,6 +30,22 @@ enum MacroDialogs {
         }
     }
 
+    /**
+     * Suggestions for a variable the user must still be free to type past —
+     * unlike `choices`, a fixed menu would refuse a proxy or user this machine
+     * has not logged into yet, which is exactly the one most worth typing by
+     * hand (a teammate's, or one about to be logged into for the first time).
+     */
+    static func suggestions(_ source: String?) -> [String] {
+        let profiles = Inventory.shared.profiles
+        var seen = Set<String>()
+        switch source {
+        case "proxy": return profiles.map(\.proxy).filter { !$0.isEmpty && seen.insert($0).inserted }
+        case "user": return profiles.map(\.username).filter { !$0.isEmpty && seen.insert($0).inserted }
+        default: return []
+        }
+    }
+
     private struct VarsForm: View {
         let macro: Macro
         let vars: [MacroVar]
@@ -52,10 +68,20 @@ enum MacroDialogs {
                            subtitle: vars.count == 1 ? "One value to fill in" : "\(vars.count) values to fill in") {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(vars, id: \.name) { v in
-                        MiscField(label: v.name, hint: (v.choices?.isEmpty == false) ? "Pick one, or edit the macro to change the list" : nil) {
+                        let suggestions = (v.choices?.isEmpty ?? true) ? MacroDialogs.suggestions(v.suggest) : []
+                        MiscField(label: v.name, hint: (v.choices?.isEmpty == false) ? "Pick one, or edit the macro to change the list"
+                                    : !suggestions.isEmpty ? "Pick a suggestion, or type any value" : nil) {
                             let b = Binding(get: { values.value[v.name] ?? "" }, set: { values.value[v.name] = $0 })
                             if let c = v.choices, !c.isEmpty {
                                 FleetPicker(options: c.map { ($0, $0) }, selection: b)
+                            } else if !suggestions.isEmpty {
+                                HStack(spacing: 4) {
+                                    FleetField(placeholder: "value for " + v.name, text: b)
+                                    Menu {
+                                        ForEach(suggestions, id: \.self) { s in Button(s) { b.wrappedValue = s } }
+                                    } label: { Text("\u{25BE}") }
+                                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                                }
                             } else {
                                 FleetField(placeholder: "value for " + v.name, text: b)
                             }

@@ -7,9 +7,6 @@ import Foundation
 @MainActor
 protocol TmuxHost: AnyObject {
     func execResult(_ cmd: String) async -> ProcResult
-    /// With a timeout (seconds; nil = the host's default) — the original
-    /// gave the probe and session list 15 s and has-session 10 s.
-    func execResult(_ cmd: String, timeout: TimeInterval?) async -> ProcResult
     func spawnCommandPTY(_ cmd: String, cols: Int, rows: Int) throws -> PTYProcess
     /// "local", "ssh", "tsh", "beam" … A beam has no way to give tmux a
     /// terminal, so it runs `tmux -C` over pipes (`spawnCommandChannel`).
@@ -20,8 +17,6 @@ protocol TmuxHost: AnyObject {
 }
 
 extension TmuxHost {
-    func execResult(_ cmd: String, timeout: TimeInterval?) async -> ProcResult { await execResult(cmd) }
-
     func spawnCommandChannel(_ cmd: String) throws -> ByteChannel {
         throw AppError("tmux over pipes is not available on this connection")
     }
@@ -80,7 +75,7 @@ enum TmuxControl {
     /// set up yet — so it comes back as an answer whose reason names the
     /// command to run.
     @MainActor static func probe(_ host: TmuxHost) async -> TmuxProbe {
-        let r = await host.execResult("tmux -V 2>/dev/null || command -v tmux || true", timeout: 15)
+        let r = await host.execResult("tmux -V 2>/dev/null || command -v tmux || true")
         return parseProbe((r.out + r.err).trimmed, local: host.transportKind == "local")
     }
 
@@ -114,7 +109,11 @@ enum TmuxControl {
 
     /// The sessions already running there (`listSessions`).
     @MainActor static func listSessions(_ host: TmuxHost) async -> [TmuxSessionInfo] {
-        let r = await host.execResult("tmux list-sessions -F '\(sessionsFormat)' 2>/dev/null || true", timeout: 15)
+        // `-u` for the same reason as in `start`: without it a host with no
+        // UTF-8 locale sends the tabs back as `_`, and every session is
+        // dropped as a line with too few fields — "nothing to attach to" on a
+        // host that has some.
+        let r = await host.execResult("tmux -u list-sessions -F '\(sessionsFormat)' 2>/dev/null || true")
         return parseSessions(r.out)
     }
 
@@ -282,7 +281,16 @@ final class TmuxSession {
     /// The command that attaches (or creates).
     func startCommand(attach: Bool = true) -> String {
         let name = shellQuote(sessionName)
-        let mode = plain ? "-C" : "-CC"
+        /*
+         * `-u`, because without a UTF-8 locale tmux replaces control
+         * characters in `-F` output with `_` — tabs included — and every
+         * format this file asks for is tab-separated. `@0\tbash\t1\t<layout>`
+         * came back as `@0_bash_1_<layout>`, which parses as a window with no
+         * layout and so no panes: a session that opens blank. It happens on
+         * any host whose shell gets no LANG, which is most plain-OpenSSH
+         * hosts reached from an app launched outside a terminal.
+         */
+        let mode = plain ? "-u -C" : "-u -CC"
         // `new-session -A` is attach-or-create in one command, which avoids
         // the race between asking whether a session exists and attaching.
         return attach
@@ -655,7 +663,7 @@ final class TmuxService {
     /// tells a control client only `%exit`, whatever happened. `=` makes the
     /// name an exact match; nil when the connection itself is gone.
     func stillThere(_ s: TmuxSession) async -> Bool? {
-        let r = await s.host.execResult("tmux has-session -t \(shellQuote("=" + s.sessionName)) 2>/dev/null && echo yes || echo no", timeout: 10)
+        let r = await s.host.execResult("tmux has-session -t \(shellQuote("=" + s.sessionName)) 2>/dev/null && echo yes || echo no")
         let out = r.out
         if (try? NSRegularExpression(pattern: #"\byes\b"#))?.matches(out) == true { return true }
         if (try? NSRegularExpression(pattern: #"\bno\b"#))?.matches(out) == true { return false }

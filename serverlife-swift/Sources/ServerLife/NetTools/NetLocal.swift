@@ -56,9 +56,12 @@ struct PortsResult {
     /// Host-side: who asked, and how.
     var from: String?
     var how: String?
+    /// The hand-run form, one `nc -zv` per port (local runs only).
+    var command = ""
 
     var json: JSON {
         var o: [String: JSON] = ["host": .string(host), "results": .array(results.map(\.json))]
+        if from == nil { o["command"] = .string(command) }
         if let from { o["from"] = .string(from) }
         if from != nil { o["how"] = JSON(how) }
         return .object(o)
@@ -83,7 +86,7 @@ struct TelnetResult {
         ["host": .string(host), "port": .number(Double(port)), "address": JSON(address), "state": .string(state),
          "connectMs": JSON(connectMs), "listenedMs": .number(Double(listenedMs)), "text": .string(text),
          "telnet": .bool(telnet), "closedByPeer": .bool(closedByPeer), "guess": JSON(guess),
-         "command": .string(command), "error": JSON(error)]
+         "command": .string(command), "commandNote": .null, "error": JSON(error)]
     }
 }
 
@@ -94,11 +97,17 @@ struct DNSResult {
     var records: [(type: String, values: [JSON])]
     var reverse: [String]?
     var servers: [String]
+    /// Lowest TTL per type, for A and AAAA only.
+    var ttls: [String: Int] = [:]
+    var usingCustomServer = false
+    var command = ""
 
     var json: JSON {
         ["host": .string(host),
          "records": .object(Dictionary(records.map { ($0.type, JSON.array($0.values)) }, uniquingKeysWith: { a, _ in a })),
-         "reverse": reverse.map { JSON($0) } ?? .null, "servers": JSON(servers)]
+         "ttls": .object(ttls.mapValues { .number(Double($0)) }),
+         "reverse": reverse.map { JSON($0) } ?? .null, "servers": JSON(servers),
+         "usingCustomServer": .bool(usingCustomServer), "command": .string(command)]
     }
 
     static func format(_ v: JSON) -> String {
@@ -106,11 +115,28 @@ struct DNSResult {
         case .string(let s): return s
         case .array(let a): return a.map { $0.stringish ?? "" }.joined()
         case .object(let o):
-            let order = ["exchange", "priority", "name", "port", "weight"]
+            let order = ["exchange", "priority", "name", "port", "weight", "critical", "issue", "issuewild", "iodef",
+                         "nsname", "hostmaster", "serial", "refresh", "retry", "expire", "minttl",
+                         "flags", "service", "regexp", "replacement", "order", "preference"]
             return o.keys.sorted { (order.firstIndex(of: $0) ?? 99, $0) < (order.firstIndex(of: $1) ?? 99, $1) }
                 .map { "\($0)=\(o[$0]!.stringish ?? "")" }.joined(separator: " ")
         default: return v.stringish ?? ""
         }
+    }
+}
+
+/// One certificate of the chain a server presented.
+struct TLSChainCert {
+    var subject: [(String, String)]
+    var issuer: [(String, String)]
+    var validFrom: String?
+    var validTo: String?
+    var fingerprint256: String?
+    var serialNumber: String?
+
+    var json: JSON {
+        ["subject": TLSResult.dnJSON(subject), "issuer": TLSResult.dnJSON(issuer), "validFrom": JSON(validFrom),
+         "validTo": JSON(validTo), "fingerprint256": JSON(fingerprint256), "serialNumber": JSON(serialNumber)]
     }
 }
 
@@ -134,21 +160,37 @@ struct TLSResult {
     var san: String?
     var fingerprint256: String?
     var serialNumber: String?
-    /// Every certificate presented, leaf first: subject and issuer common names.
-    var chain: [(subject: String, issuer: String)] = []
+    /// Every certificate presented, leaf first — intermediates then root.
+    var chain: [TLSChainCert] = []
+    /// Whether the last one in the chain is self-signed (subject == issuer):
+    /// a guess at "did it send the whole chain".
+    var chainComplete: Bool? {
+        guard let last = chain.last else { return nil }
+        return last.subject.map { "\($0.0)=\($0.1)" } == last.issuer.map { "\($0.0)=\($0.1)" }
+    }
+    /// The hand-run form (`openssl s_client …`); `commandNote` is a platform
+    /// caveat, never set on macOS.
+    var command = ""
+    var commandNote: String?
+
+    static func dnJSON(_ p: [(String, String)]) -> JSON {
+        p.isEmpty ? .null : .object(Dictionary(p.map { ($0.0, JSON.string($0.1)) }, uniquingKeysWith: { a, _ in a }))
+    }
 
     var json: JSON {
-        func dn(_ p: [(String, String)]) -> JSON {
-            p.isEmpty ? .null : .object(Dictionary(p.map { ($0.0, JSON.string($0.1)) }, uniquingKeysWith: { a, _ in a }))
+        let dn = TLSResult.dnJSON
+        if !ok {
+            return ["ok": false, "host": .string(host), "port": .number(Double(port)), "command": .string(command),
+                    "commandNote": JSON(commandNote), "error": JSON(error)]
         }
-        if !ok { return ["ok": false, "host": .string(host), "port": .number(Double(port)), "error": JSON(error)] }
-        return ["ok": true, "host": .string(host), "port": .number(Double(port)), "authorized": .bool(authorized),
+        return ["ok": true, "host": .string(host), "port": .number(Double(port)), "command": .string(command),
+                "commandNote": JSON(commandNote), "authorized": .bool(authorized),
                 "authorizationError": JSON(authorizationError), "protocol": JSON(proto),
                 "cipher": cipherName.map { ["name": .string($0), "version": JSON(cipherVersion)] } ?? .null,
                 "alpn": JSON(alpn), "subject": dn(subject), "issuer": dn(issuer), "validFrom": JSON(validFrom),
                 "validTo": JSON(validTo), "daysLeft": JSON(daysLeft), "san": JSON(san),
                 "fingerprint256": JSON(fingerprint256), "serialNumber": JSON(serialNumber),
-                "chain": .array(chain.map { ["subject": .string($0.subject), "issuer": .string($0.issuer)] })]
+                "chain": .array(chain.map(\.json)), "chainComplete": JSON(chainComplete)]
     }
 
     static func dn(_ parts: [(String, String)]) -> String? {
@@ -176,10 +218,11 @@ struct HTTPHop {
 
 struct HTTPResult {
     var chain: [HTTPHop]
+    var command = ""
     var final: HTTPHop? { chain.last }
     var redirects: Int { max(0, chain.count - 1) }
     var json: JSON {
-        ["chain": .array(chain.map(\.json)), "final": final?.json ?? .null, "redirects": .number(Double(redirects))]
+        ["chain": .array(chain.map(\.json)), "final": final?.json ?? .null, "redirects": .number(Double(redirects)), "command": .string(command)]
     }
 }
 
@@ -211,65 +254,65 @@ enum NetLocal {
 
     // MARK: ICMP and path
 
-    static func ping(host: String, count: String?) async throws -> TextRun {
+    /// Which binary and args ping this host with, optionally forced onto
+    /// one IP family. Shared between the real run and the preview/copy, so
+    /// the two cannot drift apart. macOS's `ping` has no `-6` of its own —
+    /// `ping6` is the IPv6-only sibling it ships instead.
+    static func pingSpec(_ host: String, _ count: String?, _ ipVersion: String?) -> (cmd: String, args: [String]) {
+        let n = Int(ntClamp(count, 5, 1, 20))
+        if ipVersion == "6" { return ("ping6", ["-c", String(n), host]) }
+        return ("ping", ["-c", String(n), "-W", "2000", host])
+    }
+
+    /// The ping invocation for a host, with no I/O.
+    static func pingCommand(_ host: String, _ count: String?, _ ipVersion: String?) -> String {
+        let s = pingSpec(host, count, ipVersion)
+        return ([s.cmd] + s.args).joined(separator: " ")
+    }
+
+    static func ping(host: String, count: String?, ipVersion: String? = nil) async throws -> TextRun {
         // The target field takes "host:port"; ICMP has no ports, so drop it.
         let h = try NetCheck.checkHost(NetCheck.splitHostPort(host).host)
         let n = Int(ntClamp(count, 5, 1, 20))
-        let args = ["-c", String(n), "-W", "2000", h]
-        let r = await run("ping", args, timeout: TimeInterval((n + 5) * 2))
-        return TextRun(host: h, ok: r.ok, text: r.text, timedOut: r.timedOut, command: "ping " + args.joined(separator: " "))
+        let s = pingSpec(h, count, ipVersion)
+        let r = await run(s.cmd, s.args, timeout: TimeInterval((n + 5) * 2))
+        return TextRun(host: h, ok: r.ok, text: r.text, timedOut: r.timedOut, command: pingCommand(h, count, ipVersion))
     }
 
-    static func traceroute(host: String, maxHops: String? = nil) async throws -> TextRun {
+    /// Same idea as pingSpec(), for traceroute's own IPv6-only sibling.
+    static func tracerouteSpec(_ host: String, _ maxHops: String?, _ ipVersion: String?) -> (cmd: String, args: [String]) {
+        let hops = String(Int(ntClamp(maxHops, 20, 1, 40)))
+        if ipVersion == "6" { return ("traceroute6", ["-m", hops, "-w", "2", host]) }
+        return ("traceroute", ["-m", hops, "-w", "2"] + (ipVersion == "4" ? ["-4"] : []) + [host])
+    }
+
+    static func tracerouteCommand(_ host: String, _ maxHops: String?, _ ipVersion: String?) -> String {
+        let s = tracerouteSpec(host, maxHops, ipVersion)
+        return ([s.cmd] + s.args).joined(separator: " ")
+    }
+
+    static func traceroute(host: String, maxHops: String? = nil, ipVersion: String? = nil) async throws -> TextRun {
         let h = try NetCheck.checkHost(NetCheck.splitHostPort(host).host)
         let hops = Int(ntClamp(maxHops, 20, 1, 40))
-        let args = ["-m", String(hops), "-w", "2", h]
-        let command = "traceroute " + args.joined(separator: " ")
-        let r = await run("traceroute", args, timeout: TimeInterval(hops * 4))
+        let s = tracerouteSpec(h, maxHops, ipVersion)
+        let command = tracerouteCommand(h, maxHops, ipVersion)
+        let r = await run(s.cmd, s.args, timeout: TimeInterval(hops * 4))
         if r.text.isEmpty && !r.ok {
-            return TextRun(host: h, ok: false, text: "traceroute is not installed or not on PATH.", command: command)
+            return TextRun(host: h, ok: false, text: "\(s.cmd) is not installed or not on PATH.", command: command)
         }
         return TextRun(host: h, ok: r.ok, text: r.text, timedOut: r.timedOut, command: command)
     }
 
+    static func whoisCommand(_ host: String) -> String { "whois \(host)" }
+
     static func whois(host: String) async throws -> TextRun {
         let h = try NetCheck.checkHost(NetCheck.splitHostPort(host).host)
         let r = await run("whois", [h], timeout: 25)
-        if r.text.isEmpty { return TextRun(host: h, ok: false, text: "whois is not installed or returned nothing.") }
-        return TextRun(host: h, ok: r.ok, text: r.text, timedOut: r.timedOut, command: "whois \(h)")
+        if r.text.isEmpty { return TextRun(host: h, ok: false, text: "whois is not installed or returned nothing.", command: whoisCommand(h)) }
+        return TextRun(host: h, ok: r.ok, text: r.text, timedOut: r.timedOut, command: whoisCommand(h))
     }
 
     // MARK: DNS
-
-    static let dnsTypes: [(String, UInt16)] = [
-        ("A", UInt16(kDNSServiceType_A)), ("AAAA", UInt16(kDNSServiceType_AAAA)), ("CNAME", UInt16(kDNSServiceType_CNAME)),
-        ("MX", UInt16(kDNSServiceType_MX)), ("TXT", UInt16(kDNSServiceType_TXT)), ("NS", UInt16(kDNSServiceType_NS)),
-        ("SRV", UInt16(kDNSServiceType_SRV)),
-    ]
-
-    static func lookup(host: String) async throws -> DNSResult {
-        let h = try NetCheck.checkHost(NetCheck.splitHostPort(host).host)
-        let ipv = NetCheck.ipVersion(h)
-        let found: [(String, [JSON])] = await withTaskGroup(of: (Int, String, [JSON]).self) { g in
-            for (i, (name, type)) in dnsTypes.enumerated() {
-                g.addTask {
-                    // NODATA and NXDOMAIN are both just "nothing of this type" here.
-                    let rd = await DNSQuery.run(h, type: type)
-                    return (i, name, rd.compactMap { DNSQuery.decode($0, type: type) })
-                }
-            }
-            var out: [(Int, String, [JSON])] = []
-            for await r in g where !r.2.isEmpty { out.append(r) }
-            return out.sorted { $0.0 < $1.0 }.map { ($0.1, $0.2) }
-        }
-        var reverse: [String]? = nil
-        if ipv != 0 {
-            let names = await DNSQuery.run(DNSQuery.reverseName(h), type: UInt16(kDNSServiceType_PTR))
-                .compactMap { DNSQuery.decode($0, type: UInt16(kDNSServiceType_PTR))?.string }
-            reverse = names.isEmpty ? nil : names
-        }
-        return DNSResult(host: h, records: found.map { (type: $0.0, values: $0.1) }, reverse: reverse, servers: resolvers())
-    }
 
     /// The resolvers in use (`dns.getServers()`): what /etc/resolv.conf names.
     static func resolvers() -> [String] {
@@ -283,7 +326,18 @@ enum NetLocal {
 
     // MARK: TCP reachability
 
-    static func portCheck(host: String, ports: String?, timeout: String? = nil) async throws -> PortsResult {
+    /// `-z` (connect and immediately close) is what makes this a check rather
+    /// than a conversation; dropping it is `telnetCommand`'s job.
+    static func portCommand(_ host: String, _ port: Int, _ ipVersion: String?) -> String {
+        let flag = ipVersion == "6" ? "-6 " : ipVersion == "4" ? "-4 " : ""
+        return "nc -zv \(flag)\(host) \(port)"
+    }
+
+    /// The hand-run form of the telnet probe: stay connected and show what
+    /// the far end says. `nc` without `-z` does that.
+    static func telnetCommand(_ host: String, _ port: Int) -> String { "nc -v \(host) \(port)" }
+
+    static func portCheck(host: String, ports: String?, timeout: String? = nil, ipVersion: String? = nil) async throws -> PortsResult {
         let parsed = NetCheck.splitHostPort(host)
         let h = try NetCheck.checkHost(parsed.host)
         // A target written as "host:port" has already named the port to check.
@@ -291,13 +345,16 @@ enum NetLocal {
         if list.contains(where: { $0 < 1 || $0 > 65535 }) { throw AppError("Ports run from 1 to 65535.") }
         let t = Int(ntClamp(timeout, 3000, 500, 10000))
         var results = await withTaskGroup(of: PortResult.self) { g in
-            for p in list { g.addTask { await NetSocket.probe(h, p, timeoutMs: t) } }
+            let family = ipVersion == "6" ? 6 : ipVersion == "4" ? 4 : 0
+            for p in list { g.addTask { await NetSocket.probe(h, p, timeoutMs: t, family: family) } }
             var out: [PortResult] = []
             for await r in g { out.append(r) }
             return out
         }
         results.sort { $0.port < $1.port }
-        return PortsResult(host: h, results: results)
+        var out = PortsResult(host: h, results: results)
+        out.command = list.map { portCommand(h, $0, ipVersion) }.joined(separator: "\n")
+        return out
     }
 
     // MARK: Telnet
@@ -438,6 +495,7 @@ enum NetLocal {
 enum DNSQuery {
     private final class Box {
         var records: [Data] = []
+        var ttls: [UInt32] = []
         var done = false
     }
 
@@ -448,15 +506,21 @@ enum DNSQuery {
     }
 
     static func runSync(_ name: String, type: UInt16, timeout: TimeInterval) -> [Data] {
+        runSyncTTL(name, type: type, timeout: timeout).map(\.0)
+    }
+
+    /// Each record with its TTL, as the system resolver returned it.
+    static func runSyncTTL(_ name: String, type: UInt16, timeout: TimeInterval) -> [(Data, UInt32)] {
         let box = Box()
         var ref: DNSServiceRef?
         let ctx = Unmanaged.passRetained(box)
         defer { ctx.release() }
-        let cb: DNSServiceQueryRecordReply = { _, flags, _, err, _, _, _, rdlen, rdata, _, context in
+        let cb: DNSServiceQueryRecordReply = { _, flags, _, err, _, _, _, rdlen, rdata, ttl, context in
             guard let context else { return }
             let b = Unmanaged<Box>.fromOpaque(context).takeUnretainedValue()
             if err == kDNSServiceErr_NoError, (flags & kDNSServiceFlagsAdd) != 0, let rdata {
                 b.records.append(Data(bytes: rdata, count: Int(rdlen)))
+                b.ttls.append(ttl)
             }
             if err != kDNSServiceErr_NoError || (flags & kDNSServiceFlagsMoreComing) == 0 { b.done = true }
         }
@@ -474,7 +538,7 @@ enum DNSQuery {
             if n <= 0 { if n < 0 && errno == EINTR { continue }; break }
             if DNSServiceProcessResult(ref) != kDNSServiceErr_NoError { break }
         }
-        return box.records
+        return Array(zip(box.records, box.ttls))
     }
 
     /// The PTR name for an address.
@@ -525,7 +589,7 @@ enum DNSQuery {
             }
             return .array(parts)
         default:
-            return nil
+            return decodeMore(b, type: type)
         }
     }
 

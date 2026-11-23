@@ -9,8 +9,11 @@ import Foundation
 /// can still be drawn, dimmed, while the request is in force.
 @MainActor
 enum Narrowed {
-    /// The last list read without a request narrowing it, per profile key.
-    private static var full: [String: [Host]] = [:]
+    /// The last list read without a request narrowing it, per profile key,
+    /// with when it was read. The same record serves a second, unrelated
+    /// reason to distrust a list: the cluster has since logged out or
+    /// expired (`lastFullRead`, Settings → "Show the last known hosts").
+    private static var full: [String: (nodes: [Host], at: Double)] = [:]
 
     /// Whether this profile's certificate is limited to particular resources.
     nonisolated static func isNarrowed(_ p: TeleportProfile?) -> Bool {
@@ -19,7 +22,7 @@ enum Narrowed {
 
     /// Record a successful read. Only an un-narrowed one stands for the whole cluster.
     static func noteRead(_ p: TeleportProfile, _ nodes: [Host]) {
-        if !isNarrowed(p) { full[p.key] = nodes }
+        if !isNarrowed(p) { full[p.key] = (nodes, nowMs()) }
     }
 
     private static func idOf(_ n: Host) -> String { n.uuid?.nilIfEmpty ?? n.id.nilIfEmpty ?? n.name }
@@ -29,12 +32,22 @@ enum Narrowed {
     static func heldBack(for p: TeleportProfile, reachable: [Host]) -> [Host] {
         guard isNarrowed(p) else { return [] }
         let have = Set(reachable.map(idOf))
-        return (full[p.key] ?? []).filter { !have.contains(idOf($0)) }.map { n in
+        return (full[p.key]?.nodes ?? []).filter { !have.contains(idOf($0)) }.map { n in
             var h = n
             h.extra["heldBack"] = true
             h.extra["heldBy"] = JSON(p.activeRequests)
             return h
         }
+    }
+
+    /// The last full read of a cluster that has since logged out or expired —
+    /// there whether or not anything on it was watched. nil once older than
+    /// `maxAgeMs` (nil `maxAgeMs` = "always", a real setting), and nil if
+    /// this cluster was never read this run (in memory only).
+    static func lastFullRead(for key: String, maxAgeMs: Double?) -> (nodes: [Host], at: Double)? {
+        guard let rec = full[key] else { return nil }
+        if let maxAgeMs, nowMs() - rec.at > maxAgeMs { return nil }
+        return rec
     }
 
     static func reset() { full = [:] }

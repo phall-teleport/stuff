@@ -64,7 +64,12 @@ final class Store {
             || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
         let testDir = testing ? URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("serverlife-tests-\(ProcessInfo.processInfo.processIdentifier)") : nil
-        let base = dir ?? override ?? testDir ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        // A throwaway profile (main.js SERVERLIFE_USER_DATA), for tests that
+        // drive a second copy of the app beside the one in use.
+        let envDir = ProcessInfo.processInfo.environment["SERVERLIFE_USER_DATA"].flatMap {
+            $0.isEmpty ? nil : URL(fileURLWithPath: $0)
+        }
+        let base = dir ?? override ?? envDir ?? testDir ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ServerLife-Swift", isDirectory: true)
         self.dir = base
         self.file = base.appendingPathComponent("sessions.json")

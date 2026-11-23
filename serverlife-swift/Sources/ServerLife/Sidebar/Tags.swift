@@ -101,6 +101,23 @@ enum Tags {
         }
     }
 
+    /// tags.js `mostCommonLabelKeys`: label keys worth their own column — the
+    /// ones a strict majority of these hosts carry, most common first, at most
+    /// `max`. With one host there is nothing to call "common", so none.
+    static func mostCommonLabelKeys(_ hosts: [Host], max: Int = 6) -> [String] {
+        guard hosts.count >= 2 else { return [] }
+        let list = hosts.count > 50000 ? Array(hosts.prefix(50000)) : hosts
+        let threshold = Double(list.count) / 2
+        var counted: [(key: String, count: Int)] = []
+        for t in collectTags(list) {
+            var n = 0
+            for v in t.values { n += v.count }
+            if Double(n) > threshold { counted.append((key: t.key, count: n)) }
+        }
+        counted.sort { a, b in a.count != b.count ? a.count > b.count : localeLess(a.key, b.key) }
+        return Array(counted.prefix(max).map { $0.key })
+    }
+
     // MARK: - Tokenising
 
     /// Split on whitespace, but let quotes hold a value together, so both

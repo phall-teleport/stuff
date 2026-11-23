@@ -16,7 +16,8 @@ import Observation
 @Observable
 final class Connection: Identifiable {
     let id: String
-    let spec: ConnSpec
+    /// Mutable only for the generated Teleport config, rewritten before each dial.
+    private(set) var spec: ConnSpec
     let controlPath: String
 
     // MARK: observed state
@@ -34,6 +35,13 @@ final class Connection: Identifiable {
     private(set) var prompt: String?
     /// Whether the last failed connect looked like per-session MFA (offer tsh).
     private(set) var lastErrorMfaLikely = false
+    /// The host answered with a different key than known_hosts has (offer to forget it).
+    private(set) var lastErrorHostKeyChanged = false
+    /// A plain ssh host's failure looked like "too many authentication
+    /// failures" (offer the authprobe replay).
+    private(set) var lastErrorAuthFailedLikely = false
+    /// The client/cluster version mismatch added to the last failure, if any.
+    private(set) var lastErrorVersionMismatch: Teleport.Compatibility?
     /// The last server profile read (`conn:serverInfo` push).
     private(set) var serverInfo: ServerInfo?
     /// Open terminals' ids, in opening order.
@@ -55,6 +63,12 @@ final class Connection: Identifiable {
     @ObservationIgnored private var historyCache: ShellHistory?
     @ObservationIgnored var toolsCache: HostTools?
     @ObservationIgnored var historyId: String?
+    /// Interactive execs (`execInteractive`), by exec id.
+    @ObservationIgnored var execs: [String: PTYProcess] = [:]
+    /// The live monitor's process (`startMonitor`), nil when not running.
+    @ObservationIgnored var monitor: ConnMonitorProc?
+    /// `teleportPresence`, cached for the life of the connection.
+    @ObservationIgnored var teleportPresenceCache: TeleportPresence?
 
     nonisolated(unsafe) private static var connSeq = 0
     nonisolated(unsafe) static var fwdSeq = 0
@@ -99,7 +113,9 @@ final class Connection: Identifiable {
     /// Environment for anything this connection spawns: tsh's TELEPORT_HOME
     /// (ssh needs it too, for `tsh proxy ssh`) and ssh's own directory on PATH.
     func procEnv(_ extra: [String: String?] = [:]) -> [String: String?] {
-        var env = Tools.tshEnv(home: spec.tshHome)
+        // The cluster this connection is to, for any tsh variables set for it.
+        let proxy = spec.node?.proxy?.nilIfEmpty ?? spec.beamProxy?.nilIfEmpty
+        var env = TshEnv.overrides(home: spec.tshHome, proxy: proxy)
         let dir = (Tools.ssh as NSString).deletingLastPathComponent
         if !dir.isEmpty, dir != ".", !Proc.path.split(separator: ":").contains(Substring(dir)) {
             env["PATH"] = Proc.path + ":" + dir
@@ -155,11 +171,15 @@ final class Connection: Identifiable {
                 try await self.establish()
                 self.connecting = nil
             } catch {
-                let e = error as? AppError
-                self.lastErrorMfaLikely = e?.code == "mfa"
-                self.setState(.error, error: e?.message ?? error.localizedDescription)
+                var e = error as? AppError ?? AppError(error.localizedDescription)
+                let flags = ConnFailFlags.from(e)
+                self.lastErrorMfaLikely = flags.mfa
+                self.lastErrorHostKeyChanged = flags.hostKey
+                self.lastErrorAuthFailedLikely = flags.authFailed
+                self.lastErrorVersionMismatch = await self.explainVersion(&e)
+                self.setState(.error, error: e.message)
                 self.connecting = nil
-                throw error
+                throw e
             }
         }
         connecting = t
@@ -169,6 +189,9 @@ final class Connection: Identifiable {
     private func establish() async throws {
         setState(.connecting)
         lastError = nil
+        // A fresh attempt, not another chapter of the last one: a reconnect
+        // must not replay the failed attempt's "$ ssh …" in the overlay.
+        log = []
 
         // A beam has no master: `tsh beams ssh` is the session, `tsh beams
         // exec` every other channel. Connected at once, so the file browser
@@ -197,6 +220,17 @@ final class Connection: Identifiable {
             // master on an existing path, so it has to go first.
             pushLog("Removing the dead control socket before reconnecting.\n", "sys")
             unlink(controlPath)
+        }
+
+        // A relogin may have happened since this connection's config was
+        // written (or none could be, on a cluster not logged in when `create`
+        // ran): `tsh config` only reformats what is on disk, so redo it.
+        if type == "teleport" && transport != .tsh {
+            let n = spec.node
+            if let f = try? await TeleportSSH.writeClusterSshConfig(dir: ConnRuntime.configDir, proxy: n?.proxy,
+                                                                     cluster: n?.cluster, home: n?.home) {
+                spec.configFile = f
+            }
         }
 
         let args = spec.masterArgs(controlPath: controlPath)
@@ -238,6 +272,9 @@ final class Connection: Identifiable {
             let work = DispatchWorkItem { [weak self] in
                 MainActor.assumeIsolated {
                     let waiting = self?.state == .prompting
+                    // Giving up must not leave the master running: a later
+                    // reconnect would spawn a second one on the same ControlPath.
+                    if let m = self?.master { m.terminate(grace: 0.5); self?.master = nil }
                     gate.finish(AppError("Connection timed out. " + (waiting
                         ? "Authentication is still waiting for input."
                         : "The host did not respond.")))
@@ -265,7 +302,12 @@ final class Connection: Identifiable {
             let sig = ConnRun.ptySignal(code).map { ", signal \(ConnRun.signalName($0))" } ?? ""
             var err = AppError(ConnText.cleanupError(tail) ?? "Connection failed (ssh exited with code \(code)\(sig))")
             // Lets the UI offer the tsh transport rather than a retry that fails the same way.
-            if type == "teleport" && ConnText.looksLikeMfa(tail) { err.code = "mfa" }
+            let flags = ConnFailFlags(mfa: type == "teleport" && ConnText.looksLikeMfa(tail),
+                                      hostKey: ConnText.looksLikeHostKeyChanged(tail),
+                                      // A plain ssh host has no tsh to switch to,
+                                      // but authprobe can replay the attempt.
+                                      authFailed: type != "teleport" && ConnText.looksLikeMfa(tail))
+            err.code = flags.code
             gate.finish(err)
         } else if state != .closed && master == nil {
             health.stop()
@@ -676,6 +718,8 @@ final class Connection: Identifiable {
     // MARK: teardown
 
     private func teardownChildren() {
+        stopMonitor()
+        for eid in Array(execs.keys) { killExec(eid) }
         for tid in Array(terminals.keys) { closeTerminal(tid) }
         for (_, p) in forwardProcs { p.terminate() }
         forwardProcs = [:]

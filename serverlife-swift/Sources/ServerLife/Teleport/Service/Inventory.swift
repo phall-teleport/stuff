@@ -56,6 +56,7 @@ final class Inventory {
     @ObservationIgnored private var _homeErrors: [Teleport.HomeError] = []
     @ObservationIgnored private var _beams: [String: [Beam]] = [:]
     @ObservationIgnored private var _beamSupport: [String: BeamSupport] = [:]
+    @ObservationIgnored private var _phaseSupport: [String: BeamAddSupport] = [:]
     @ObservationIgnored private var _requests: [String: [AccessRequest]] = [:]
 
     var sshHosts: [Host] { _ = generation; return _sshHosts }
@@ -116,6 +117,7 @@ final class Inventory {
     @ObservationIgnored private var started = false
     @ObservationIgnored private var lastHomes: [String] = []
     @ObservationIgnored private var lastTshPath = ""
+    @ObservationIgnored private var lastEnvPrint = ""
     @ObservationIgnored private var lastNodeSeconds: Double = -1
 
     private init() {}
@@ -213,6 +215,15 @@ final class Inventory {
         if force || tshPath != lastTshPath {
             lastTshPath = tshPath
             Tools.setTshPath(tshPath)
+            Beams.forgetAddSupport()
+            Teleport.forgetTctl()
+        }
+        // `applyTshEnv`: at startup, and whenever a patch touches tshEnvText,
+        // clusterTshEnv, tshHomeEnv, tshEnvInShells or tshHomes.
+        let envPrint = TshEnv.settingsFingerprint()
+        if force || envPrint != lastEnvPrint {
+            lastEnvPrint = envPrint
+            TshEnv.applySettings()
         }
     }
 
@@ -467,10 +478,20 @@ final class Inventory {
         return liveProfiles.filter { !hidden.contains($0.proxy) }
     }
 
-    /// Marked by hand as having beams (settings.beamProxies), whatever the probe says.
+    /// Marked by hand as having beams (settings.beamProxies), whatever the
+    /// probe says — or a beams.sh / beams.run cluster, which is one from the
+    /// start unless it was unmarked (settings.notBeamProxies).
     func markedAsBeams(_ proxy: String) -> Bool {
-        Store.shared.setting("beamProxies", [String]()).contains(proxy)
+        if Store.shared.setting("beamProxies", [String]()).contains(proxy) { return true }
+        return Beams.beamsByName(proxy) && !Store.shared.setting("notBeamProxies", [String]()).contains(proxy)
     }
+
+    /// Whether this tsh can do Phases for a cluster (`addSupport().phases`),
+    /// learnt on each beams read. False until then.
+    func phasesSupported(_ proxy: String) -> Bool { _ = beamsGeneration; return _phaseSupport[proxy]?.phases ?? false }
+
+    /// The whole `addSupport` answer for a cluster, once a beams read asked.
+    func addSupport(_ proxy: String) -> BeamAddSupport? { _ = beamsGeneration; return _phaseSupport[proxy] }
 
     func beamsSupported(_ proxy: String) -> Bool {
         markedAsBeams(proxy) || (beamSupport[proxy]?.ok ?? false)
@@ -494,25 +515,30 @@ final class Inventory {
     /// every beams-capable cluster, or just `proxy`'s.
     func refreshBeams(refresh: Bool = false, proxy: String? = nil) async {
         let wanted = proxy.map { px in beamProfiles.filter { $0.proxy == px } } ?? beamProfiles
-        let marked = Set(Store.shared.setting("beamProxies", [String]()))
-        let results = await withTaskGroup(of: (String, BeamSupport, TshList<Beam>?).self) { g in
+        let marked = Set(wanted.map(\.proxy).filter { markedAsBeams($0) })
+        let results = await withTaskGroup(of: (String, BeamSupport, TshList<Beam>?, BeamAddSupport?).self) { g in
             for p in wanted {
                 g.addTask {
                     let probe = await Beams.supported(proxy: p.proxy, home: p.homeDir, refresh: refresh)
-                    if !probe.ok && !marked.contains(p.proxy) { return (p.proxy, probe, nil) }
-                    return (p.proxy, probe, await Beams.list(proxy: p.proxy, home: p.homeDir))
+                    if !probe.ok && !marked.contains(p.proxy) { return (p.proxy, probe, nil, nil) }
+                    let list = await Beams.list(proxy: p.proxy, home: p.homeDir)
+                    // Whether this tsh can do Phases, for the tab beside the
+                    // beams. Asked of the binary, and cached by it.
+                    let can = await Beams.addSupport(proxy: p.proxy, home: p.homeDir)
+                    return (p.proxy, probe, list, can)
                 }
             }
-            var out: [(String, BeamSupport, TshList<Beam>?)] = []
+            var out: [(String, BeamSupport, TshList<Beam>?, BeamAddSupport?)] = []
             for await r in g { out.append(r) }
             return out
         }
-        let beforeBeams = _beams, beforeSupport = _beamSupport
-        for (px, probe, list) in results {
+        let beforeBeams = _beams, beforeSupport = _beamSupport, beforePhases = _phaseSupport
+        for (px, probe, list, can) in results {
             _beamSupport[px] = probe
             if let list { _beams[px] = list.ok ? list.items : [] } else { _beams.removeValue(forKey: px) }
+            if let can { _phaseSupport[px] = can }
         }
-        if _beams != beforeBeams || _beamSupport != beforeSupport {
+        if _beams != beforeBeams || _beamSupport != beforeSupport || _phaseSupport != beforePhases {
             beamsGeneration += 1
             onBeams.forEach { $0() }
         }
@@ -549,7 +575,15 @@ final class Inventory {
         var set = Store.shared.setting("beamProxies", [String]())
         set.removeAll { $0 == proxy }
         if marked { set.append(proxy) }
+        // A beams.sh / beams.run cluster is marked by its name: turning it off
+        // is an opt-out of that, and turning it back on removes the opt-out.
+        var off = Store.shared.setting("notBeamProxies", [String]())
+        if Beams.beamsByName(proxy) {
+            off.removeAll { $0 == proxy }
+            if !marked { off.append(proxy) }
+        }
         Store.shared.setSetting("beamProxies", set)
+        Store.shared.setSetting("notBeamProxies", off)
         await refreshBeams(refresh: true)
         StatusBus.shared.show(marked ? "Listing beams for this cluster" : "No longer treating this cluster as beams")
     }
@@ -668,7 +702,9 @@ final class Inventory {
 
     /// Saved cluster logins (store `tshLogins`), most recently used first.
     static func savedLogins() -> [JSON] {
-        Store.shared.listTshLogins()
+        Store.shared["tshLogins"].items.sorted {
+            ($0["lastUsed"].double ?? $0["updatedAt"].double ?? 0) > ($1["lastUsed"].double ?? $1["updatedAt"].double ?? 0)
+        }
     }
 
     /// A saved login record as login options.
@@ -681,6 +717,11 @@ final class Inventory {
 
     /// store.js `markTshLoginUsed`.
     static func markSavedLoginUsed(_ id: String) {
-        Store.shared.markTshLoginUsed(id)
+        Store.shared.mutate("tshLogins") { list in
+            guard var arr = list.array, let i = arr.firstIndex(where: { $0["id"].string == id }) else { return }
+            arr[i]["lastUsed"] = .number(nowMs())
+            arr[i]["useCount"] = .number((arr[i]["useCount"].double ?? 0) + 1)
+            list = .array(arr)
+        }
     }
 }

@@ -58,25 +58,52 @@ final class SessionTermView: TerminalView, TerminalViewDelegate {
     func applySettings(fontSize size: CGFloat? = nil) {
         let s = Store.shared
         if let size { fontSize = max(8, min(28, size)) } else if fontSize == 0 { fontSize = SessionTermView.settingFontSize }
-        let family = s.settingJSON("fontFamily").string.flatMap { $0.trimmed.nilIfEmpty } ?? "SFMono-Regular, Menlo, monospace"
-        let f = SessionTermView.font(family: family, size: fontSize)
+        let f = currentFont(fontSize)
         if font != f { font = f }
         let scrollback = s.settingJSON("scrollback").int ?? 10000
         getTerminal().changeHistorySize(scrollback > 0 ? scrollback : 10000)
         let blink = s.settingJSON("cursorBlink").bool ?? true
-        getTerminal().setCursorStyle(blink ? .blinkBar : .steadyBar)
+        // term.js: `cursorStyle: settings.cursorStyle || 'bar'`.
+        let style: CursorStyle
+        switch s.settingJSON("cursorStyle").string ?? "bar" {
+        case "block": style = blink ? .blinkBlock : .steadyBlock
+        case "underline": style = blink ? .blinkUnderline : .steadyUnderline
+        default: style = blink ? .blinkBar : .steadyBar
+        }
+        getTerminal().setCursorStyle(style)
+    }
+
+    /// A pane's own font (panestyle.js), else the setting — through the
+    /// same font stack as the original's `fontStack(settings.fontFamily)`.
+    var styleFont: String?
+    /// A pane's own palette (panestyle.js `paletteFor`), else the app's.
+    var styleTheme: [String: String]?
+
+    private func currentFont(_ size: CGFloat) -> NSFont {
+        let setting = styleFont ?? Store.shared.settingJSON("fontFamily").string.flatMap { $0.trimmed.nilIfEmpty }
+        return MiscFonts.font(setting, size: size)
     }
 
     func setFontSize(_ px: CGFloat) {
         fontSize = max(8, min(28, px))
-        font = SessionTermView.font(family: Store.shared.settingJSON("fontFamily").string.flatMap { $0.trimmed.nilIfEmpty }
-                                    ?? "SFMono-Regular, Menlo, monospace", size: fontSize)
+        font = currentFont(fontSize)
+    }
+
+    /// term.js `redraw()`: drop what the renderer has cached and paint every
+    /// row again — for a picture left muddled (after a wake, a GPU hiccup).
+    func redraw() {
+        guard !disposed else { return }
+        let f = font
+        font = currentFont(fontSize == 0 ? SessionTermView.settingFontSize : fontSize)
+        if font == f { needsDisplay = true }
+        getTerminal().updateFullScreen()
+        setNeedsDisplay(bounds)
     }
 
     /// The palette: Theme.shared.terminal when a theme supplies one, else the
     /// original's dark or light set.
     func applyTheme() {
-        let t = TermPalette.current()
+        let t = styleTheme ?? TermPalette.current()
         nativeBackgroundColor = NSColor(hex: t["background"] ?? "#0f1117")
         nativeForegroundColor = NSColor(hex: t["foreground"] ?? "#d8dee9")
         caretColor = NSColor(hex: t["cursor"] ?? "#4c8dff")

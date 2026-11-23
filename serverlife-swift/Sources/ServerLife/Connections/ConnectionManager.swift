@@ -48,8 +48,49 @@ enum ConnPrefs {
     static func apply(to opts: ConnectOptions, host: Host, settings: JSON? = nil) -> ConnectOptions {
         var o = opts
         if o.agentForward == nil { o.agentForward = agentForward(for: host, settings: settings) }
+        // Options a caller passes — a preset, a one-off, or `.null` for
+        // "plain" — win; with none, the host's default applies. X11 is part of
+        // the options but has always been its own argument, so an explicit
+        // one still rules.
+        if o.sshOptions == nil { o.sshOptions = sshOptionsDefault(for: host, settings: settings) ?? .null }
+        // A saved profile's own ssh options go on top of whatever applies,
+        // rather than replacing it; for the same option, the profile's line wins.
+        if let prof = o.profileSshOptions?.nilIfEmpty {
+            o.sshOptions = mergeProfileOptions(o.sshOptions ?? .null, prof)
+        }
+        o.profileSshOptions = nil
+        if let raw = o.sshOptions, raw.truthy {
+            let n = SSHOptions.normalize(raw).options
+            o.sshOptions = n.json
+            if o.x11 == nil && n.x11 != "off" { o.x11 = n.x11 }
+            // Reason, invites and automatic requests exist only as tsh flags.
+            if host.isTeleport && o.transport == nil && SSHOptions.needsTsh(n.json) { o.transport = "tsh" }
+        } else {
+            o.sshOptions = nil
+        }
         if o.login?.isEmpty ?? true, let l = explicitLogin(for: host, settings: settings) { o.login = l }
         return o
+    }
+
+    /// `sshOptionsRecord(host).default`.
+    static func sshOptionsDefault(for host: Host, settings: JSON? = nil) -> JSON? {
+        let s = settings ?? Store.shared.settings
+        let d = s["sshOptionsHosts"][host.prefKey]["default"]
+        return d.truthy ? d : nil
+    }
+
+    /// The profile half of `withHostPrefs`: its -o lines replace the
+    /// options' lines of the same name (split on space or `=`, any case).
+    static func mergeProfileOptions(_ raw: JSON, _ profile: String) -> JSON {
+        var base = SSHOptions.normalize(raw.truthy ? raw : .object([:])).options
+        let mine = profile.components(separatedBy: "\n").map { $0.trimmed }.filter { !$0.isEmpty }
+        func nameOf(_ l: String) -> String {
+            String(l.split(omittingEmptySubsequences: false, whereSeparator: { $0 == " " || $0 == "\t" || $0 == "=" })
+                .first ?? "").lowercased()
+        }
+        let names = Set(mine.map(nameOf))
+        base.extraOptions = base.extraOptions.filter { !names.contains(nameOf($0)) } + mine
+        return base.json
     }
 
     /// Whether a host is remembered as needing per-session MFA.
@@ -101,6 +142,8 @@ final class ConnectionManager {
     func unsubscribe(_ token: UUID) { listeners[token] = nil }
 
     private func emit(_ e: ConnEvent) { for l in listeners.values { l(e) } }
+    /// For the pieces in other files of this directory (the local monitor).
+    func emitEvent(_ e: ConnEvent) { emit(e) }
 
     // MARK: lookup
 
@@ -176,6 +219,7 @@ final class ConnectionManager {
             s.mfaMode = opts.mfaMode?.nilIfEmpty
             s.timeout = opts.timeout
             s.x11Timeout = opts.x11Timeout
+            s.sshOptions = opts.sshOptions.flatMap { $0.truthy ? $0 : nil }
         }
 
         // A beam: no ssh_config, no target, no OpenSSH at all.
@@ -204,9 +248,13 @@ final class ConnectionManager {
                 transport = .tsh
                 leafForced = true
             }
+            // Caught rather than left to throw: `tsh config` needs a cluster
+            // that is logged in, and failing here meant no connection was ever
+            // registered for the relogin-and-retry to connect later. `connect`
+            // regenerates it right before dialling.
             let configFile = transport == .tsh ? nil
-                : try await TeleportSSH.writeClusterSshConfig(dir: configDir, proxy: host.proxy, cluster: host.cluster,
-                                                              home: host.home)
+                : try? await TeleportSSH.writeClusterSshConfig(dir: configDir, proxy: host.proxy, cluster: host.cluster,
+                                                               home: host.home)
             let target = TeleportSSH.sshTarget(host, login: opts.login?.nilIfEmpty)
             let cl = host.cluster ?? ""
             let label = host.ambiguous == true && host.uuid?.isEmpty == false
@@ -238,6 +286,7 @@ final class ConnectionManager {
                          label: alias + (login.map { " (\($0))" } ?? ""))
         // An alias from an extra config file only exists inside it: `ssh -F`.
         s.configFile = host.configFile?.nilIfEmpty
+        s.identityFile = host.identityFile?.nilIfEmpty
         s.proxyJump = host.proxyJump?.nilIfEmpty
         s.host = host
         common(&s, transport: transport)
@@ -261,8 +310,15 @@ final class ConnectionManager {
         do {
             try await c.connect()
         } catch {
-            if let h = startHistory(c.historyEntry) { endHistory(h, (error as? AppError)?.message ?? error.localizedDescription) }
-            throw error
+            var e = error as? AppError ?? AppError(error.localizedDescription)
+            if let h = startHistory(c.historyEntry) { endHistory(h, e.message) }
+            // Let the window offer the MFA-capable transport, forgetting the
+            // stale known_hosts entry, or the authprobe diagnosis, rather than
+            // a retry that fails the same way (main.js `conn:connect`).
+            if c.lastErrorMfaLikely { e.message += " [mfa]" }
+            if c.lastErrorHostKeyChanged { e.message += " [hostkey]" }
+            if c.lastErrorAuthFailedLikely { e.message += " [authfail]" }
+            throw e
         }
         if c.historyId == nil { c.historyId = startHistory(c.historyEntry) }
     }

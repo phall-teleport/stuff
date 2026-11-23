@@ -176,13 +176,17 @@ import Testing
         #expect(s.listNetRequests().count == 1)
     }
 
-    @Test func netRunsAreEveryRunNewestFirstCappedAt25() {
-        // store.js compares a three-part key with a two-part one, so a repeat
-        // is never replaced: Recent is every run.
+    @Test func netRunsReplaceTheSameToolTargetAndHostNewestFirstCappedAt25() {
         s.addNetRun(["tool": "ping", "target": "h"])
         let r = s.addNetRun(["tool": "ping", "target": "h", "ok": false, "summary": .string(String(repeating: "s", count: 200))])
         #expect(r["id"].string?.hasPrefix("run_") == true && r["ok"] == false && r["summary"].string?.count == 160)
-        #expect(s.listNetRuns().count == 2 && s.listNetRuns()[0]["id"] == r["id"])
+        #expect(s.listNetRuns().count == 1 && s.listNetRuns()[0]["id"] == r["id"])
+        // The same tool and target from a host is a different run; by id or by label.
+        s.addNetRun(["tool": "ping", "target": "h", "on": ["hostId": "web1", "label": "web1"]])
+        s.addNetRun(["tool": "ping", "target": "h", "on": ["label": "db"]])
+        s.addNetRun(["tool": "ping", "target": "h", "on": ["hostId": "web1", "label": "renamed"]])
+        #expect(s.listNetRuns().count == 3)
+        #expect(s.listNetRuns()[0]["on"]["label"] == "renamed")
         for i in 0..<30 { s.addNetRun(["tool": "dig", "target": .string("t\(i)")]) }
         #expect(s.listNetRuns().count == 25)
         s.clearNetRuns()
@@ -286,5 +290,82 @@ import Testing
         #expect(one["counts"]["macros"] == 1 && one["data"]["hiddenMacros"] == [])
         #expect(throws: AppError.self) { try Backup.parse(#"{"format":"serverlife.backup","version":"2","data":{}}"#) }
         #expect(throws: AppError.self) { try Backup.parse(#"{"format":"serverlife.backup","version":1}"#) }
+    }
+
+    // MARK: 0.16–0.39 additions
+
+    @Test func profileKeepsSshExtraOptionsKubeAndIcon() {
+        let p = s.upsertProfile(["name": "k", "sshExtraOptions": "-o ServerAliveInterval=30", "icon": "★",
+                                 "kube": ["spec": ["contextName": "dev"], "namespace": "default"]])
+        #expect(p["sshExtraOptions"] == "-o ServerAliveInterval=30" && p["icon"] == "★")
+        #expect(p["kube"]["spec"]["contextName"] == "dev" && p["kube"]["namespace"] == "default")
+        let q = s.upsertProfile(["name": "plain"])
+        #expect(q["sshExtraOptions"].isNull && q["kube"].isNull && q["icon"].isNull)
+    }
+
+    @Test func macroOrderIsListedAndDeduped() {
+        #expect(s.listMacros()["order"] == [])
+        #expect(s.setMacroOrder(["b", "", "a", "b", "c"]) == ["b", "a", "c"])
+        #expect(s.listMacros()["order"] == ["b", "a", "c"])
+    }
+
+    @Test func beamsIsAMacroScope() {
+        #expect(s.upsertMacro(["command": "uptime", "where": "beams"])["where"] == "beams")
+        #expect(s.upsertMacro(["command": "uptime", "where": "nowhere"])["where"] == "all")
+        #expect(s.setMacroPin("m1", where: "beams")[0]["where"] == "beams")
+        #expect(s.setMacroPin("m2", where: "elsewhere")[1]["where"] == "hosts")
+    }
+
+    @Test func tshLoginRemembersShowInHosts() {
+        #expect(s.upsertTshLogin(["proxy": "a:443", "showInHosts": true])["showInHosts"] == true)
+        #expect(s.upsertTshLogin(["proxy": "b:443"])["showInHosts"] == false)
+    }
+
+    /// tests/kubekeys.test.mjs: with its Teleport cluster known, a kube
+    /// cluster is keyed by that; otherwise by its group.
+    @Test func hostPrefKeyForKubeClusters() {
+        let g = "tp:prod.example.com:443"
+        let kube: JSON = ["kind": "kube", "id": "kube:tsh:prod.example.com:prod.example.com:dev", "name": "dev", "groupKey": .string(g)]
+        #expect(Store.hostPrefKey(kube) == "kube:\(g):dev")
+        var withCluster = kube; withCluster["teleportCluster"] = "prod"
+        #expect(Store.hostPrefKey(withCluster) == "kube:prod:dev")
+        #expect(Store.hostPrefKey(["kind": "kube", "id": "kube:direct:minikube", "name": "minikube"]) == "kube:direct:minikube")
+        #expect(Store.hostPrefKey(["uuid": "u1", "kind": "kube", "name": "x", "groupKey": "g"]) == "uuid:u1")
+        #expect(Store.hostPrefKey(["type": "teleport", "name": "web", "cluster": "c"]) == "tsh:c:web")
+        #expect(Store.hostPrefKey(["alias": "box"]) == "ssh:box")
+        #expect(Store.hostPrefKey(.null) == "")
+    }
+
+    @Test func backupCarriesMacroOrder() throws {
+        s.setMacroOrder(["x", "y"])
+        #expect(Backup.fullKeys.contains("macroOrder"))
+        #expect(Backup.exportAll(s)["data"]["macroOrder"] == ["x", "y"])
+        #expect(Backup.exportMacros(s, nil)["data"]["macroOrder"] == ["x", "y"])
+        #expect(Backup.exportMacros(s, ["m_1"])["data"]["macroOrder"] == [])
+        let doc = try Backup.parse(Backup.envelope("macros", ["macroOrder": ["y", "z"]]).text())
+        Backup.applyImport(s, doc)
+        #expect(s.listMacros()["order"] == ["x", "y", "z"])
+        Backup.applyImport(s, doc, mode: "replace")
+        #expect(s.listMacros()["order"] == ["y", "z"])
+    }
+
+    @Test func multiExecFileStagesAndRetries() throws {
+        let none = MXFileOptions.parse(options: .map([]))
+        #expect(none == MXFileOptions.Extras(stages: nil, retries: 0, retryDelaySeconds: 10))
+        let x = MXFileOptions.parse(options: .map([
+            ("stages", .map([("first", .string("2")), ("pause", .bool(false))])),
+            ("retries", .double(12.7)), ("retryDelaySeconds", .int(5000)),
+        ]))
+        #expect(x.stages == MXFileOptions.Stages(first: 2, batch: 5, pause: false, stopOnFail: true))
+        #expect(x.retries == 10 && x.retryDelaySeconds == 3600)
+        #expect(MXFileOptions.parse(options: .map([("retries", .int(-3)), ("retryDelaySeconds", .null)])).retries == 0)
+        #expect(MXFileOptions.parse(options: .map([("retryDelaySeconds", .null)])).retryDelaySeconds == 10)
+        // Round trip through the emitter and reader.
+        let e = MXFileOptions.Extras(stages: .init(first: 1, batch: 3, pause: true, stopOnFail: false), retries: 2, retryDelaySeconds: 30)
+        let text = YAMLEmitter.dump(.map([("options", .map(MXFileOptions.yamlEntries(e)))]), .init(lineWidth: 100))
+        #expect(text.contains("retryDelaySeconds: 30"))
+        #expect(MXFileOptions.parse(options: try YAMLReader.load(text)["options"]) == e)
+        let plain = MultiExecFile.stripNulls(.map(MXFileOptions.yamlEntries(.init())))
+        #expect(plain == .map([("retries", .int(0)), ("retryDelaySeconds", .int(10))]))
     }
 }

@@ -23,11 +23,15 @@ struct ManagedSSHHost: Sendable {
     var extraOptions: String?
     /// Write even when the user's own config already defines the alias.
     var force = false
+    /// The config file to write into — one the host list reads — instead of
+    /// the primary one ("New host in this config").
+    var file: String?
     init(alias: String, hostname: String, user: String? = nil, port: Int? = nil, identityFile: String? = nil,
-         proxyJump: String? = nil, forwardAgent: Bool = false, extraOptions: String? = nil, force: Bool = false) {
+         proxyJump: String? = nil, forwardAgent: Bool = false, extraOptions: String? = nil, force: Bool = false,
+         file: String? = nil) {
         self.alias = alias; self.hostname = hostname; self.user = user; self.port = port
         self.identityFile = identityFile; self.proxyJump = proxyJump; self.forwardAgent = forwardAgent
-        self.extraOptions = extraOptions; self.force = force
+        self.extraOptions = extraOptions; self.force = force; self.file = file
     }
 }
 
@@ -227,7 +231,14 @@ enum SSHConfig {
             h.hostname = first("hostname") ?? a.alias
             h.user = first("user") ?? NSUserName()
             h.port = Int(first("port") ?? "22") ?? 22
-            h.identityFile = first("identityfile")
+            // ssh tries every IdentityFile/CertificateFile it was given, in
+            // order, before falling through to the agent — so a host with a
+            // certificate plus a fallback key, or several key types, genuinely
+            // has more than one. Keeping only the first hid that from the UI.
+            let identityFiles = asList(cfg["identityfile"]), certificateFiles = asList(cfg["certificatefile"])
+            h.identityFile = identityFiles.first
+            h.extra["identityFiles"] = JSON(identityFiles)
+            h.extra["certificateFiles"] = JSON(certificateFiles)
             h.configFile = primary ? nil : file
             h.extra["proxied"] = .bool(proxied)
             // A Teleport-generated ProxyCommand: this alias already routes through tsh.
@@ -256,6 +267,13 @@ enum SSHConfig {
                 continue
             }
             if !inBlock { continue }
+            // Most keys take the first value seen, same as ssh_config itself —
+            // but IdentityFile/CertificateFile are explicitly cumulative (ssh
+            // tries each one it was given, in order), so those are collected.
+            if kv.key == "identityfile" || kv.key == "certificatefile" {
+                cfg[kv.key, default: []].append(stripQuotes(kv.value))
+                continue
+            }
             if cfg[kv.key] == nil { cfg[kv.key] = [stripQuotes(kv.value)] }
         }
         return cfg
@@ -309,9 +327,12 @@ enum SSHConfig {
     /// block. Backs the file up once (`<config>.serverlife-backup`) and refuses
     /// to shadow a Host the user defined outside the block unless `force`.
     @discardableResult
-    static func addHost(_ host: ManagedSSHHost, configPath: String = defaultPath) throws -> (alias: String, path: String) {
+    static func addHost(_ host: ManagedSSHHost, configPath primaryPath: String = defaultPath) throws -> (alias: String, path: String, label: String) {
         if host.alias.isEmpty || host.alias.contains(where: { $0.isWhitespace }) { throw AppError("Give the host a single-word alias") }
         if host.hostname.isEmpty { throw AppError("Hostname is required") }
+        // Into the config file it was asked for — one the host list reads — or the primary one.
+        let configPath = host.file?.nilIfEmpty.map(expandHome) ?? primaryPath
+        let label = host.file?.nilIfEmpty != nil && configPath != primaryPath ? configPath : "~/.ssh/config"
         let fm = FileManager.default
         try? fm.createDirectory(atPath: (configPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])
@@ -324,7 +345,7 @@ enum SSHConfig {
         let clash = TPText.test(#"^\s*Host\s+(.*\s)?"# + TPText.escapeRegex(host.alias) + #"(\s|$)"#, outside,
                                 [.caseInsensitive, .anchorsMatchLines])
         if clash && !host.force {
-            throw AppError("~/.ssh/config already defines \"\(host.alias)\" outside the ServerLife block")
+            throw AppError("\(label) already defines \"\(host.alias)\" outside the ServerLife block")
         }
         let s = text.range(of: blockStart), e = text.range(of: blockEnd)
         var block = ""
@@ -339,7 +360,7 @@ enum SSHConfig {
             out = (text.isEmpty ? "" : trimEnd(text) + "\n\n") + newBlock + "\n"
         }
         try writeAtomically(out, configPath)
-        return (host.alias, configPath)
+        return (host.alias, configPath, label)
     }
 
     /// `removeHostFromConfig`: remove an alias from the managed block; an
@@ -472,6 +493,9 @@ enum SSHConfig {
     }
 
     // MARK: - Helpers
+
+    /// `asList`: always an array, dropping anything empty.
+    static func asList(_ v: [String]?) -> [String] { (v ?? []).map(\.trimmed).filter { !$0.isEmpty } }
 
     /// JavaScript `String.split(sep)`.
     static func jsSplit(_ s: String, _ sep: String) -> [String] { s.components(separatedBy: sep) }

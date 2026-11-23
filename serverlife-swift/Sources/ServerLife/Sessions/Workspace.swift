@@ -78,6 +78,24 @@ extension SessionsWindow {
         func describe(_ id: String) -> JSON? {
             guard let p = pane(id) else { return nil }
             if p.isHosts { return ["kind": "hosts", "group": JSON(p.hostsGroup), "title": .string(p.title ?? "Hosts")] }
+            // KubeLife panes are local panes or views underneath, and would be
+            // saved as plain shells: a cluster browser came back as an empty
+            // terminal, a pod's exec or logs as a shell in the home directory.
+            // Saved as what they are instead — the kube-ui owner puts what it
+            // needs to reopen one in `attachments["layoutSpec"]` (a JSON object
+            // with `kind` kubeBrowser / kubeLogViewer / kubePod) and reopens it
+            // with `kube-restore-open`.
+            if let spec = p.attachments["layoutSpec"] as? JSON, spec.object != nil {
+                var o = spec.object ?? [:]
+                if o["title"] == nil || o["title"]?.isNull == true { o["title"] = JSON(p.title) }
+                return .object(o)
+            }
+            if p.kind == .tmux, Actions.shared.isRegistered("tmux-restore-of") {
+                var spec: JSON?
+                Actions.shared.perform("tmux-restore-of", window: window, paneId: p.id,
+                                       args: ["reply": { (v: Any?) in spec = v as? JSON } as (Any?) -> Void])
+                if let spec, !spec.isNull { return spec }
+            }
             switch p.kind {
             case .local:
                 return ["kind": "local", "cwd": JSON(p.cwd), "shell": JSON(p.shellName), "blank": .bool(p.blankShell)]
@@ -122,7 +140,22 @@ extension SessionsWindow {
     /// A saved descriptor found in the live inventory.
     private func resolveHost(_ pane: JSON) -> Host? {
         guard let id = pane["hostId"].string else { return nil }
+        // A beam is in no inventory list this early after a restart — beams
+        // are listed per cluster — so every beam pane was skipped. Its id
+        // says everything needed to dial it again: `beam:<proxy>:<name>`,
+        // the proxy carrying its port.
+        if let b = Self.beamHost(id: id, pane: pane) { return b }
         return SessionsCore.host(forId: id)
+    }
+
+    static func beamHost(id: String, pane: JSON) -> Host? {
+        guard id.hasPrefix("beam:"), let colon = id.lastIndex(of: ":"), colon > id.index(id.startIndex, offsetBy: 4) else { return nil }
+        let proxy = String(id[id.index(id.startIndex, offsetBy: 5)..<colon]), name = String(id[id.index(after: colon)...])
+        guard !proxy.isEmpty, !name.isEmpty else { return nil }
+        let home: String? = pane.object?.keys.contains("home") == true
+            ? pane["home"].string
+            : Inventory.shared.profiles.first { $0.proxy == proxy }?.homeDir.nilIfEmpty
+        return Host(json: ["id": .string(id), "type": "beam", "name": .string(name), "proxy": .string(proxy), "home": JSON(home)])
     }
 
     /// Reopen a saved workspace: the first pane of each tab as the tab, then
@@ -131,6 +164,9 @@ extension SessionsWindow {
         let tabsJ = ws["tabs"].items
         guard !tabsJ.isEmpty else { return }
         var opened = 0, skipped = 0
+        // A tmux session is attached once: attaching brings back every one of
+        // its windows, so its other tabs and panes are already there.
+        var tmuxDone = Set<String>()
         restoring = true
         defer { restoring = false; changed() }
         for t in tabsJ {
@@ -158,6 +194,32 @@ extension SessionsWindow {
                     if spec["type"].isNull, let k = spec["kind"].string { h.type = k }
                     if spec["type"].isNull && spec["kind"].isNull { h.type = kind == "vnc" ? Host.vnc : Host.serial }
                     Actions.shared.perform("\(h.type)-open", window: window, host: h)
+                case "kubeBrowser", "kubePod", "kubeLogViewer":
+                    // The browser and the log viewer are always tabs of their
+                    // own; a pod pane splits like a shell. Checked against the
+                    // cluster before reopening (kube-ui).
+                    guard Actions.shared.isRegistered("kube-restore-open") else { skipped += 1; continue }
+                    let ok: Bool = await withCheckedContinuation { cont in
+                        var done = false
+                        Actions.shared.perform("kube-restore-open", window: window, args: [
+                            "spec": pj, "first": first, "split": dir == .col ? "down" : "right",
+                            "reply": { (v: Any?) in if !done { done = true; cont.resume(returning: (v as? Bool) ?? false) } } as (Any?) -> Void,
+                        ])
+                    }
+                    if !ok { skipped += 1; continue }
+                case "tmux":
+                    let key = "\(pj["local"].truthy ? "local" : (pj["hostId"].string ?? ""))|\(pj["login"].string ?? "")|\(pj["session"].string ?? "")"
+                    if tmuxDone.contains(key) { first = false; continue }
+                    tmuxDone.insert(key)
+                    guard Actions.shared.isRegistered("tmux-restore-open") else { skipped += 1; continue }
+                    let ok: Bool = await withCheckedContinuation { cont in
+                        var done = false
+                        Actions.shared.perform("tmux-restore-open", window: window, args: [
+                            "spec": pj,
+                            "reply": { (v: Any?) in if !done { done = true; cont.resume(returning: (v as? Bool) ?? false) } } as (Any?) -> Void,
+                        ])
+                    }
+                    if !ok { skipped += 1; continue }
                 case "local":
                     if first {
                         openLocalShell(cwd: pj["cwd"].string, shell: pj["shell"].string, blank: pj["blank"].truthy)
@@ -191,6 +253,12 @@ extension SessionsWindow {
                 if p["kind"].string == "local" {
                     let where_ = p["cwd"].string.map { SessionsCore.shortCwd($0) } ?? ""
                     out.append(where_.isEmpty ? "local shell" : "local shell: \(where_)")
+                    return
+                }
+                if p["kind"].string == "tmux" {
+                    let label = p["label"].string?.nilIfEmpty ?? "host"
+                    let on = p["local"].truthy ? "this machine" : (p["login"].string?.nilIfEmpty.map { "\($0)@\(label)" } ?? label)
+                    out.append("tmux “\(p["session"].string ?? "")” on \(on)")
                     return
                 }
                 let target = p["target"].string ?? ""

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Folders, folder browser, hosts pane, saved profiles, add server, quick connect, history (folders.js …).
@@ -26,6 +27,8 @@ enum HostsFeature {
             if let v = ctx.arg("proxyJump", as: String.self) { i.proxyJump = v }
             if let v = ctx.arg("extraOptions", as: String.self) { i.extraOptions = v }
             if let v = ctx.arg("destination", as: String.self) { i.destination = v }
+            if let v = ctx.arg("configFile", as: String.self) { i.configFile = v }
+            if let v = ctx.arg("alias", as: String.self) { i.alias = v }
             AddServer.openDialog(ctx.window, initial: i)
         }
 
@@ -50,7 +53,10 @@ enum HostsFeature {
         }
         a.register("launch-profile") { ctx in
             guard let p = profileArg(ctx) else { return }
-            Task { @MainActor in await Profiles.launch(p, window: ctx.window) }
+            // args `forceTerminal` Bool (sftp with a terminal), `split` "right"/"down".
+            let force = ctx.arg("forceTerminal", as: Bool.self) ?? false
+            let split = ctx.arg("split", as: String.self)
+            Task { @MainActor in await Profiles.launch(p, window: ctx.window, forceTerminal: force, split: split) }
         }
 
         // profiles.js `openNewSessionDialog`. sessions owns the menu id
@@ -94,6 +100,12 @@ enum HostsFeature {
             HostsPane.open(ctx.window, groupKey: ctx.arg("groupKey", as: String.self),
                            split: ctx.arg("split", as: String.self) ?? ctx.arg("dir", as: String.self))
         }
+        // hostspane.js `pickedHostsOf(paneId)`: args `reply: ([Host]) -> Void`;
+        // the hosts picked in that hosts pane (empty for any other pane).
+        a.register("hosts-pane-picked") { ctx in
+            let hosts = ctx.paneId.map { HostsPane.pickedHostsOf($0) } ?? []
+            ctx.arg("reply", as: (([Host]) -> Void).self)?(hosts)
+        }
         // folders.js `openFolderDialog`: args `groupKey`, `parentId` (new
         // inside), `folderId` (edit), `hosts` [Host] (default: the group's),
         // `completion: (HostFolder?) -> Void` (the folder made/edited, nil when cancelled).
@@ -111,6 +123,44 @@ enum HostsFeature {
         }
         a.register("folders-import") { ctx in
             Task { @MainActor in await FolderDialogs.importFolders(ctx.window, groups: HostsHooks.folderGroups()) }
+        }
+
+        // sshoptions.js: the "All SSH options…" dialog for `host`; args
+        // `login`, `focus` "remoteForwards"/"dynamicForwards"/"reason".
+        a.register("ssh-options") { ctx in
+            guard let h = ctx.host else { return }
+            let focus: SSHOptionsUI.Focus? = switch ctx.arg("focus", as: String.self) {
+            case "remoteForwards": .remoteForwards
+            case "dynamicForwards": .dynamicForwards
+            case "reason": .reason
+            default: nil
+            }
+            SSHOptionsUI.openDialog(h, login: ctx.arg("login", as: String.self), window: ctx.window, focus: focus)
+        }
+        // `sshOptionsMenu`: appends the "SSH options" submenu for `host` to
+        // args `menu` (NSMenu), or hands it to `reply: (Any?) -> Void` as a
+        // CtxItem. Args `login`, `openX11: () -> Void`.
+        a.register("ssh-options-menu") { ctx in
+            guard let h = ctx.host else { return }
+            let item = SSHOptionsUI.menu(h, login: ctx.arg("login", as: String.self), window: ctx.window,
+                                         openX11: ctx.arg("openX11", as: (() -> Void).self))
+            if let reply = ctx.arg("reply", as: ((Any?) -> Void).self) { reply(item) }
+            if let menu = ctx.arg("menu", as: NSMenu.self) {
+                for mi in CtxMenu.build([item]).items { mi.menu?.removeItem(mi); menu.addItem(mi) }
+            }
+        }
+        // sshpresets.js `editSshConfig(file)`: args `path` (nil = ~/.ssh/config), or `host`'s file.
+        a.register("ssh-config-edit") { ctx in
+            SSHConfigEditor.open(ctx.window, file: ctx.arg("path", as: String.self) ?? ctx.host?.configFile)
+        }
+        // addserver.js `removeSshConfigHost`: delete or comment out `host`'s block in its file.
+        // folders.js migrateKubeHostKeys — kube-ui calls it as cluster rows are drawn.
+        a.register("hosts-migrate-kube-keys") { ctx in
+            KubeHostKeys.migrate(ctx.arg("hosts", as: [JSON].self) ?? [])
+        }
+        a.register("ssh-config-remove-host") { ctx in
+            guard let h = ctx.host else { return }
+            Task { @MainActor in await SSHConfigEditor.removeHost(h, window: ctx.window) }
         }
 
         FolderDialogs.install()

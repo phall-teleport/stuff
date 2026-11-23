@@ -47,12 +47,38 @@ private struct AddTabButton: View {
         .onHover { hover.on = $0 }
         .help("New session or local shell (⌘N)")
         .tourAnchor("tab-add")
-        .contextMenu {
-            Button("New session…  ⌘N") { Actions.shared.perform("new-session", window: window) }
-            Button("Quick connect…  ⌘⌥C") { Actions.shared.perform("quick-connect", window: window) }
-            Button("New local shell  ⌘T") { Actions.shared.perform("new-local", window: window) }
-        }
+        // Right-click goes straight to the address box, skipping the picker
+        // for a host that was never in it; an AI assistant opens on the right
+        // of the tab in use.
+        .overlay(SessRightClickMenu { [weak window] in
+            let m = NSMenu()
+            m.sessAdd("New session…", key: "⌘N") { Actions.shared.perform("new-session", window: window) }
+            m.sessAdd("Quick connect…", key: "⌘⌥C") { Actions.shared.perform("quick-connect", window: window) }
+            m.sessAdd("New local shell", key: "⌘T") { Actions.shared.perform("new-local", window: window) }
+            if Actions.shared.isRegistered("ai-menu") {
+                m.addItem(.separator())
+                Actions.shared.perform("ai-menu", window: window, args: ["menu": m])
+            }
+            return m
+        })
     }
+}
+
+/// A transparent layer that passes clicks through and answers right-clicks
+/// with an AppKit menu (for menus other owners append NSMenu items to).
+struct SessRightClickMenu: NSViewRepresentable {
+    let build: () -> NSMenu
+    final class V: NSView {
+        var build: (() -> NSMenu)?
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let e = NSApp.currentEvent else { return nil }
+            let right = e.type == .rightMouseDown || (e.type == .leftMouseDown && e.modifierFlags.contains(.control))
+            return right ? super.hitTest(point) : nil
+        }
+        override func menu(for event: NSEvent) -> NSMenu? { MainActor.assumeIsolated { build?() } }
+    }
+    func makeNSView(context: Context) -> V { let v = V(); v.build = build; return v }
+    func updateNSView(_ v: V, context: Context) { v.build = build }
 }
 
 /// One tab: connection dot, who and where, what it is doing, close.

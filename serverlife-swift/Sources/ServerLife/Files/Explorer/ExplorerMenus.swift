@@ -82,6 +82,7 @@ extension ExplorerModel {
                 guard let self else { return }
                 Task {
                     let urls = await Modal.openFiles(self.window)
+                    if !urls.isEmpty, self.isKube, let d = targetDir { await XPKube.upload(self, urls.map(\.path), d); return }
                     if !urls.isEmpty { await XPTransfer.uploadTo(self.connId, urls.map(\.path), targetDir, window: self.window) }
                 }
             })
@@ -89,6 +90,7 @@ extension ExplorerModel {
                 guard let self else { return }
                 Task {
                     let urls = await Modal.openFiles(self.window, directories: true, files: false)
+                    if !urls.isEmpty, self.isKube, let d = targetDir { await XPKube.upload(self, urls.map(\.path), d); return }
                     if !urls.isEmpty { await XPTransfer.uploadTo(self.connId, urls.map(\.path), targetDir, window: self.window) }
                 }
             })

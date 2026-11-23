@@ -21,5 +21,17 @@ enum TeleportServiceFeature {
         Actions.shared.register("inventory-refresh") { _ in
             Task { await Inventory.shared.refresh() }
         }
+
+        // VNet per cluster: vnet-start, vnet-stop, vnet-log, vnet-status, vnet-menu.
+        VnetActions.install()
+
+        // Query: the tsh variables a run for this proxy/home gets (args
+        // `proxy`, `home`; reply [String: String]) — for anyone starting tsh
+        // outside Teleport.run (terminal tabs, Connections).
+        Actions.shared.register("tsh-env-for") { ctx in
+            let proxy = ctx.arg("proxy", as: String.self) ?? ctx.host?.proxy
+            let home = ctx.arg("home", as: String.self) ?? ctx.host?.home
+            ctx.arg("reply", as: ((Any?) -> Void).self)?(TshEnv.vars(home: home, proxy: proxy))
+        }
     }
 }

@@ -14,21 +14,54 @@ enum SBMenus {
     /// clicked in; `folder` the folder, when it was clicked inside one.
     static func hostMenu(_ host: Host, groupKey: String? = nil, folder: HostFolder? = nil, window: WindowModel?) -> [CtxItem] {
         let w = window
+        let sw0 = w?.feature(SidebarWindow.self)
         if host.isRequestableRow {
+            // Either kind of row — a watched host whose access lapsed, or a
+            // node the cluster's requestable list shows — can be watched or
+            // unwatched from here.
+            let watched = HostWatch.isWatched(host)
+            // MFA can be marked ahead of the grant, under the id the node will
+            // carry once access lands.
+            var mfaHostId = ""
+            let rid = host.extra["resourceId"]?.string?.nilIfEmpty
+                ?? ((host.cluster ?? "").isEmpty || (host.uuid ?? "").isEmpty ? "" : "/\(host.cluster!)/node/\(host.uuid!)")
+            if (host.extra["kind"]?.string ?? "node") == "node", !rid.isEmpty, let uuid = host.uuid?.nilIfEmpty {
+                mfaHostId = Teleport.inventoryNodeIds([(id: rid, cluster: host.cluster ?? "", uuid: uuid)], home: host.home)[rid] ?? ""
+            }
             var items: [CtxItem] = [
                 .heading(host.name),
-                CtxItem("Requestable since \(HostWatch.goneFor(host.requestableSince ?? nowMs())) ago", disabled: true),
+                host.requestableSince != nil
+                    ? CtxItem("Requestable since \(HostWatch.goneFor(host.requestableSince!)) ago", disabled: true)
+                    : CtxItem("Requestable \u{2014} your roles do not reach it yet", disabled: true),
                 CtxItem("Request access to it…", icon: "\u{2691}", title: "Starts a request with this node already chosen") {
                     SBActions.requestAccessFor(host, window: w)
                 },
             ]
+            if let b = bulkRequestItem(sw0, window: w) { items.append(b) }
+            if !mfaHostId.isEmpty {
+                let on = HostPrefs.isMfaHost(mfaHostId)
+                items.append(CtxItem(on ? "Forget that this needs MFA" : "Mark as needing MFA once granted", icon: "\u{26BF}",
+                                     title: on ? "Marked to need MFA once granted \u{2014} click to forget"
+                                        : "So it connects straight to tsh the moment access lands, with no failed attempt first") {
+                    var h = Host(type: Host.teleport, id: mfaHostId, name: host.name)
+                    h.cluster = host.cluster
+                    HostPrefs.setMfaHost(h, !on)
+                })
+            }
+            if watched { items.append(watchProfileItem(host, window: w)) }
             if let uuid = host.uuid {
                 items.append(CtxItem("Copy its node id") { Clipboard.write(uuid); SBActions.status("Copied " + uuid) })
             }
-            if let wk = host.watchKey {
-                items += [.sep, CtxItem("Stop watching it", icon: "\u{2326}") {
-                    HostWatch.forget(wk); SBActions.status("Forgot \(host.name)")
-                }]
+            items.append(.sep)
+            if watched {
+                items.append(CtxItem("Stop watching it", icon: "\u{2326}") {
+                    HostWatch.forget(host.watchKey ?? FolderModel.hostKey(host)); SBActions.status("Stopped watching \(host.name)")
+                })
+            } else {
+                items.append(CtxItem("Tell me if this host disappears", icon: "\u{25CB}",
+                                     title: "Keeps its node id and last known details, marks it with the bell, and says so if it leaves the cluster") {
+                    HostWatch.toggleWatch(host, SB2.realGroupKey(groupKey, for: host))
+                })
             }
             return items
         }
@@ -38,10 +71,12 @@ enum SBMenus {
                 CtxItem(host.watchMissing
                         ? "Gone \(HostWatch.goneFor(host.watchMissingSince ?? 0)) — last seen \(HostWatch.goneFor(host.watchLastSeen ?? 0)) ago"
                         : "Not checked — last confirmed \(HostWatch.goneFor(host.watchLastSeen ?? 0)) ago", disabled: true),
+                watchProfileItem(host, window: w),
             ]
             if let uuid = host.uuid {
                 items.append(CtxItem("Copy its node id") { Clipboard.write(uuid); SBActions.status("Copied " + uuid) })
             }
+            if let b = bulkRequestItem(sw0, window: w) { items.append(b) }
             items += [.sep, CtxItem("Stop watching and forget it", icon: "\u{2326}", title: "Removes the row and the record kept of it") {
                 HostWatch.forget(host.watchKey ?? FolderModel.hostKey(host))
                 SBActions.status("Forgot \(host.name)")
@@ -81,8 +116,8 @@ enum SBMenus {
         ]
         if canSplit {
             items += [
-                CtxItem("Open beside current (split right)", icon: "\u{216E}") { SBActions.splitWith(host, login: logins.first, dir: "right", window: w) },
-                CtxItem("Open below current (split down)", icon: "\u{2017}") { SBActions.splitWith(host, login: logins.first, dir: "down", window: w) },
+                CtxItem("Open beside current (split right)", icon: "\u{216E}") { SBActions.splitWith(host, login: preferred ?? logins.first, dir: "right", window: w) },
+                CtxItem("Open below current (split down)", icon: "\u{2017}") { SBActions.splitWith(host, login: preferred ?? logins.first, dir: "down", window: w) },
             ]
         }
         var other: [CtxItem] = []
@@ -105,6 +140,7 @@ enum SBMenus {
                              title: "Always connect to this host as one account, whatever last worked") {
             SBDialogs.preferredUser(host, window: w)
         })
+        items.append(startupCommandItem(host, window: w))
         items.append(openFilesMenu(host))
         items.append(tmuxMenu(host, window: w))
         if let fm = folderMenu(host, groupKey: groupKey, window: w) { items.append(fm) }
@@ -146,7 +182,12 @@ enum SBMenus {
                                 : "Keeps its node id and last known details, and says so if it stops being listed") {
             HostWatch.toggleWatch(host, SB2.realGroupKey(groupKey, for: host))
         })
+        // Only once a look has been saved for it, from Pane style on one of its panes.
+        if let st = hostStyleItem(host.id, window: w) { items.append(st) }
+        items.append(askAiItem(host, window: w))
+        if let b = bulkRequestItem(sw, window: w) { items.append(b) }
         items.append(.sep)
+        if let m = multiexecSelectedItem(sw, window: w) { items.append(m) }
         let ticked = sw?.checkedHosts.contains(host.id) ?? false
         items.append(CtxItem(ticked ? "Unselect for multi-exec" : "Select for multi-exec", icon: ticked ? "\u{2611}" : "\u{2610}") {
             sw?.toggleChecked(host.id)
@@ -158,10 +199,12 @@ enum SBMenus {
                 CtxItem(mfa ? "Forget that this needs MFA" : "Remember as an MFA server", icon: "\u{26BF}") { HostPrefs.setMfaHost(host, !mfa) },
             ]
         }
-        items.append(CtxItem("Open with X11 forwarding", icon: "\u{2317}") { Task { await SBActions.openX11(host, login: logins.first, window: w) } })
+        // X11 is one of the SSH options now, with forwards, a jump host and
+        // Teleport's reason and invitations.
+        items.append(sshOptionsItem(host, login: logins.first, window: w))
         items.append(agentForwardMenu(host))
         items.append(.sep)
-        items.append(CtxItem("Run a command…", icon: "\u{25B8}") { SBHostActions.openRunCommand(host, login: logins.first, window: w) })
+        items.append(CtxItem("Run a command…", icon: "\u{25B8}") { SBHostActions.openRunCommand(host, login: preferred ?? logins.first, logins: logins, window: w) })
         if isTp {
             items.append(CtxItem("Latency to this node…", icon: "\u{21C4}",
                                  title: "tsh latency ssh — round trip to the proxy and from the proxy to the node, live") {
@@ -196,7 +239,12 @@ enum SBMenus {
         }
         items.append(CtxItem("Forget host key…", icon: "\u{26BF}") {
             let name = isTp ? "\(host.name).\(host.cluster ?? "")" : (host.hostname?.nilIfEmpty ?? host.alias ?? "")
-            Actions.shared.perform("forget-host-key", window: w, host: host, args: ["hostname": name])
+            var args: [String: Any] = ["hostname": name]
+            if !isTp {
+                if let a = host.alias { args["alias"] = a }
+                if let f = host.configFile { args["configFile"] = f }
+            }
+            Actions.shared.perform("forget-host-key", window: w, host: host, args: args)
         })
         items.append(.sep)
         let hidden = HostPrefs.isHidden(host)
@@ -211,6 +259,8 @@ enum SBMenus {
                 Actions.shared.perform("remove-managed-host", window: w, args: ["alias": alias])
             })
         }
+        items += sshSourceItems(host, window: w)
+        if let it = installTeleportItem(host, window: w) { items.append(it) }
         items.append(CtxItem("Copy ssh command") {
             let cmd = isTp ? "tsh ssh \(logins.first.map { $0 + "@" } ?? "")\(host.name)" : "ssh \(host.alias ?? host.name)"
             Clipboard.write(cmd)
@@ -437,6 +487,7 @@ enum SBMenus {
                 HostPrefs.setShowRequestable(key, !showing)
             })
             items += ClusterMarks.menu(p, window: window)
+            if let d = SBGroupMenuExtra.decodeItem(p, window: window) { items.append(d) }
             items.append(CtxItem("Status (tsh status)…", title: "Roles, logins, expiry and the certificate extensions, as tsh prints them") {
                 Actions.shared.perform("tsh-status", window: window, args: ["profileKey": p.key])
             })
@@ -445,6 +496,7 @@ enum SBMenus {
             })
         }
         if isSsh {
+            items += SBGroupMenuExtra.sshConfigItems(key, window: window)
             items.append(CtxItem("Re-read the config files", icon: "\u{21BB}") { SBActions.refreshSshConfigs(key) })
             items.append(CtxItem("SSH config files…", icon: "\u{2630}", title: "Read hosts from more than one config file") {
                 SBDialogs.sshConfigFiles(window: window)
@@ -469,7 +521,7 @@ enum SBMenus {
         if !folderKey.isEmpty {
             items.append(.sep)
             items.append(CtxItem("Open this list in a pane", icon: "\u{25A6}",
-                                 title: "The hosts of this group, with room: folders on or off, rows or tiles", submenu: [
+                                 title: "The hosts of this group, with room: folders on or off, rows, tiles or a table — the arrow for a new tab, beside or below", submenu: [
                 CtxItem("In a new tab") { Actions.shared.perform("hosts-pane", window: window, args: ["groupKey": folderKey]) },
                 CtxItem("Beside this pane") { Actions.shared.perform("hosts-pane", window: window, args: ["groupKey": folderKey, "split": "right"]) },
                 CtxItem("Below this pane") { Actions.shared.perform("hosts-pane", window: window, args: ["groupKey": folderKey, "split": "down"]) },
@@ -503,6 +555,7 @@ enum SBMenus {
                 })
             }
             items.append(CtxItem("Copy login cmd", icon: "\u{29C9}") { SBActions.copyLoginCommand(p) })
+            items.append(SBGroupMenuExtra.tshEnvItem(p, window: window))
             if !p.expired {
                 items.append(CtxItem("Active sessions\u{2026}", icon: "\u{21C4}",
                                      title: "Who is in what right now \u{2014} and watch, join or moderate the SSH and Kubernetes ones") {
@@ -518,6 +571,7 @@ enum SBMenus {
                     Actions.shared.perform("tsh-make-active", window: window, args: ["profileKey": p.key])
                 })
             }
+            items += SBGroupMenuExtra.vnetItems(p, window: window)
             if let w = window, let item = SidebarHooks.clusterSwitchMenuItem?(p, w) { items.append(item) }
             let supported = inv.beamsSupported(p.proxy)
             let marked = inv.markedAsBeams(p.proxy)

@@ -90,3 +90,87 @@ import Foundation
     let t = await Proc.run("/bin/sleep", ["10"], timeout: 0.5)
     #expect(t.timedOut)
 }
+
+// MARK: - 0.39 shared helpers (csv.js, textdiff.js, util.js, code editor)
+
+@Test func csvQuotesOnlyWhenNeeded() {
+    let rows: [[String: Any]] = [
+        ["name": "web-1", "n": 3, "note": "a, b"],
+        ["name": "say \"hi\"", "n": 1.5, "note": NSNull()],
+        ["name": "two\nlines", "ok": true],
+    ]
+    let s = toCsv(rows, columns: [("name", "Name"), ("n", nil), ("note", "Note"), ("ok", "OK")])
+    #expect(s == "Name,n,Note,OK\r\nweb-1,3,\"a, b\",\r\n\"say \"\"hi\"\"\",1.5,,\r\n\"two\nlines\",,,true\r\n")
+    let j = toCsv([JSON.object(["a": .number(2), "b": .string("x")])], columns: [("a", nil), ("b", nil)])
+    #expect(j == "a,b\r\n2,x\r\n")
+}
+
+@Test func diffLinesLCS() {
+    let d = diffLines("a\nb\nc", "a\nc\nd")
+    #expect(d == [DiffLine(type: .same, line: "a"), DiffLine(type: .remove, line: "b"),
+                  DiffLine(type: .same, line: "c"), DiffLine(type: .add, line: "d")])
+    #expect(diffLines("", "x") == [DiffLine(type: .add, line: "x")])
+    #expect(diffLines(nil, "") == [])
+    #expect(diffLines("x", "x") == [DiffLine(type: .same, line: "x")])
+}
+
+@Test func dateTimeTzReadsLikeAClock() {
+    let tz = TimeZone(identifier: "America/Los_Angeles")!
+    var c = DateComponents(); c.year = 2024; c.month = 3; c.day = 5; c.hour = 15; c.minute = 7
+    var cal = Calendar(identifier: .gregorian); cal.timeZone = tz
+    let d = cal.date(from: c)!
+    let ms = d.timeIntervalSince1970 * 1000
+    #expect(Fmt.dateTimeTz(ms: ms, now: d, timeZone: tz) == "Mar 5, 3:07 PM PST")
+    #expect(Fmt.dateTimeTz(ms: ms, now: d.addingTimeInterval(400 * 86400), timeZone: tz) == "Mar 5, 2024, 3:07 PM PST")
+    #expect(Fmt.dateTimeTz(ms: nil) == "")
+}
+
+private func tokens(_ text: String, _ lang: CodeLanguage) -> [(String, CodeToken)] {
+    let ns = text as NSString
+    return CodeSyntax.spans(text, lang).map { (ns.substring(with: $0.range), $0.token) }
+}
+
+@Test func sshConfigTokens() {
+    let t = tokens("# c\nHost web-* !x\n  HostName=10.0.0.1\n  ForwardAgnet yes\n  IdentityFile \"a b\" # x\n", .sshConfig)
+    let want: [(String, CodeToken)] = [
+        ("# c", .comment), ("Host", .keyword), ("web-*", .string), ("!x", .string),
+        ("HostName=", .key), ("10.0.0.1", .string), ("ForwardAgnet", .invalid), ("yes", .string),
+        ("IdentityFile", .key), ("\"a b\"", .string), ("# x", .comment),
+    ]
+    #expect(t.count == want.count)
+    for (a, b) in zip(t, want) { #expect(a.0 == b.0 && a.1 == b.1) }
+}
+
+@Test func yamlTokens() {
+    let src = "# top\nkind: Pod\nmetadata:\n  name: \"web\" # c\n  labels: {app: web}\nlist:\n  - a\n  - key: &x v\nrun: |\n  echo key: no\nafter: *x\n---\n"
+    let t = tokens(src, .yaml)
+    func has(_ s: String, _ k: CodeToken) -> Bool { t.contains { $0.0 == s && $0.1 == k } }
+    #expect(has("# top", .comment))
+    #expect(has("kind", .key) && has("metadata", .key) && has("name", .key) && has("after", .key))
+    #expect(has("\"web\"", .string) && has("# c", .comment))
+    #expect(has("app", .key) && has("{", .punctuation) && has("}", .punctuation))
+    #expect(has("-", .punctuation) && has("key", .key) && has("&x", .label) && has("*x", .label))
+    #expect(has("|", .special))
+    // A block of text is text: "echo key: no" is not a key.
+    #expect(!has("echo key", .key))
+    #expect(has("---", .meta))
+}
+
+@MainActor @Test func broadcastActionsReachEveryListener() {
+    var hits = 0
+    Actions.shared.register("app-resume") { _ in hits += 1 }
+    Actions.shared.register("app-resume") { _ in hits += 10 }
+    Actions.shared.perform("app-resume")
+    #expect(hits == 11)
+}
+
+@MainActor @Test func bundledFontsRegister() {
+    BundledFonts.registerAll()
+    #expect(BundledFonts.list.count == 51)
+    // Every face in the list has its file, and registers under some family.
+    let missing = BundledFonts.list.filter { BundledFonts.registeredFamily[$0.family] == nil }.map(\.family)
+    #expect(missing.isEmpty, "not registered: \(missing)")
+    #expect(BundledFonts.font(family: "JetBrains Mono", size: 12) != nil)
+    let mismatched = BundledFonts.registeredFamily.filter { $0.key != $0.value }
+    print("bundled fonts whose own family differs:", mismatched)
+}

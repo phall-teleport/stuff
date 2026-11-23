@@ -38,6 +38,7 @@ enum ExplorerFeature {
         MiscHooks.settingsSaved.append { _, _ in XPFiles.settingsChanged() }
         XPSessionsGlue.install()
         XPS3.install()
+        XPKube.install()
         XPFiles.start()
     }
 }

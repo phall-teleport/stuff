@@ -187,10 +187,6 @@ final class SerialPortHandle: @unchecked Sendable {
     private let queue = DispatchQueue(label: "serial.read")
     private var source: DispatchSourceRead?
     private let lock = NSLock()
-    /// Held for a whole write and around closing the descriptor, so two
-    /// writes never interleave and nothing is written to a closed (or
-    /// reused) descriptor.
-    private let ioLock = NSLock()
     private var closed = false
     private var saved = termios()
 
@@ -283,14 +279,13 @@ final class SerialPortHandle: @unchecked Sendable {
         closed = true
         lock.unlock()
         source?.cancel()
-        ioLock.lock(); Darwin.close(fd); ioLock.unlock()
+        Darwin.close(fd)
         onEnd?(error)
     }
 
     var isOpen: Bool { lock.lock(); defer { lock.unlock() }; return !closed }
 
     func write(_ data: Data) {
-        ioLock.lock(); defer { ioLock.unlock() }
         guard isOpen else { return }
         data.withUnsafeBytes { raw in
             guard var p = raw.baseAddress else { return }
@@ -302,7 +297,7 @@ final class SerialPortHandle: @unchecked Sendable {
                 else if n < 0 && (errno == EAGAIN || errno == EINTR) {
                     // Flow control is holding us back; wait for the line, briefly.
                     spins += 1
-                    if spins > 2000 || !isOpen { break }
+                    if spins > 2000 { break }
                     usleep(1000)
                 } else { break }
             }
@@ -348,10 +343,8 @@ final class SerialPortHandle: @unchecked Sendable {
         closed = true
         lock.unlock()
         source?.cancel()
-        ioLock.lock()
         var t = saved
         _ = tcsetattr(fd, TCSANOW, &t)
         Darwin.close(fd)
-        ioLock.unlock()
     }
 }

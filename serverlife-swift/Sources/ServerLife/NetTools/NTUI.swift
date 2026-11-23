@@ -46,7 +46,8 @@ struct NTBadge: View {
             .font(.system(size: 10.5, design: .monospaced))
             .lineLimit(1)
             .padding(.horizontal, 7).padding(.vertical, 2)
-            .foregroundStyle(kind == "name" ? Color.white : kind == "ok" ? p.green : kind == "warn" ? p.amber : p.textDim)
+            .foregroundStyle(kind == "name" ? Color.white : kind == "ok" ? p.green : kind == "warn" ? p.amber
+                             : kind == "bad" ? p.red : kind == "role" ? p.accent : kind == "perm" ? p.green : p.textDim)
             .background(RoundedRectangle(cornerRadius: 3).fill(kind == "name" ? p.accentDim : p.panel3))
             .textSelection(.enabled)
     }

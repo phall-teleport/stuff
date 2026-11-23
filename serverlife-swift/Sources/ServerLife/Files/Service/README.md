@@ -78,19 +78,34 @@ One SFTP channel and one `TransferQueue` per connection id.
   `rename`, `chmod(mode:)`, `stat`, `remove(connId, [FileEntry])`,
   `readFile(connId, path, maxBytes:)` → String, `writeFile`, `search`.
 - `xfer:*`: `upload(connId, localPaths:, remoteDir:)` / `download(connId, entries:,
-  localDir:)` → job id; `crossPlan(src, dest)` → `CrossTransfer.Route`;
-  `cross(src, entries:, to:, destDir:, mode:)` → `CrossTransfer.Started`;
+  localDir:)` → job id **at once**: the job appears as `status "planning"` (the
+  panel says "reading the file list…", offers Cancel and no Retry while
+  `fileCount == 0`) while the tree is walked in the background, then turns
+  `queued`, or `error` with the walk's own message ("Could not read the file
+  list" when it had none); a cancel mid-walk stops at the next directory.
+  `crossRoute(src, dest) async` → `CrossTransfer.Route` (`xfer:crossPlan`: asks
+  tsh for its version; a same-cluster pair is relayed below tsh 18 — tsh 17
+  "copied" server-to-server onto this machine and exited 0). `crossPlan(src, dest)`
+  is the same without waiting, from the version the last check saw (warmed when a
+  Teleport connection opens its SFTP channel); prefer `await crossRoute`.
+  `cross(src, entries:, to:, destDir:, mode:)` → `CrossTransfer.Started` (always
+  re-checks the route; `mode: "direct"` is honoured only where the route allows it);
   `setLimit(kbPerSecond:)` (stores `transferLimitKb`, applies to every queue).
   Queue controls are on the queue: `cancel pause resume pauseAll resumeAll retry
   move(id, ±1) clearFinished`.
 - `sync:*`: `syncPlan(connId, SyncPlanner.Request)` → `SyncPlanner.Plan`;
   `syncApply(connId, plan, actions:)` → `SyncPlanner.ApplyResult`.
+- `diskSpace(connId, dir) async throws -> DiskSpace?` (`conn:diskSpace`): one
+  `df -Pk -- 'dir'` (8 s); nil — never an error — under quietRemote, on a
+  per-session-MFA host (tsh not by necessity), when not connected, or when `df`
+  printed nothing parseable. `parseDf(stdout)` is pure. The explorer's footer
+  caches per folder for 30 s and skips S3/kube and quietRemote (explorer.js).
 - `onJobFinished` — every finished job; defaults to recording downloads.
 
 ## TransferQueue (TransferQueue.swift, engine in Transfers.swift)
 
 `jobs: [TransferJobView]` — `id, kind ("upload"/"download"/"cross"), label, status
-("queued"/"running"/"paused"/"done"/"error"/"cancelled"), paused, resumed,
+("planning"/"queued"/"running"/"paused"/"done"/"error"/"cancelled"), paused, resumed,
 totalBytes, doneBytes, fileIndex, fileCount, currentFile, phase ("the server is
 closing the file", "setting permissions", "writing out the file"), error, rate
 (B/s, sampled every 400 ms), startedAt, endedAt, limit`. `onUpdate`, `onFinished`
@@ -103,10 +118,14 @@ also holds jobs added later; `retry` resumes from the local file's size (downloa
 or the server's (upload) — only on retry; `move` only among queued jobs; the speed
 limit is one sliding-window allowance per queue, serialised so 16 chunks cannot
 each claim it; uploads restore mode and mtime. Custom jobs (`TransferJobSpec.customRun`)
-report through `TransferRunContext`.
+report through `TransferRunContext`. Placeholders: `addPlanning(kind:label:)` →
+`(id, isCancelled)`, then `finishPlanning(id, label:items:dirs:roots:)` (held if
+`pauseAll` is in force) or `failPlanning(id, message)`; both no-ops unless the job
+is still planning. `cancel` cancels a planning job outright. `isBusy` counts planning.
 
 `Transfers.uploadFile/downloadFile/planUpload/planDownload/parallelChunks` are usable
-on their own (relay, watches and S3-to-server use them).
+on their own (`planUpload/planDownload(…, isCancelled:)` throw `Transfers.PlanCancelled`
+at a directory boundary once it turns true) (relay, watches and S3-to-server use them).
 
 ## SFTPClient (SFTPClient.swift)
 
@@ -164,7 +183,8 @@ the dialog (ported from rsyncsync.js, tested as tests/rsync.test.mjs was):
 
 ## LocalFS (LocalFS.swift)
 
-`listing(dir)` (`local:list`), `list`, `entry`, `info(path)` → `Info` (target, ctime,
+`diskSpace(path) async throws -> DiskSpace` (`local:diskSpace`; statfs, `f_bavail`
+not `f_bfree` — root's reserve is not writable space), `listing(dir)` (`local:list`), `list`, `entry`, `info(path)` → `Info` (target, ctime,
 birthtime, immediate files/dirs), `treeSize(path)` (400k / 20 s, `truncated`),
 `ensureDir` (`local:mkdir`), `ensureParentDir`, `remove(paths)`, `removeEntry`,
 `rename`, `parentOf`, `home`, `shortcuts()`, `existingDirs(paths)`, `reveal`, `open`,
@@ -178,6 +198,13 @@ binary refusal), `writeText`, `stat/lstat`, `userName/groupName`.
 `plan(job)` (pure). Rows live in the store's `downloads` array in store.js's shape.
 
 ## Not done / notes
+
+- 0.39 sync: `local.js`'s terminal half (tsh tabs' tools env, `env:` for a launched
+  program) belongs to whoever owns local terminals (connections/sessions), not here.
+  The SFTP profile type (0.22) needs nothing service-side: it is an ssh connection
+  (`type` "ssh", plain-SSH relay route) opened files-only by the connections/hosts owners.
+- `Connection.diskSpace` exists in connections.js; it is ported here as
+  `FilesService.diskSpace` over `FilesBridge.execResult` (ConnectionManager.execResult).
 
 - The store side of downloads uses small `fileprivate` stand-ins in
   DownloadHistory.swift until the data owner publishes `addDownload` & co.; switch

@@ -56,10 +56,35 @@ final class RecordingsModel: ObservableObject {
     ]
 
     var liveProfiles: [TeleportProfile] { Inventory.shared.liveProfiles }
+    /// The recordings list offers every known profile, not just the ones
+    /// still logged in — a lapsed certificate is one "Login" away.
+    var allProfiles: [TeleportProfile] { Inventory.shared.profiles }
+
+    /// A plain YYYY-MM-DD (UTC, as `toISOString`), the only format tsh accepts.
+    static func dateDaysAgo(_ days: Int, now: Double = nowMs()) -> String {
+        String(TPText.isoString(ms: now - Double(days) * 86_400_000).prefix(10))
+    }
+
+    /// The recordings list's range: the two dates are the source of truth,
+    /// a preset only fills them in. A day by default, closest to tsh's own
+    /// no-range default of the last 24 hours.
+    @Published var fromDate = RecordingsModel.dateDaysAgo(1)
+    @Published var toDate = RecordingsModel.dateDaysAgo(0)
+
+    func setRange(days: Int) {
+        fromDate = Self.dateDaysAgo(days)
+        toDate = Self.dateDaysAgo(0)
+        applyDates()
+    }
+
+    func applyDates() {
+        recordings = []; loaded = false
+        loadRecordings()
+    }
 
     /// `currentKey`: the profile chosen, falling back to the first.
-    func currentProfile() -> TeleportProfile? {
-        let ps = liveProfiles
+    func currentProfile(_ list: [TeleportProfile]? = nil) -> TeleportProfile? {
+        let ps = list ?? liveProfiles
         return ps.first { $0.proxy == proxy && $0.homeDir == (home ?? $0.homeDir) } ?? ps.first
     }
 
@@ -77,13 +102,16 @@ final class RecordingsModel: ObservableObject {
     }
 
     func loadRecordings() {
-        guard let p = currentProfile() else { return }
+        guard let p = currentProfile(allProfiles) else { return }
         proxy = p.proxy; home = p.homeDir
-        loading = true; loadError = nil
-        let px = p.proxy, h = p.homeDir
+        loadError = nil
+        // An expired certificate: the view offers Login instead.
+        if p.expired { loading = false; return }
+        loading = true
+        let px = p.proxy, h = p.homeDir, from = fromDate, to = toDate
         Task { @MainActor in
-            let res = await Teleport.listRecordings(proxy: px, fromUtc: nil, toUtc: nil, home: h)
-            guard px == self.proxy else { return }
+            let res = await Teleport.listRecordings(proxy: px, fromUtc: from, toUtc: to, home: h)
+            guard px == self.proxy, from == self.fromDate, to == self.toDate else { return }
             self.loading = false
             if res.ok { self.recordings = res.items; self.loaded = true } else { self.loadError = res.error ?? "Could not list recordings" }
             self.loadNotes()
@@ -111,12 +139,14 @@ final class RecordingsModel: ObservableObject {
         var durationMs: Double?
         var playable: Bool
         var interactive: Bool
+        var proto = "ssh"
         var fromNote = false
         var id: String { sid }
 
         init(_ r: Recording) {
             sid = r.sid; cluster = r.cluster; proxy = r.proxy; node = r.node; user = r.user; login = r.login
             startedAt = r.startedAt; durationMs = r.durationMs; playable = r.playable; interactive = r.interactive
+            proto = r.proto
         }
 
         init(note n: JSON, proxy px: String?) {
@@ -402,18 +432,65 @@ private struct HistoryTab: View {
 private struct ProfileChooser: View {
     @ObservedObject var m: RecordingsModel
     var reload = true
+    /// Every profile, expired ones marked (the recordings list).
+    var all = false
 
     var body: some View {
-        let ps = m.liveProfiles
-        let cur = m.currentProfile()
+        let ps = all ? m.allProfiles : m.liveProfiles
+        let cur = m.currentProfile(ps)
         TUIField(label: "Cluster") {
             Picker("", selection: Binding(get: { cur?.key ?? "" }, set: { k in
                 if let p = ps.first(where: { $0.key == k }) {
                     if reload { m.choose(p) } else { m.proxy = p.proxy; m.home = p.homeDir }
                 }
             })) {
-                ForEach(ps, id: \.key) { p in Text(TUI.name(p) + (p.homeName.isEmpty ? "" : " · " + p.homeName)).tag(p.key) }
+                ForEach(ps, id: \.key) { p in
+                    Text(TUI.name(p) + (p.homeName.isEmpty ? "" : " · " + p.homeName) + (p.expired ? "  (expired)" : "")).tag(p.key)
+                }
             }.labelsHidden().frame(maxWidth: 360, alignment: .leading)
+        }
+    }
+}
+
+/// Range / From / To above the recordings list.
+private struct RangeFields: View {
+    @ObservedObject var m: RecordingsModel
+
+    private static let fmt: DateFormatter = {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "UTC")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private func binding(_ kp: ReferenceWritableKeyPath<RecordingsModel, String>) -> Binding<Date> {
+        Binding(get: { Self.fmt.date(from: m[keyPath: kp]) ?? Date() },
+                set: { d in
+                    let v = Self.fmt.string(from: d)
+                    if v != m[keyPath: kp] { m[keyPath: kp] = v; m.applyDates() }
+                })
+    }
+
+    var body: some View {
+        let today = Self.fmt.date(from: RecordingsModel.dateDaysAgo(0)) ?? Date()
+        let to = Self.fmt.date(from: m.toDate) ?? today
+        HStack(alignment: .bottom, spacing: 12) {
+            TUIField(label: "Range") {
+                Picker("", selection: Binding(get: { 0 }, set: { d in if d > 0 { m.setRange(days: d) } })) {
+                    Text("Custom range…").tag(0)
+                    ForEach(RecordingsModel.ranges, id: \.days) { Text($0.label).tag($0.days) }
+                }.labelsHidden().frame(width: 190)
+            }
+            TUIField(label: "From") {
+                DatePicker("", selection: binding(\.fromDate), in: ...to, displayedComponents: .date)
+                    .labelsHidden().environment(\.timeZone, TimeZone(identifier: "UTC")!)
+            }
+            TUIField(label: "To") {
+                DatePicker("", selection: binding(\.toDate), in: ...today, displayedComponents: .date)
+                    .labelsHidden().environment(\.timeZone, TimeZone(identifier: "UTC")!)
+            }
         }
     }
 }
@@ -423,12 +500,27 @@ private struct RecordingsTab: View {
 
     var body: some View {
         let pal = Theme.shared.p
-        if m.liveProfiles.isEmpty {
-            TUIEmpty(lines: ["No active Teleport profile. Log in first."])
+        if m.allProfiles.isEmpty {
+            TUIEmpty(lines: ["No Teleport profile. Log in first."])
         } else {
             VStack(alignment: .leading, spacing: 0) {
-                ProfileChooser(m: m)
-                if m.loading && !m.loaded {
+                HStack(alignment: .bottom, spacing: 12) {
+                    ProfileChooser(m: m, all: true)
+                    RangeFields(m: m)
+                }
+                if let cur = m.currentProfile(m.allProfiles), cur.expired {
+                    VStack(spacing: 8) {
+                        Text("\(TUI.name(cur))\u{2019}s certificate has expired — log in to view its recordings.")
+                            .font(.system(size: 12)).foregroundStyle(pal.muted)
+                        Button("Login") {
+                            Task {
+                                // A fresh certificate on the same proxy+home is
+                                // still found by currentProfile, so the choice stays.
+                                if await TeleportPanel.doLogin(cur, window: m.window) { m.applyDates() }
+                            }
+                        }.buttonStyle(.primary)
+                    }.frame(maxWidth: .infinity).padding(.vertical, 24)
+                } else if m.loading && !m.loaded {
                     TUIEmpty(lines: ["Loading recordings…"])
                 } else if let e = m.loadError {
                     TUIEmpty(lines: [e], error: true)
@@ -455,7 +547,7 @@ private struct RecordingsTab: View {
             }
             .foregroundStyle(pal.text)
             // Opened before the inventory had any profile: load once it has.
-            .task(id: m.liveProfiles.map(\.key)) {
+            .task(id: m.allProfiles.map { $0.key + ($0.expired ? "!" : "") }) {
                 if !m.loaded && !m.loading && m.loadError == nil { m.loadRecordings() }
             }
         }
@@ -475,6 +567,8 @@ private struct RecordingsTab: View {
                 HStack(spacing: 5) {
                     Text(r.node?.nilIfEmpty ?? "unknown node").font(.system(size: 12.5))
                     TUITag(text: r.fromNote ? "outside the range" : (r.interactive ? "interactive" : "exec"))
+                    // Only the rows that are not ssh say what they are.
+                    if !r.proto.isEmpty && r.proto != "ssh" { TUITag(text: r.proto) }
                     if !r.playable { TUITag(text: "not recorded", kind: .warn) }
                 }
                 Text(["\(r.user ?? "") \u{2192} \(r.login ?? "")", r.durationMs.map { Fmt.duration(ms: $0) } ?? "",

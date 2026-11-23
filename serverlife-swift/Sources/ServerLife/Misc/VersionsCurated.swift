@@ -214,7 +214,7 @@ extension VersionHistory {
                     .init(name: "Access requests", items: [
                         "Browse… lists everything tsh request search reports — servers, apps, databases, Kubernetes, desktops — by name and label, filterable as you type.",
                         "That is a different set from the sidebar on purpose: a request is for a resource you cannot see yet.",
-                        "Requests show node/a4232-monitoring instead of node/d68f45ed-…, with the raw id in the tooltip.",
+                        "Requests show node/web-3 instead of node/d68f45ed-…, with the raw id in the tooltip.",
                         "Requestable roles are offered as a checklist instead of typed from memory.",
                         "Save a set of resources, roles and reason against its cluster, and load it back from Saved… to raise again.",
                     ]),

@@ -16,6 +16,12 @@ enum NetDisplay {
     case teleport(WebAPIPing.Result)
     case local(LocalInfo)
     case hostFacts(HostFacts, label: String)
+    case sockets(SocketsResult, label: String?)
+    case cidr(CIDRResult)
+    case url(URLDecodeResult, file: String?)
+    case sshcert(SSHCertResult, file: String?)
+    case jwt(JWTResult, file: String?)
+    case svid(SVIDResult, file: String?)
 }
 
 // MARK: - Shared wording
@@ -48,9 +54,20 @@ enum NetWords {
             ("Serial", r.serialNumber),
             ("SHA-256", r.fingerprint256),
             ("Names", r.san.map { $0.replacingOccurrences(of: "DNS:", with: "").replacingOccurrences(of: ",\\s*", with: ", ", options: .regularExpression) }),
-            ("Chain", r.chain.count > 1 ? r.chain.enumerated().map { "\($0.offset): \($0.element.subject)  ← \($0.element.issuer)" }.joined(separator: "\n") : nil),
         ]
     }
+
+    /// The rest of the chain, past the leaf: each intermediate and the root.
+    static func chainSections(_ r: TLSResult) -> [(title: String, rows: [(String, String?)])] {
+        let rest = Array(r.chain.dropFirst())
+        return rest.enumerated().map { i, c in
+            (i == rest.count - 1 ? "Root" : "Intermediate \(i + 1)",
+             [("Subject", TLSResult.dn(c.subject)), ("Issuer", TLSResult.dn(c.issuer)), ("Valid to", c.validTo), ("SHA-256", c.fingerprint256)])
+        }
+    }
+
+    static let leafOnlyHint = "The server sent only the leaf certificate — no intermediates. That is fine when the client "
+        + "already trusts the issuer directly, and a likely cause of \"works in a browser, fails from curl/a script\" when it does not."
 }
 
 // MARK: - The view
@@ -64,7 +81,7 @@ struct NetResultView: View {
         VStack(alignment: .leading, spacing: 0) {
             switch display {
             case .text(let r):
-                if !r.command.isEmpty { NTCmd(text: r.command) }
+                NTCmdBlock(command: r.command)
                 NTPre(text: r.text.isEmpty ? "(no output)" : r.text)
                 if r.timedOut { NTHint(text: "Timed out before finishing.", color: p.amber).padding(.top, 6) }
 
@@ -86,10 +103,11 @@ struct NetResultView: View {
                 }
 
             case .dns(let r):
+                NTCmdBlock(command: r.command)
                 if r.records.isEmpty && r.reverse == nil { NTEmpty(text: "Nothing resolves for \(r.host).") }
                 ForEach(Array(r.records.enumerated()), id: \.offset) { _, rec in
                     VStack(alignment: .leading, spacing: 2) {
-                        NTHead(text: rec.type)
+                        NTHead(text: rec.type + (r.ttls[rec.type].map { "  ·  TTL \($0)s" } ?? ""))
                         ForEach(Array(rec.values.enumerated()), id: \.offset) { _, v in
                             Text(DNSResult.format(v)).font(.system(size: 11.5, design: .monospaced)).textSelection(.enabled)
                         }
@@ -101,10 +119,13 @@ struct NetResultView: View {
                         ForEach(rev, id: \.self) { Text($0).font(.system(size: 11.5, design: .monospaced)).textSelection(.enabled) }
                     }.padding(.bottom, 13)
                 }
-                if !r.servers.isEmpty { NTHint(text: "Resolvers: " + r.servers.joined(separator: ", ")).padding(.top, 10) }
+                if !r.servers.isEmpty {
+                    NTHint(text: (r.usingCustomServer ? "Queried via: " : "Resolvers: ") + r.servers.joined(separator: ", ")).padding(.top, 10)
+                }
 
             case .ports(let r):
                 NTCmd(text: NetWords.portLine(r, from: nil))
+                NTCmdBlock(command: r.command)
                 PortGrid(results: r.results, remote: false)
 
             case .remotePorts(let r, let label):
@@ -170,10 +191,21 @@ struct NetResultView: View {
 
             case .tls(let r):
                 if !r.ok {
+                    NTCmdBlock(command: r.command, note: r.commandNote)
                     NTEmpty(text: r.error ?? "", color: p.red)
                 } else {
                     NTCmd(text: "\(r.host):\(r.port)")
+                    NTCmdBlock(command: r.command, note: r.commandNote)
                     NTKV(rows: NetWords.tlsRows(r))
+                    let rest = NetWords.chainSections(r)
+                    if !rest.isEmpty {
+                        VStack(alignment: .leading, spacing: 0) {
+                            NTHead(text: "Rest of the chain (\(rest.count))", top: 13)
+                            ForEach(Array(rest.enumerated()), id: \.offset) { _, sct in NTSection(title: sct.title, rows: sct.rows) }
+                        }
+                    } else if r.chainComplete == false {
+                        NTHint(text: NetWords.leafOnlyHint).padding(.top, 10)
+                    }
                     if let d = r.daysLeft, d < 21 {
                         NTHint(text: d < 0 ? "This certificate has expired." : "This certificate expires soon.",
                                color: d < 0 ? p.red : p.amber).padding(.top, 10)
@@ -181,6 +213,7 @@ struct NetResultView: View {
                 }
 
             case .http(let r):
+                NTCmdBlock(command: r.command)
                 if let f = r.final {
                     NTFlow {
                         NTBadge(text: "\(f.status) \(f.statusMessage)".ntTrimmed, kind: NetWords.statusKind(f.status))
@@ -214,6 +247,8 @@ struct NetResultView: View {
             case .local(let r):
                 NTSection(title: "This machine", rows: [("Host name", r.hostname), ("Platform", r.platform),
                                                        ("Resolvers", r.dnsServers.joined(separator: ", "))])
+                // The same three facts, the way this platform's own tools show them.
+                NTCmdBlock(command: NetPreview.macLocalCommand)
                 if !r.addresses.isEmpty {
                     NTSection(title: "Interfaces", rows: r.addresses.map { ("\($0.name) (\($0.family))", $0.cidr ?? $0.address) })
                 }
@@ -228,6 +263,13 @@ struct NetResultView: View {
                         VStack(alignment: .leading, spacing: 0) { NTHead(text: name); NTPre(text: text) }.padding(.bottom, 13)
                     }
                 }
+
+            case .sockets(let r, let label): SocketsView(r: r, label: label)
+            case .cidr(let r): CIDRView(r: r)
+            case .url(let r, let file): URLDecodeView(r: r, file: file)
+            case .sshcert(let r, let file): SSHCertView(r: r, file: file)
+            case .jwt(let r, let file): JWTView(r: r, file: file)
+            case .svid(let r, let file): SVIDView(r: r, file: file)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -237,9 +279,10 @@ struct NetResultView: View {
     private func telnetView(_ r: TelnetResult) -> some View {
         let p = Theme.shared.p
         let s = PortStateInfo.of(state: r.state)
-        NTCmd(text: ["telnet \(r.host) \(r.port)",
-                     r.address.flatMap { $0 != r.host ? "→ \($0)" : nil } ?? "",
-                     r.connectMs.map { "connected in \($0)ms" } ?? ""].filter { !$0.isEmpty }.joined(separator: "  ·  "))
+        NTCmdBlock(command: r.command)
+        let meta = [r.address.flatMap { $0 != r.host ? "→ \($0)" : nil } ?? "",
+                    r.connectMs.map { "connected in \($0)ms" } ?? ""].filter { !$0.isEmpty }.joined(separator: "  ·  ")
+        if !meta.isEmpty { NTCmd(text: meta) }
         NTFlow {
             NTBadge(text: s.label, kind: r.state == "open" ? "ok" : "warn")
             if r.telnet { NTBadge(text: "speaks telnet", kind: "ok") }
@@ -315,6 +358,7 @@ struct NetResultView: View {
     @ViewBuilder
     private func teleportView(_ r: WebAPIPing.Result) -> some View {
         NTCmd(text: "\(r.url) — \(r.ms)ms")
+        NTCmdBlock(command: NetPreview.teleportPingCommand(r.url, false))
         NTFlow {
             ForEach(Array(r.badges.enumerated()), id: \.offset) { _, b in NTBadge(text: b.text, kind: b.kind) }
         }.padding(.bottom, 13)
@@ -382,9 +426,10 @@ extension NetDisplay {
             return ["\(label) → \(r.host)", r.text, "Run on the host as: \(r.command)"].joined(separator: "\n")
         case .dns(let r):
             var out: [String] = []
-            for rec in r.records { out.append(rec.type); out += rec.values.map(DNSResult.format) }
+            if !r.command.isEmpty { out.append(r.command) }
+            for rec in r.records { out.append(rec.type + (r.ttls[rec.type].map { "  ·  TTL \($0)s" } ?? "")); out += rec.values.map(DNSResult.format) }
             if let rev = r.reverse { out.append("PTR"); out += rev }
-            if !r.servers.isEmpty { out.append("Resolvers: " + r.servers.joined(separator: ", ")) }
+            if !r.servers.isEmpty { out.append((r.usingCustomServer ? "Queried via: " : "Resolvers: ") + r.servers.joined(separator: ", ")) }
             return out.isEmpty ? "Nothing resolves for \(r.host)." : out.joined(separator: "\n")
         case .ports(let r):
             return ([NetWords.portLine(r, from: nil)] + r.results.map { p in
@@ -397,7 +442,7 @@ extension NetDisplay {
             }).joined(separator: "\n")
         case .telnet(let r):
             let s = PortStateInfo.of(state: r.state)
-            return ["telnet \(r.host) \(r.port)", s.label, r.guess ?? "", r.state == "open" ? r.text : (r.error ?? s.why)]
+            return [r.command, s.label, r.guess ?? "", r.state == "open" ? r.text : (r.error ?? s.why)]
                 .filter { !$0.isEmpty }.joined(separator: "\n")
         case .remoteTelnet(let r, let host, let port, let label, _):
             let f = r.results.first
@@ -407,7 +452,12 @@ extension NetDisplay {
             return ports.isEmpty ? "No serial ports on this machine right now."
                 : ports.map { [$0.path, $0.label].filter { !$0.isEmpty }.joined(separator: "  ") }.joined(separator: "\n")
         case .tls(let r):
-            return r.ok ? "\(r.host):\(r.port)\n" + NTKV.text(NetWords.tlsRows(r)) : (r.error ?? "")
+            guard r.ok else { return [r.command, r.error ?? ""].filter { !$0.isEmpty }.joined(separator: "\n") }
+            let rest = NetWords.chainSections(r)
+            return (["\(r.host):\(r.port)", r.command, NTKV.text(NetWords.tlsRows(r))]
+                    + (rest.isEmpty ? (r.chainComplete == false ? [NetWords.leafOnlyHint] : [])
+                       : ["Rest of the chain (\(rest.count))"] + rest.map { "\($0.title)\n" + NTKV.text($0.rows) }))
+                .filter { !$0.isEmpty }.joined(separator: "\n")
         case .http(let r):
             guard let f = r.final else { return "" }
             var out = ["\(f.status) \(f.statusMessage)  \(f.ms)ms  \(Fmt.bytes(f.bytes))"]
@@ -431,6 +481,21 @@ extension NetDisplay {
                 + "\n" + NTKV.text(r.addresses.map { ("\($0.name) (\($0.family))", $0.cidr ?? $0.address) })
         case .hostFacts(let f, _):
             return f.ntText
+        case .sockets(let r, let label):
+            return NetSocketWords.text(r, label)
+        case .cidr(let r):
+            return ((r.check.map { ["\($0.inside ? "inside" : "outside") \($0.address) is \($0.inside ? "" : "not ")in \(r.cidr)"] } ?? [])
+                    + ["IPv\(r.family) subnet", NTKV.text(CIDRView.rows(r))]).joined(separator: "\n")
+        case .url(let r, _):
+            return [r.decoded.map { "Decoded\n\($0)" }, "Encoded (a value in a query string)\n\(r.encoded)",
+                    r.encodedUrl != r.encoded ? "Encoded (a whole URL)\n\(r.encodedUrl)" : nil]
+                .compactMap { $0 }.joined(separator: "\n\n")
+        case .sshcert(let r, _):
+            return r.raw
+        case .jwt(let r, _):
+            return JWTView.raw(r)
+        case .svid(let r, _):
+            return SVIDView.raw(r)
         }
     }
 }

@@ -71,17 +71,29 @@ enum SSHKeys {
     /// Whether a private key is passphrase-protected, from its own header:
     /// OpenSSH format names its cipher ("none" when plain); old PEM says
     /// `Proc-Type: 4,ENCRYPTED`.
-    static func headerSaysEncrypted(_ head: Data) -> Bool {
-        let text = String(decoding: head.prefix(512).map { $0 }, as: UTF8.self)
-        let latin = String(data: head.prefix(512), encoding: .isoLatin1) ?? text
-        if latin.hasPrefix("-----BEGIN OPENSSH PRIVATE KEY-----") {
-            let lines = latin.components(separatedBy: "\n")
-            var b64 = lines.count > 1 ? lines[1].ntTrimmed : ""
-            b64 = String(b64.prefix(b64.count - b64.count % 4))
-            let raw = Data(base64Encoded: b64).flatMap { String(data: $0, encoding: .isoLatin1) } ?? ""
-            return !raw.contains("none")
-        }
+    static func headerSaysEncrypted(_ head: Data) -> Bool? {
+        let text = String(decoding: head.prefix(1024).map { $0 }, as: UTF8.self)
+        let latin = String(data: head.prefix(1024), encoding: .isoLatin1) ?? text
+        if latin.hasPrefix("-----BEGIN OPENSSH PRIVATE KEY-----") { return opensshKeyEncrypted(latin) }
         return (try! NSRegularExpression(pattern: #"Proc-Type:\s*4,ENCRYPTED"#, options: .caseInsensitive)).matches(latin)
+    }
+
+    /// An OpenSSH-format key: `openssh-key-v1\0`, then a length-prefixed
+    /// cipher name — "none" when the key is plain. Read as that one field
+    /// rather than searched for: "none" can turn up anywhere in base64 (a
+    /// salt, the key itself), which made an encrypted key look plain. nil
+    /// when the header is not what it should be.
+    static func opensshKeyEncrypted(_ headerText: String) -> Bool? {
+        var b64 = headerText.components(separatedBy: "\n").filter { !$0.isEmpty && !$0.hasPrefix("-----") }
+            .map { $0.ntTrimmed }.joined()
+        b64 = String(b64.prefix(b64.count - b64.count % 4))
+        guard let raw = Data(base64Encoded: b64).map(Array.init) else { return nil }
+        let magic = Array("openssh-key-v1\0".utf8)
+        guard raw.count >= magic.count + 4, Array(raw[0..<magic.count]) == magic else { return nil }
+        let len = raw[magic.count..<magic.count + 4].reduce(0) { $0 << 8 | Int($1) }
+        let start = magic.count + 4
+        guard len <= 64, start + len <= raw.count else { return nil }
+        return String(decoding: raw[start..<start + len], as: UTF8.self) != "none"
     }
 
     /// Every keypair in ~/.ssh, found by its .pub file.
@@ -104,7 +116,7 @@ enum SSHKeys {
             let publicKey = ((try? String(contentsOfFile: pub, encoding: .utf8)) ?? "").ntTrimmed
             var encrypted: Bool? = nil
             if hasPrivate, let h = FileHandle(forReadingAtPath: priv) {
-                encrypted = headerSaysEncrypted(h.readData(ofLength: 512))
+                encrypted = headerSaysEncrypted(h.readData(ofLength: 1024))
                 try? h.close()
             }
             let mtime = ((try? fm.attributesOfItem(atPath: (pub as NSString).resolvingSymlinksInPath))?[.modificationDate] as? Date).map { $0.timeIntervalSince1970 * 1000 }
@@ -148,7 +160,7 @@ enum SSHKeys {
     /// identity and asks for each encrypted one.
     @MainActor
     static func addToAgent(_ privatePath: String?, passphrase: String? = nil, timeout: TimeInterval = 30,
-                           keychain: Bool = false) async -> AddResult {
+                           keychain: Bool = false, pkcs11Provider: String? = nil) async -> AddResult {
         guard Tools.toolAvailable("ssh-add") else {
             return AddResult(ok: false, output: "ssh-add was not found on this machine.", missing: true)
         }
@@ -156,7 +168,11 @@ enum SSHKeys {
         // `--apple-use-keychain` stores the passphrase in the login keychain;
         // Apple's fork only, so opt-in.
         if keychain { args.append("--apple-use-keychain") }
-        if let privatePath { args.append(privatePath) }
+        // `-s <provider>`: every identity a PKCS#11 token holds, through its
+        // provider library; the prompt is then for the token's PIN.
+        if let pkcs11Provider { args += ["-s", pkcs11Provider] } else if let privatePath { args.append(privatePath) }
+        let promptRe = pkcs11Provider != nil ? "enter pin" : "passphrase"
+        let wrongRe = pkcs11Provider != nil ? "incorrect pin|wrong pin" : "bad passphrase|incorrect passphrase"
         let term: PTYProcess
         do {
             term = try PTYProcess(exe: Tools.tool("ssh-add"), args: args,
@@ -176,7 +192,7 @@ enum SSHKeys {
                 term.terminate()
                 let text = out.replacingOccurrences(of: "\u{1b}\\[[0-9;?]*[a-zA-Z]", with: "", options: .regularExpression).ntTrimmed
                 cont.resume(returning: AddResult(ok: ok, output: extra ?? text,
-                                                 needsPassphrase: !ok && text.range(of: "passphrase", options: .caseInsensitive) != nil && passphrase == nil))
+                                                 needsPassphrase: !ok && text.range(of: promptRe, options: [.caseInsensitive, .regularExpression]) != nil && passphrase == nil))
             }
             let timer = DispatchWorkItem { finish(false, "ssh-add did not finish in time") }
             DispatchQueue.main.asyncAfter(deadline: .now() + timeout, execute: timer)
@@ -184,20 +200,21 @@ enum SSHKeys {
                 let chunk = String(decoding: d, as: UTF8.self)
                 out += chunk
                 fresh += chunk
-                if fresh.range(of: "passphrase", options: .caseInsensitive) != nil {
+                if fresh.range(of: promptRe, options: [.caseInsensitive, .regularExpression]) != nil {
                     fresh = ""
                     guard let passphrase else {
                         // Nothing to type; stop rather than leaving it waiting.
                         timer.cancel()
-                        finish(false, privatePath != nil ? "This key is protected by a passphrase"
+                        finish(false, pkcs11Provider != nil ? "This PKCS#11 token needs its PIN"
+                               : privatePath != nil ? "This key is protected by a passphrase"
                                : "One of the default keys is protected by a passphrase — add it on its own to enter it")
                         return
                     }
                     term.write(passphrase + "\r")
                 }
-                if (try! NSRegularExpression(pattern: "bad passphrase|incorrect passphrase", options: .caseInsensitive)).matches(out) {
+                if (try! NSRegularExpression(pattern: wrongRe, options: .caseInsensitive)).matches(out) {
                     timer.cancel()
-                    finish(false, "Incorrect passphrase")
+                    finish(false, pkcs11Provider != nil ? "Incorrect PIN" : "Incorrect passphrase")
                 }
             }
             term.onExit = { code in
@@ -208,11 +225,23 @@ enum SSHKeys {
         }
     }
 
-    struct Generated { var name, privatePath, publicPath, publicKey: String; var type: String?; var fingerprint: String? }
+    struct Generated {
+        var name, privatePath, publicPath, publicKey: String; var type: String?; var fingerprint: String?
+        var securityKey = false
+    }
+
+    static let securityKeyTypes = ["ed25519-sk", "ecdsa-sk"]
 
     /// Create a new keypair in ~/.ssh.
     static func generate(name: String, type: String = "ed25519", bits: Int? = nil, comment: String? = nil,
-                         passphrase: String = "") async throws -> Generated {
+                         passphrase: String = "", resident: Bool = false, verifyRequired: Bool = false,
+                         pin: String? = nil) async throws -> Generated {
+        let securityKey = securityKeyTypes.contains(type)
+        if securityKey && !SSHVersion.supports("securityKeyIdentities") {
+            let v = SSHVersion.current()
+            throw AppError("This machine's ssh-keygen\(v.map { " (\($0.raw))" } ?? "") is too old for FIDO2 security-key "
+                + "keys — OpenSSH 8.2 or later is needed.")
+        }
         if name.isEmpty || name.contains("/") || name.contains("\\") { throw AppError("Give the key a simple file name") }
         let fm = FileManager.default
         try? fm.createDirectory(atPath: sshDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -223,7 +252,11 @@ enum SSHKeys {
         let c = (comment ?? "").isEmpty ? "\(NSUserName())@\(String(cString: host))" : comment!
         var args = ["-t", type, "-f", target, "-N", passphrase, "-C", c]
         if type == "rsa" { args += ["-b", String(bits ?? 4096)] }
-        let r = await run("ssh-keygen", args, timeout: 120)
+        if securityKey {
+            if resident { args += ["-O", "resident"] }
+            if verifyRequired { args += ["-O", "verify-required"] }
+        }
+        let r = securityKey ? await generateSecurityKey(args, pin: pin) : await run("ssh-keygen", args, timeout: 120)
         if !r.ok {
             let m = (r.stderr.isEmpty ? r.stdout : r.stderr).ntTrimmed
             throw AppError(m.isEmpty ? "ssh-keygen failed" : m)
@@ -232,7 +265,7 @@ enum SSHKeys {
         let info = await describe(target + ".pub")
         let pub = ((try? String(contentsOfFile: target + ".pub", encoding: .utf8)) ?? "").ntTrimmed
         return Generated(name: name, privatePath: target, publicPath: target + ".pub", publicKey: pub,
-                         type: info?.type, fingerprint: info?.fingerprint)
+                         type: info?.type, fingerprint: info?.fingerprint, securityKey: securityKey)
     }
 
     /// The script that appends a public key to authorized_keys if absent and
@@ -270,7 +303,7 @@ enum SSHKeys {
         return installResult(try await c.exec(script, timeout: 20))
     }
 
-    struct KnownHost: Equatable { var line: String; var type: String; var key: String }
+    struct KnownHost: Equatable { var line: String; var type: String; var key: String; var file: String? = nil }
 
     /// Host keys recorded for a hostname.
     static func knownHostEntries(_ host: String) async -> [KnownHost] {

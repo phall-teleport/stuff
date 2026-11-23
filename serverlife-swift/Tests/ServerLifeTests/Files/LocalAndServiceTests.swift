@@ -59,6 +59,12 @@ import Testing
         await #expect { try await LocalFS.readText(dir) } throws: { errorText($0) == "That is not a file." }
     }
 
+    @Test func diskSpaceOfTheVolume() async throws {
+        let d = try await LocalFS.diskSpace(NSTemporaryDirectory())
+        #expect(d.total > 0 && d.free >= 0 && d.free <= d.total)
+        await #expect(throws: AppError.self) { try await LocalFS.diskSpace("/no/such/place/at/all") }
+    }
+
     @Test func placesAndStars() {
         let s = LocalFS.shortcuts()
         #expect(s.first == LocalFS.Place(name: "Home", path: NSHomeDirectory()))
@@ -176,17 +182,80 @@ import Testing
         await #expect(throws: AppError.self) { try await svc.cross(Self.a, entries: entries, to: Self.a, destDir: "/") }
     }
 
-    @Test func routes() {
+    @Test func routes() async {
         var n1 = ServerLife.Host(type: "teleport", id: "t1", name: "n1"); n1.proxy = "p:443"; n1.cluster = "c1"; n1.hostname = "n1"
         var n2 = n1; n2.name = "n2"; n2.hostname = "n2"
         var n3 = n1; n3.cluster = "leaf"
         func conn(_ h: ServerLife.Host, _ type: String = "teleport") -> FilesConn {
             FilesConn(id: h.name, label: h.name, type: type, transport: "mux", target: "root@" + h.name, host: h, login: "root")
         }
-        let direct = CrossTransfer.planRoute(conn(n1), conn(n2))
+        let direct = CrossTransfer.planRoute(conn(n1), conn(n2), tshVersion: "18.2.1")
         #expect(direct == .init(mode: "direct", reason: "Both nodes are on c1; tsh will copy them server-to-server."))
-        #expect(CrossTransfer.planRoute(conn(n1), conn(n3)).reason.hasPrefix("The nodes are on different Teleport clusters."))
+        // tsh 17 "copies" server-to-server onto this machine and exits 0.
+        let old = CrossTransfer.planRoute(conn(n1), conn(n2), tshVersion: "17.7.30")
+        #expect(old == .init(mode: "relay", reason: "Both nodes are on c1, but tsh 17.7.30 cannot copy server-to-server "
+            + "(that needs tsh 18 or newer). Files will be downloaded to this machine and uploaded to the destination."))
+        let unknown = CrossTransfer.planRoute(conn(n1), conn(n2), tshVersion: nil)
+        #expect(unknown.mode == "relay" && unknown.reason.hasPrefix("Both nodes are on c1, but tsh (version unknown) cannot"))
+        #expect(CrossTransfer.planRoute(conn(n1), conn(n2), tshVersion: "Teleport something").mode == "relay")
+        #expect(CrossTransfer.planRoute(conn(n1), conn(n3), tshVersion: "18.0.0").reason.hasPrefix("The nodes are on different Teleport clusters."))
+        #expect(CrossTransfer.planRoute(conn(n1), conn(n2, "ssh"), tshVersion: "18.0.0").reason.hasPrefix("At least one endpoint is a plain SSH host."))
         #expect(CrossTransfer.scpTarget(conn(n2), "/srv/") == "root@n2:/srv/")
+
+        // The asking version consults tsh only when the route could be direct.
+        let saved = CrossTransfer.tshVersion
+        defer { CrossTransfer.tshVersion = saved }
+        CrossTransfer.tshVersion = { "18.1.0" }
+        #expect(await CrossTransfer.planRoute(conn(n1), conn(n2)).mode == "direct")
+        #expect(CrossTransfer.knownTshVersion == .some("18.1.0"))
+        CrossTransfer.tshVersion = { "17.7.30" }
+        #expect(await CrossTransfer.planRoute(conn(n1), conn(n2)).mode == "relay")
+        CrossTransfer.tshVersion = { Issue.record("asked tsh for a cross-cluster route"); return nil }
+        #expect(await CrossTransfer.planRoute(conn(n1), conn(n3)).mode == "relay")
+    }
+
+    @Test func uploadShowsAPlanningRowAndCanBeCancelledMidWalk() async throws {
+        install()
+        defer { FilesService.shared.connectionClosed(Self.a) }
+        let dir = try scratchDir("svcplan"); defer { cleanup(dir) }
+        let svc = FilesService.shared
+        // A path that vanishes is a visible error row, not a silent disappearance.
+        let bad = try await svc.upload(Self.a, localPaths: [dir + "/nope"], remoteDir: dir)
+        let q = svc.queue(Self.a)
+        #expect(["planning", "error"].contains(q.jobs.first { $0.id == bad }?.status ?? ""))
+        await waitFor { q.jobs.first { $0.id == bad }?.status == "error" }
+        let v = q.jobs.first { $0.id == bad }
+        #expect(v?.status == "error" && v?.error?.hasPrefix("ENOENT") == true && v?.endedAt != nil)
+        #expect(v?.label == "nope → \(dir)")
+    }
+
+    @Test func remoteDiskSpace() async throws {
+        install()
+        let saved = FilesBridge.execResult
+        defer { FilesBridge.execResult = saved }
+        var asked: [String] = []
+        FilesBridge.execResult = { _, cmd, _ in
+            asked.append(cmd)
+            return ("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1000 400 500 45% /\n", 0)
+        }
+        let d = try await FilesService.shared.diskSpace(Self.a, "/srv/it's")
+        #expect(d == DiskSpace(total: 1_024_000, free: 512_000))
+        #expect(asked == ["df -Pk -- '/srv/it'\\''s' 2>/dev/null"])
+        #expect(FilesService.parseDf("") == nil)
+        #expect(FilesService.parseDf("rbash: df: command not found") == nil)
+        #expect(FilesService.parseDf("Filesystem 1024-blocks Used Available\nx 0 0 0 0% /") == nil)
+        #expect(FilesService.parseDf("Filesystem 1024-blocks\nx abc def ghi") == nil)
+
+        // A per-session-MFA host is never asked; a leaf (tsh by necessity) is.
+        let conn = FilesBridge.connection
+        defer { FilesBridge.connection = conn }
+        FilesBridge.connection = { id in var c = conn(id); c?.transport = "tsh"; return c }
+        asked = []
+        #expect(try await FilesService.shared.diskSpace(Self.a, "/") == nil && asked.isEmpty)
+        FilesBridge.connection = { id in var c = conn(id); c?.transport = "tsh"; c?.tshByNecessity = true; return c }
+        #expect(try await FilesService.shared.diskSpace(Self.a, "/") != nil)
+        FilesBridge.connection = { id in var c = conn(id); c?.connected = false; return c }
+        #expect(try await FilesService.shared.diskSpace(Self.a, "/") == nil)
     }
 
     /// Every upload event for one watch, as it happens.

@@ -95,7 +95,8 @@ extension SessionsWindow {
         showOverlay(p, PaneOverlay(title: "Connecting to \(SessConnRecords.shared.label(connId) ?? "")…",
                                    sub: SessConn.target(connId) ?? "", showLog: true))
         do {
-            try await SessConn.connect(connId)
+            try await SessRelogin.connect(connId, window: window)
+            Task { await SessPresence.shared.check(connId, refresh: true) }
             // Stick with whatever login worked for this host next time.
             if let rec = SessConnRecords.shared.get(connId), let login = rec.login {
                 SessionsWindow.rememberLogin(rec.hostId, login)
@@ -173,6 +174,8 @@ extension SessionsWindow {
         let b = try await SessConn.openTerminal(connId, cols: t?.cols ?? 100, rows: t?.rows ?? 30)
         attach(p, b)
         if p.tabId == activeTabId { focusActivePane() }
+        // The live stats bar, once there is a session to show it for.
+        PaneStats.shared.attach(p)
     }
 
     // MARK: Local shells, commands, backends, views
@@ -183,6 +186,7 @@ extension SessionsWindow {
     func openLocalShell(cwd: String? = nil, shell: String? = nil, blank: Bool = false, title: String? = nil,
                         command: String? = nil, args: [String]? = nil, env: [String: String] = [:],
                         onExit: ((Int32?) -> Void)? = nil) -> SessionPane {
+        let cwd = cwd ?? SessionsCore.lastLocalCwd
         let t = createTab(title: title ?? "Local shell", kind: "local", connId: nil)
         let p = createPane(tabId: t.id, kind: .local, connId: nil, cwd: cwd)
         p.title = title ?? "local"
@@ -213,10 +217,12 @@ extension SessionsWindow {
             if let command { p.attachments["command"] = command }
             p.shellName = command == nil ? (shell ?? shellPath).split(separator: "/").last.map(String.init) : nil
             p.blankShell = blank
+            p.plainShell = command == nil
             // A shell opened with no cwd starts at home: say so at once.
             p.cwd = cwd ?? p.cwd ?? NSHomeDirectory()
             attach(p, b)
             if p.tabId == activeTabId { focusActivePane() }
+            if p.plainShell { PaneStats.shared.attach(p) }
             changed()
         } catch {
             p.status = "error"
@@ -232,6 +238,9 @@ extension SessionsWindow {
         let kind: PaneKind = backend.kind == "tmux" ? .tmux : (backend.kind == "local" || backend.kind == "command") ? .local : .device
         let p = placeNewPane(kind: kind, connId: nil, title: title, split: split)
         p.title = title
+        // A program on a pty (kubectl exec/logs, tsh play) reads as its own
+        // title, not as "local: ~".
+        if backend.kind == "command" { p.attachments["named"] = true }
         p.host = host
         p.reconnect = reconnect
         if let greeting { p.term?.writeln("\u{1b}[90m\(greeting)\u{1b}[0m") }
@@ -306,7 +315,9 @@ extension SessionsWindow {
             StatusBus.shared.toast("Host is no longer in the inventory", kind: .error); return
         }
         let tabId = p.tabId
-        closePane(p.id)
+        // The tab goes with it immediately after — not really "closing a
+        // pane" as a person would mean it, so no theatre for this one.
+        closePane(p.id, animate: false)
         if tab(tabId) != nil { closeTab(tabId) }
         var o = OpenHostOptions(); o.login = login; o.reuse = false
         await openHost(host, o)
@@ -319,10 +330,16 @@ extension SessionsWindow {
             StatusBus.shared.toast("Host is no longer in the inventory", kind: .error); return
         }
         let tabId = p.tabId
-        closePane(p.id)
+        // The tab goes with it immediately after — not really "closing a
+        // pane" as a person would mean it, so no theatre for this one.
+        closePane(p.id, animate: false)
         if tab(tabId) != nil { closeTab(tabId) }
         var o = OpenHostOptions()
-        o.login = rec.login; o.transport = "tsh"; o.reuse = false
+        // The login this pane was opened with may be exactly what is stale:
+        // drop it the moment it stops being one the cluster grants.
+        let options = HostPrefs.loginOptions(host)
+        let login = rec.login.flatMap { l in options.isEmpty || options.contains(l) ? l : nil } ?? HostPrefs.preferredLogin(host)
+        o.login = login; o.transport = "tsh"; o.reuse = false
         o.mfaMode = Store.shared.settingJSON("mfaMode").string ?? "platform"
         await openHost(host, o)
     }
@@ -360,13 +377,22 @@ extension SessionsWindow {
             StatusBus.shared.toast("Host is no longer in the inventory", kind: .error); return
         }
         let tabId = p.tabId
-        closePane(p.id)
+        // The tab goes with it immediately after — not really "closing a
+        // pane" as a person would mean it, so no theatre for this one.
+        closePane(p.id, animate: false)
         if tab(tabId) != nil { closeTab(tabId) }
         // Remember the working method so the next connection starts with it.
         Store.shared.setSetting("mfaMode", mode)
         var o = OpenHostOptions()
         o.login = rec.login; o.transport = "tsh"; o.reuse = false; o.mfaMode = mode
         await openHost(host, o)
+    }
+
+    /// The header's "↻ Reconnect" (reconnectFromBanner).
+    func reconnectFromBanner(_ p: SessionPane) {
+        p.showReconnect = false
+        if p.kind == .device { p.reconnectArmed = false; Task { await restartDevice(p) }; return }
+        Task { await reconnectPane(p) }
     }
 
     func reconnectPane(_ p: SessionPane) async {
@@ -382,10 +408,11 @@ extension SessionsWindow {
         var o = o
         if o.error == nil, o.scene == nil { o.scene = ConnectAnim.pick() }
         p.overlaySawPrompt = o.promptInput
+        p.overlayPeek = false
         p.overlay = o
     }
 
-    func hideOverlay(_ p: SessionPane) { p.overlay = nil; p.overlaySawPrompt = false }
+    func hideOverlay(_ p: SessionPane) { p.overlay = nil; p.overlaySawPrompt = false; p.overlayPeek = false }
 
     /// One more line in an open overlay's log (`noteOverlay`).
     func noteOverlay(_ p: SessionPane, _ text: String) {

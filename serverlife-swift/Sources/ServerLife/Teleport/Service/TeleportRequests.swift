@@ -66,9 +66,12 @@ struct RequestableRole: Codable, Hashable, Sendable {
 }
 
 extension Teleport {
-    /// `REQUEST_KINDS`: what `tsh request search --kind=` accepts, most useful first.
+    /// `REQUEST_KINDS`: what `tsh request search --kind=` accepts, most useful
+    /// first. `kube_resource` is a namespace or a pod *inside* an
+    /// already-requestable kube_cluster, not a resource of its own — see
+    /// `searchRequestable`'s kubeKind/namespace handling.
     static let requestKinds = [
-        "node", "app", "db", "kube_cluster", "windows_desktop", "linux_desktop",
+        "node", "app", "db", "kube_cluster", "kube_resource", "windows_desktop", "linux_desktop",
         "user_group", "saml_idp_service_provider", "git_server",
         "aws_ic_account", "aws_ic_account_assignment",
     ]
@@ -187,7 +190,9 @@ extension Teleport {
 
     /// `searchRequestable`: what this user could ask for, by kind.
     static func searchRequestable(proxy: String?, kind: String = "node", search: String? = nil, labels: String? = nil,
-                                  query: String? = nil, kubeCluster: String? = nil, home: String?) async -> TshList<RequestableResource> {
+                                  query: String? = nil, kubeCluster: String? = nil, kubeKind: String? = nil,
+                                  namespace: String? = nil, allNamespaces: Bool = false,
+                                  home: String?) async -> TshList<RequestableResource> {
         var args: [String] = []
         if let p = proxy?.nilIfEmpty { args.append("--proxy=" + p) }
         args += ["request", "search", "--kind=" + kind, "--format=json"]
@@ -195,6 +200,13 @@ extension Teleport {
         if let v = labels?.nilIfEmpty { args.append("--labels=" + v) }
         if let v = query?.nilIfEmpty { args.append("--query=" + v) }
         if let v = kubeCluster?.nilIfEmpty { args.append("--kube-cluster=" + v) }
+        // kind kube_resource only — which sub-resource to search for, and (for
+        // pods) which namespace. `--kube-kind` wants the plural CLI form
+        // ("namespaces", "pods"), distinct from the singular form Teleport
+        // roles use for `kubernetes_resources`.
+        if let v = kubeKind?.nilIfEmpty { args.append("--kube-kind=" + v) }
+        if allNamespaces { args.append("--all-kube-namespaces") }
+        else if let v = namespace?.nilIfEmpty { args.append("--namespace=" + v) }
         let r = await run(args, home: home, timeout: 60)
         if !r.ok {
             let msg = TPText.errText(r)

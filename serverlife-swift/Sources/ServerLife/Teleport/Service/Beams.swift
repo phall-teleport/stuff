@@ -10,6 +10,9 @@ struct Beam: Codable, Hashable, Identifiable, Sendable {
     /// What was asked for, when the service put it somewhere else ("" otherwise).
     var requestedRegion: String
     var url: String
+    /// The Phase it was started from, as `name` or `name@sha256:…`; empty for
+    /// the standard image, and for a tsh too old to say.
+    var phase: String = ""
     /// ms since the epoch, for a countdown.
     var expires: Double?
     var proxy: String
@@ -53,7 +56,7 @@ enum Beams {
         let req = b["requested_region"].stringish ?? ""
         return Beam(id: b["id"].stringish ?? "", uuid: b["uuid"].stringish ?? "", owner: b["owner"].stringish ?? "",
                     region: region, requestedRegion: !req.isEmpty && req != region ? req : "",
-                    url: b["url"].stringish ?? "", expires: TPText.parseDate(b["expires"].string),
+                    url: b["url"].stringish ?? "", phase: b["phase"].stringish ?? "", expires: TPText.parseDate(b["expires"].string),
                     proxy: proxy ?? "", home: home?.nilIfEmpty)
     }
 
@@ -100,9 +103,13 @@ enum Beams {
 
     /// `beams:add`: start a beam (never with `--console`; the app opens the
     /// session itself). Creating a VM is not instant: 5 minutes.
-    static func add(proxy: String?, home: String?, region: String? = nil) async -> (ok: Bool, beam: Beam?, error: String?) {
+    /// `phase` and `roles` are only ever passed when `addSupport` said this tsh takes them.
+    static func add(proxy: String?, home: String?, region: String? = nil, phase: String? = nil,
+                    roles: [String] = []) async -> (ok: Bool, beam: Beam?, error: String?) {
         var rest = ["--format=json"]
         if let r = region?.nilIfEmpty { rest.append("--region=" + r) }
+        if let p = phase?.nilIfEmpty { rest.append("--phase=" + p) }
+        if !roles.isEmpty { rest.append("--roles=" + roles.joined(separator: ",")) }
         let r = await run(argsFor("add", rest, proxy: proxy), home: home, timeout: 300)
         let out = TPText.plain(r.out)
         if let at = out.firstIndex(of: "{"), let j = try? JSON.parse(String(out[at...])), j.object != nil {

@@ -9,12 +9,23 @@ import CryptoKit
 enum NetTLS {
     /// Report what the server presents, including a chain that does not
     /// validate — "the certificate is expired" is the answer, not an error.
-    static func info(host: String, port: String? = nil) async throws -> TLSResult {
+    ///
+    /// `starttls` (smtp, imap or pop3) says hello in plaintext and asks to
+    /// upgrade first — opportunistic TLS on 587/143/110 is otherwise
+    /// invisible here, because the port never speaks TLS until asked.
+    static func info(host: String, port: String? = nil, starttls: String? = nil) async throws -> TLSResult {
         let parsed = NetCheck.splitHostPort(host)
         let h = try NetCheck.checkHost(parsed.host)
-        let p = ntPort(ntNumberOr(port, Double(parsed.port ?? 443)))
+        let proto = starttls.flatMap { startTLSPorts[$0] != nil ? $0 : nil }
+        let p = ntPort(ntNumberOr(port, Double(parsed.port ?? proto.flatMap { startTLSPorts[$0] } ?? 443)))
+        let command = tlsCommand(h, p, proto)
+        func failed(_ e: String) -> TLSResult {
+            var r = TLSResult(ok: false, host: h, port: p, error: e)
+            r.command = command
+            return r
+        }
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: p)), p > 0, p < 65536 else {
-            return TLSResult(ok: false, host: h, port: p, error: "Port should be >= 0 and < 65536. Received \(p).")
+            return failed("Port should be >= 0 and < 65536. Received \(p).")
         }
         return await withCheckedContinuation { (cont: CheckedContinuation<TLSResult, Never>) in
             let queue = DispatchQueue(label: "nettools.tls")
@@ -28,9 +39,20 @@ enum NetTLS {
                 complete(true)
             }, queue)
             let params = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+            let starttlsFail = StartTLSFramer.Failure()
+            if let proto {
+                // Below TLS in the stack: the plaintext hello and upgrade run
+                // first, and TLS starts on the same connection once it is done.
+                let o = NWProtocolFramer.Options(definition: StartTLSFramer.definition)
+                o["protocol"] = proto
+                o["failure"] = starttlsFail
+                params.defaultProtocolStack.applicationProtocols.append(o)
+            }
             let conn = NWConnection(host: NWEndpoint.Host(h), port: nwPort, using: params)
-            let finish: (TLSResult) -> Void = { r in
+            let finish: (TLSResult) -> Void = { res in
                 guard !st.done else { return }
+                var r = res
+                r.command = command
                 st.done = true
                 conn.cancel()
                 cont.resume(returning: r)
@@ -49,17 +71,29 @@ enum NetTLS {
                     if let trust = st.trust { describe(trust, into: &r) }
                     finish(r)
                 case .failed(let e):
-                    finish(TLSResult(ok: false, host: h, port: p, error: message(e, h, p)))
+                    finish(failed(starttlsFail.message ?? message(e, h, p)))
                 case .waiting(let e):
                     // Refused, unreachable or unresolvable: Network.framework
                     // would wait for the path to change; the original failed.
-                    finish(TLSResult(ok: false, host: h, port: p, error: message(e, h, p)))
+                    finish(failed(starttlsFail.message ?? message(e, h, p)))
                 default: break
                 }
             }
             conn.start(queue: queue)
-            queue.asyncAfter(deadline: .now() + 10) { finish(TLSResult(ok: false, host: h, port: p, error: "Timed out.")) }
+            queue.asyncAfter(deadline: .now() + (proto == nil ? 10 : 12)) {
+                finish(failed(proto == nil ? "Timed out." : "Timed out waiting on STARTTLS."))
+            }
         }
+    }
+
+    /// The default plaintext port each STARTTLS protocol usually answers on.
+    static let startTLSPorts: [String: Int] = ["smtp": 587, "imap": 143, "pop3": 110]
+
+    /// The hand-run form. `-starttls <proto>` is openssl's own flag for the
+    /// plaintext-then-upgrade dance, so it stays a one-liner.
+    static func tlsCommand(_ host: String, _ port: Int, _ starttls: String?) -> String {
+        let flag = starttls.map { " -starttls \($0)" } ?? ""
+        return "openssl s_client -connect \(host):\(port)\(flag) -servername \(host) </dev/null 2>/dev/null | openssl x509 -noout -text"
     }
 
     static func message(_ e: NWError, _ h: String, _ p: Int) -> String {
@@ -149,8 +183,13 @@ enum NetTLS {
         r.fingerprint256 = SHA256.hash(data: der).map { String(format: "%02X", $0) }.joined(separator: ":")
         r.chain = certs.map { c in
             let cv = values(c)
-            return (TLSResult.dn(cv.subject) ?? (SecCertificateCopySubjectSummary(c) as String? ?? "?"),
-                    TLSResult.dn(cv.issuer) ?? "?")
+            return TLSChainCert(
+                subject: cv.subject, issuer: cv.issuer,
+                validFrom: cv.notBefore.map(opensslDate), validTo: cv.notAfter.map(opensslDate),
+                fingerprint256: SHA256.hash(data: SecCertificateCopyData(c) as Data)
+                    .map { String(format: "%02X", $0) }.joined(separator: ":"),
+                serialNumber: (SecCertificateCopySerialNumberData(c, nil) as Data?)?
+                    .map { String(format: "%02X", $0) }.joined())
         }
     }
 
@@ -220,7 +259,25 @@ enum NetTLS {
 
     /// An HTTP(S) check: status, headers, timing and the redirect chain.
     /// Bodies are read only far enough to show what came back.
-    static func httpCheck(url: String, method: String = "GET", insecure: Bool = false, timeout: TimeInterval = 15) async throws -> HTTPResult {
+    /// The hand-run form: `-v` shows the same status line and headers.
+    static func httpCommand(_ url: String, _ method: String, _ insecure: Bool, _ headers: String) -> String {
+        let m = method.uppercased()
+        let h = NetCurl.headerLines(headers).map { " -H '" + $0.replacingOccurrences(of: "'", with: "'\\''") + "'" }.joined()
+        return "curl -sv\(m == "HEAD" ? " -I" : " -X " + m)\(insecure ? " -k" : "")\(h) -- '\(url)'"
+    }
+
+    /// The request headers: the defaults, then each `Name: value` line.
+    static func requestHeaders(_ headers: String) -> [String: String] {
+        var out = ["User-Agent": "ServerLife", "Accept": "*/*"]
+        for h in NetCurl.headerLines(headers) {
+            guard let i = h.firstIndex(of: ":"), i > h.startIndex else { continue }
+            out[String(h[..<i]).ntTrimmed] = String(h[h.index(after: i)...]).ntTrimmed
+        }
+        return out
+    }
+
+    static func httpCheck(url: String, method: String = "GET", insecure: Bool = false, timeout: TimeInterval = 15,
+                          headers: String = "") async throws -> HTTPResult {
         var raw = url.ntTrimmed
         if raw.isEmpty { throw AppError("Give a URL or host.") }
         if raw.range(of: "^https?://", options: [.regularExpression, .caseInsensitive]) == nil { raw = "https://" + raw }
@@ -235,7 +292,7 @@ enum NetTLS {
         var current = target
         for i in 0...maxRedirects {
             let res = try await HTTPFetch.once(current, method: m, insecure: insecure, timeout: timeout,
-                                               headers: ["User-Agent": "ServerLife", "Accept": "*/*"], keep: 2048)
+                                               headers: requestHeaders(headers), keep: 2048)
             let preview = String(decoding: res.body.prefix(2048), as: UTF8.self)
             chain.append(HTTPHop(url: normalised(current), status: res.status, statusMessage: res.reason,
                                  headers: res.headers, ms: res.ms, bytes: res.bytes, preview: String(preview.prefix(2048))))
@@ -245,7 +302,7 @@ enum NetTLS {
             _ = try NetCheck.checkHost(next.host)
             current = next
         }
-        return HTTPResult(chain: chain)
+        return HTTPResult(chain: chain, command: httpCommand(normalised(target), m, insecure, headers))
     }
 
     static func normalised(_ u: URL) -> String {

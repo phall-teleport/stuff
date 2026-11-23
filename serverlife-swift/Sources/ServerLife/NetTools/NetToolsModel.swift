@@ -44,6 +44,25 @@ final class NetToolsModel: ObservableObject {
     @Published var serialFlow = "none"
     @Published var serialNewline = "cr"
     @Published var serialEcho = false
+    // 0.39: forced address family (local runs), a chosen nameserver, STARTTLS,
+    // the HTTP check's own headers and -k, and the subnet check.
+    @Published var ipVersion = ""
+    @Published var dnsServer = ""
+    @Published var starttls = ""
+    @Published var httpHeaders = ""
+    @Published var httpInsecure = false
+    @Published var cidrCheck = ""
+    /// The decoders' pasted text. Each pasted-input tool keeps its own: a
+    /// certificate left in the box is not a JWT, so the box follows the tool.
+    @Published var pasteText = ""
+    /// The file the box's text came from, when it came from one — tsh's list,
+    /// a cluster's Decode, or Browse. Typing makes it text of your own again.
+    @Published var pasteFile = ""
+    private var pasteFor: [String: (text: String, file: String)] = [:]
+    @Published var tshCerts: [NetDecodeIO.TshCertText] = []
+    /// The command the last run actually ran, and for which tool.
+    var lastRunCommand = ""
+    var lastRunCommandTool = ""
 
     // curl
     @Published var curlMethod = "GET"
@@ -56,6 +75,10 @@ final class NetToolsModel: ObservableObject {
     @Published var curlInsecure = false
     @Published var curlFollow = true
     @Published var curlTimeout = "20"
+    @Published var curlResolve = ""
+    @Published var curlCaCert = ""
+    @Published var curlClientCert = ""
+    @Published var curlClientKey = ""
 
     // Run on
     @Published var runOn = ""
@@ -83,12 +106,15 @@ final class NetToolsModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: w)
     }
 
-    init(host: String?, tool: String, preset: JSON?, runOn: String, window: WindowModel?) {
+    init(host: String?, tool: String, preset: JSON?, runOn: String, window: WindowModel?,
+         input: String? = nil, file: String? = nil) {
         self.window = window
         let t = NetTool.find(tool) != nil ? tool : "ping"
         self.tool = t
         target = host ?? NetToolsModel.suggestTarget()
         output = .help(t)
+        pasteText = input ?? ""
+        pasteFile = input != nil ? (file ?? "") : ""
         if let o = preset?["opts"], o.object != nil {
             curlMethod = o["method"].string ?? "GET"
             curlHeaders = o["headers"].string ?? ""
@@ -100,6 +126,7 @@ final class NetToolsModel: ObservableObject {
             curlInsecure = o["insecure"].truthy
             curlFollow = o["followRedirects"].bool != false
             curlTimeout = String(ntStoredTimeout(o["timeout"]))
+            applyCurlExtras(o)
         }
         savedId = preset?["id"].string
         syncSessions()
@@ -108,6 +135,7 @@ final class NetToolsModel: ObservableObject {
         // What that host has — always asked on open, as the original's render did.
         loadCaps()
         reloadStrips()
+        tshCerts = NetDecodeIO.tshCerts()
         refresher.start(every: 2) { [weak self] in self?.syncSessions() }
     }
 
@@ -115,7 +143,71 @@ final class NetToolsModel: ObservableObject {
 
     // MARK: Derived
 
-    var needsTarget: Bool { !["local", "serial"].contains(tool) }
+    var needsTarget: Bool { !["local", "serial", "sockets"].contains(tool) && !NetTool.isPaste(tool) }
+    var isPaste: Bool { NetTool.isPaste(tool) }
+
+    /// `--resolve`, a private CA and a client cert/key, from a stored request.
+    func applyCurlExtras(_ o: JSON) {
+        curlResolve = o["resolve"].string ?? ""
+        curlCaCert = o["caCert"].string ?? ""
+        curlClientCert = o["clientCert"].string ?? ""
+        curlClientKey = o["clientKey"].string ?? ""
+    }
+
+    /// Typing in the box makes it text of your own again.
+    func pasteEdited() { if !pasteFile.isEmpty { pasteFile = "" } }
+
+    private func swapPaste(_ next: String) {
+        if NetTool.isPaste(tool) { pasteFor[tool] = (pasteText, pasteFile) }
+        if NetTool.isPaste(next) { pasteText = pasteFor[next]?.text ?? ""; pasteFile = pasteFor[next]?.file ?? "" }
+    }
+
+    /// Browse…: decode a file from disk instead of pasting it.
+    func browsePaste() {
+        let kind = tool
+        Task { @MainActor in
+            do {
+                guard let r = try await NetDecodeIO.pickFile(kind, window: handle?.window) else { return }
+                pasteText = r.text.ntTrimmed
+                pasteFile = r.file
+                run()
+            } catch { say(error.localizedDescription, kind: .error) }
+        }
+    }
+
+    /// "Use a certificate tsh issued…".
+    func useTshCert(_ i: Int) {
+        guard tshCerts.indices.contains(i) else { return }
+        pasteText = tshCerts[i].text.ntTrimmed
+        pasteFile = tshCerts[i].cert.file
+        run()
+    }
+
+    func pickCurlFile(_ title: String, _ set: @escaping (String) -> Void) {
+        Task { @MainActor in
+            if let p = await NetDecodeIO.pickPath(title: title, window: handle?.window) { set(p) }
+        }
+    }
+
+    /// The command a tool would run, before it is run (`net:previewCommand`).
+    var commandPreview: (command: String?, note: String?, error: String?) {
+        guard NetPreview.tools.contains(tool), runOn.isEmpty else { return (nil, nil, nil) }
+        return NetPreview.command(NetPreviewInput(tool: tool, host: target.ntTrimmed, ports: ports.ntTrimmed, count: count,
+                                                  method: method, insecure: httpInsecure, telnetPort: telnetPort,
+                                                  server: dnsServer.ntTrimmed, ipVersion: ipVersion, starttls: starttls,
+                                                  headers: httpHeaders))
+    }
+
+    /// Copy command: what would run (curl's preview, then any other tool's),
+    /// else what the last run of this tool ran.
+    func copyCommand() {
+        let cmd = (tool == "curl" ? curlPreview
+            : NetPreview.tools.contains(tool) && runOn.isEmpty ? commandPreview.command ?? ""
+            : tool == lastRunCommandTool ? lastRunCommand : "").ntTrimmed
+        if cmd.isEmpty { say("Nothing to run locally for this tool"); return }
+        Clipboard.write(cmd)
+        say("Command copied")
+    }
     var onLabel: String { runOn.isEmpty ? "" : (NTConnections.info(runOn)?.label ?? "that host") }
 
     /// Default to a logged-in proxy, since that is usually what is being debugged.
@@ -139,6 +231,10 @@ final class NetToolsModel: ObservableObject {
         o.followRedirects = curlFollow
         // `parseInt(curlTimeout.value, 10) || 20`
         o.timeout = ntParseInt(curlTimeout).flatMap { $0 != 0 ? $0 : nil } ?? 20
+        o.resolve = curlResolve
+        o.caCert = curlCaCert.ntTrimmed
+        o.clientCert = curlClientCert.ntTrimmed
+        o.clientKey = curlClientKey.ntTrimmed
         return o
     }
 
@@ -198,11 +294,13 @@ final class NetToolsModel: ObservableObject {
     /// A tool that cannot run on the chosen host is not left selected.
     func syncOptions() {
         if !runOn.isEmpty, !NetTool.canRunRemotely(tool) || NetTool.missing(NetTool.find(tool), caps) != nil {
+            swapPaste("ports")
             tool = "ports"
         }
     }
 
     func selectTool(_ id: String) {
+        swapPaste(id)
         tool = id
         syncOptions()
         output = .help(tool)
@@ -243,6 +341,7 @@ final class NetToolsModel: ObservableObject {
         curlInsecure = o["insecure"].truthy
         curlFollow = o["followRedirects"].bool != false
         curlTimeout = String(ntStoredTimeout(o["timeout"]))
+            applyCurlExtras(o)
         savedId = r["id"].string
         applyHostRef(r["on"])
         run()
@@ -266,6 +365,7 @@ final class NetToolsModel: ObservableObject {
             curlInsecure = o["insecure"].truthy
             curlFollow = o["followRedirects"].bool != false
             curlTimeout = String(ntStoredTimeout(o["timeout"]))
+            applyCurlExtras(o)
         } else if o.object != nil {
             if o["count"].truthy { count = o["count"].stringish ?? count }
             if o["ports"].truthy { ports = o["ports"].stringish ?? ports }
@@ -387,12 +487,20 @@ final class NetToolsModel: ObservableObject {
             "local": [
                 Example(name: "This machine", why: "Interfaces and resolvers, when the problem might be here"),
             ],
+            "cidr": [
+                Example(name: "A /16 VPC", why: "The usual AWS VPC size: 65,534 usable addresses", target: "10.0.0.0/16"),
+                Example(name: "A netmask, as ifconfig prints it", why: "Dotted mask turned into a prefix", target: "192.168.1.0 255.255.255.0"),
+                Example(name: "Is this address allowed?", why: "An allow-list entry and an address to test against it",
+                        target: "172.16.0.0/12", opts: ["check": "172.31.4.20"]),
+                Example(name: "An IPv6 /64", why: "One LAN\u{2019}s worth of IPv6", target: "2001:db8:1234::/64"),
+            ],
         ]
         return table[id] ?? []
     }
 
     func loadExample(_ x: Example) {
         if let c = x.curl {
+            swapPaste("curl")
             tool = "curl"
             target = c.url
             curlMethod = c.method
@@ -401,15 +509,17 @@ final class NetToolsModel: ObservableObject {
             curlType = c.contentType
             curlBearer = c.bearer
             if let t = c.timeout { curlTimeout = String(t) }
+            curlResolve = ""; curlCaCert = ""; curlClientCert = ""; curlClientKey = ""
         } else {
             // A serial example is about the speed, not a host — leave the
             // target alone for the next tool rather than blanking it.
-            if tool != "serial" { target = x.target }
+            if tool != "serial" && !NetTool.isPaste(tool) { target = x.target }
             if let v = x.opts["count"] { count = v }
             if let v = x.opts["ports"] { ports = v }
             if let v = x.opts["method"] { method = v }
             if let v = x.opts["port"] { telnetPort = v }
             if let v = x.opts["baud"] { serialBaud = v }
+            cidrCheck = x.opts["check"] ?? ""
         }
         syncOptions()
         output = .loaded(name: x.name, why: x.why)
@@ -484,7 +594,8 @@ final class NetToolsModel: ObservableObject {
     func run() {
         if running { return }
         let t = target.ntTrimmed
-        if needsTarget && t.isEmpty { say("Give a host", kind: .error); return }
+        if needsTarget && t.isEmpty { say(tool == "cidr" ? "Give a subnet" : "Give a host", kind: .error); return }
+        if isPaste && pasteText.ntTrimmed.isEmpty { say("Paste something to decode", kind: .error); return }
         running = true
         let tool = self.tool
         output = .running("Running \(NetTool.label(tool))…")
@@ -502,12 +613,16 @@ final class NetToolsModel: ObservableObject {
                 lastText = r.text.isEmpty ? r.display.plainText : r.text
                 lastName = r.name
                 summary = r.note
+                lastRunCommand = r.command ?? ""
+                lastRunCommandTool = tool
             } catch {
                 ok = false
                 summary = error.localizedDescription
                 output = .error(summary)
                 lastText = summary
                 lastName = "\(tool)-\(NetText.safeName(t)).txt"
+                lastRunCommand = ""
+                lastRunCommandTool = ""
             }
             running = false
             say("")
@@ -531,6 +646,7 @@ final class NetToolsModel: ObservableObject {
         var text: String
         var name: String
         var note: String
+        var command: String? = nil
     }
 
     /// Run one tool and hand back what to show, what to save, and one line
@@ -574,26 +690,32 @@ final class NetToolsModel: ObservableObject {
             case "local":
                 let f = try await NetRemote.hostFacts(on)
                 return Dispatched(display: .hostFacts(f, label: label), text: f.ntText, name: "\(safe(label))-network.txt", note: f.hostname)
+            case "sockets":
+                let r = try await NetSockets.hostSockets(on)
+                return Dispatched(display: .sockets(r, label: label), text: r.text, name: "sockets-\(safe(label)).txt",
+                                  note: r.missing.map { "no \($0) on \(label)" } ?? "\(r.rows.count) socket\(r.rows.count == 1 ? "" : "s") on \(label)")
             default:
                 throw AppError("\(NetTool.label(tool)) runs from this machine only for now.")
             }
         }
         switch tool {
         case "ping":
-            let r = try await NetLocal.ping(host: target, count: count)
-            return Dispatched(display: .text(r), text: r.text, name: "ping-\(safe(target)).txt", note: NetText.firstLine(r.text))
+            let r = try await NetLocal.ping(host: target, count: count, ipVersion: ipVersion)
+            return Dispatched(display: .text(r), text: r.text, name: "ping-\(safe(target)).txt", note: NetText.firstLine(r.text),
+                              command: r.command)
         case "traceroute":
-            let r = try await NetLocal.traceroute(host: target)
-            return Dispatched(display: .text(r), text: r.text, name: "traceroute-\(safe(target)).txt", note: NetText.firstLine(r.text))
+            let r = try await NetLocal.traceroute(host: target, ipVersion: ipVersion)
+            return Dispatched(display: .text(r), text: r.text, name: "traceroute-\(safe(target)).txt", note: NetText.firstLine(r.text),
+                              command: r.command)
         case "dns":
-            let r = try await NetLocal.lookup(host: target)
+            let r = try await NetLocal.lookup(host: target, server: dnsServer.ntTrimmed.isEmpty ? nil : dnsServer.ntTrimmed)
             return Dispatched(display: .dns(r), text: NetText.pretty(r.json), name: "dns-\(safe(target)).json",
-                              note: r.records.filter { !$0.values.isEmpty }.map(\.type).joined(separator: ", "))
+                              note: r.records.filter { !$0.values.isEmpty }.map(\.type).joined(separator: ", "), command: r.command)
         case "ports":
-            let r = try await NetLocal.portCheck(host: target, ports: ports.ntTrimmed)
+            let r = try await NetLocal.portCheck(host: target, ports: ports.ntTrimmed, ipVersion: ipVersion)
             let open = r.results.filter { $0.state == "open" }.map { String($0.port) }
             return Dispatched(display: .ports(r), text: NetText.pretty(r.json), name: "ports-\(safe(target)).json",
-                              note: open.isEmpty ? "nothing open" : "open: " + open.joined(separator: ", "))
+                              note: open.isEmpty ? "nothing open" : "open: " + open.joined(separator: ", "), command: r.command)
         case "telnet":
             let t = try NetCheck.telnetTarget(target, telnetPort)
             let r = try await NetLocal.telnetProbe(host: t.host, port: String(t.port))
@@ -607,29 +729,63 @@ final class NetToolsModel: ObservableObject {
                               text: ports.map { [$0.path, $0.label].filter { !$0.isEmpty }.joined(separator: "  ") }.joined(separator: "\n"),
                               name: "serial-ports.txt", note: "\(ports.count) port\(ports.count == 1 ? "" : "s")")
         case "tls":
-            let r = try await NetTLS.info(host: target)
+            let r = try await NetTLS.info(host: target, starttls: starttls.isEmpty ? nil : starttls)
             let cn = r.subject.first { $0.0 == "CN" }?.1
             return Dispatched(display: .tls(r), text: NetText.pretty(r.json), name: "tls-\(safe(target)).json",
-                              note: cn.map { "\($0), \(r.daysLeft.map(String.init) ?? "?") days left" } ?? "")
+                              note: cn.map { "\($0), \(r.daysLeft.map(String.init) ?? "?") days left" } ?? "", command: r.command)
         case "http":
-            let r = try await NetTLS.httpCheck(url: target, method: method)
+            let r = try await NetTLS.httpCheck(url: target, method: method, insecure: httpInsecure, headers: httpHeaders)
             return Dispatched(display: .http(r), text: NetText.pretty(r.json), name: "http-\(safe(target)).json",
-                              note: "\(r.final?.status ?? 0) \(r.final?.statusMessage ?? "")".ntTrimmed)
+                              note: "\(r.final?.status ?? 0) \(r.final?.statusMessage ?? "")".ntTrimmed, command: r.command)
         case "curl":
             let r = try await NetCurl.request(curlOpts)
             return Dispatched(display: .curl(r, from: nil), text: r.body, name: "response-\(safe(target))\(NetText.bodyExt(r.contentType))",
                               note: "\(r.status) \(r.statusText) · \(Fmt.bytes(r.bytes)) · \(Fmt.duration(ms: r.ms))")
         case "whois":
             let r = try await NetLocal.whois(host: target)
-            return Dispatched(display: .text(r), text: r.text, name: "whois-\(safe(target)).txt", note: NetText.firstLine(r.text))
+            return Dispatched(display: .text(r), text: r.text, name: "whois-\(safe(target)).txt", note: NetText.firstLine(r.text),
+                              command: r.command)
         case "teleport":
             let r = try await WebAPIPing.ping(proxy: target)
             let json: JSON = ["url": .string(r.url), "ms": .number(Double(r.ms)), "ping": r.ping]
             return Dispatched(display: .teleport(r), text: NetText.pretty(json), name: "webapi-ping-\(safe(target)).json",
-                              note: r.note)
+                              note: r.note, command: NetPreview.teleportPingCommand(r.url, false))
         case "local":
             let r = NetLocal.localInfo()
-            return Dispatched(display: .local(r), text: NetText.pretty(r.json), name: "this-machine.json", note: r.hostname)
+            return Dispatched(display: .local(r), text: NetText.pretty(r.json), name: "this-machine.json", note: r.hostname,
+                              command: NetPreview.macLocalCommand)
+        case "sockets":
+            let r = await NetSockets.listSockets()
+            return Dispatched(display: .sockets(r, label: nil), text: r.text, name: "sockets.txt",
+                              note: r.missing.map { "\($0) is not installed" } ?? "\(r.rows.count) socket\(r.rows.count == 1 ? "" : "s")",
+                              command: r.command)
+        case "cidr":
+            let r = try NTDecode.cidr(target, check: cidrCheck.ntTrimmed.isEmpty ? nil : cidrCheck.ntTrimmed)
+            return Dispatched(display: .cidr(r), text: NetText.pretty(r.json), name: "subnet-\(safe(r.cidr)).json",
+                              note: "\(r.cidr) · \(r.usable) usable" + (r.check.map { " · \($0.address) \($0.inside ? "inside" : "outside")" } ?? ""))
+        case "url":
+            let r = try NTDecode.url(pasteText)
+            return Dispatched(display: .url(r, file: pasteFile.isEmpty ? nil : pasteFile), text: r.decoded ?? r.encoded,
+                              name: "url.txt", note: "")
+        case "sshcert":
+            let r = try NTDecode.sshCert(pasteText)
+            // Where it came from when that is known; otherwise matched on the
+            // key data, so a pasted copy of one of tsh's own files finds it too.
+            var file: String? = pasteFile.isEmpty ? nil : pasteFile
+            if file == nil { file = NetDecodeIO.tshCerts().first { NetDecodeIO.sameCert(pasteText, $0.text) }?.cert.file }
+            return Dispatched(display: .sshcert(r, file: file), text: r.raw, name: "ssh-cert-\(safe(r.keyId)).txt", note: "",
+                              command: NetPreview.sshCertCommand(file))
+        case "jwt":
+            let r = try NTDecode.jwt(pasteText)
+            let header = r.header.jsText(indent: 2), payload = r.payload.jsText(indent: 2)
+            return Dispatched(display: .jwt(r, file: pasteFile.isEmpty ? nil : pasteFile),
+                              text: "{\n  \"header\": " + header.replacingOccurrences(of: "\n", with: "\n  ")
+                                + ",\n  \"payload\": " + payload.replacingOccurrences(of: "\n", with: "\n  ") + "\n}",
+                              name: "jwt.json", note: "", command: NetPreview.jwtCommand(r).command)
+        case "svid":
+            let r = try NTDecode.svid(pasteText)
+            return Dispatched(display: .svid(r, file: pasteFile.isEmpty ? nil : pasteFile), text: SVIDView.raw(r),
+                              name: "svid.txt", note: "", command: NetPreview.svidCommand(r))
         default:
             throw AppError("Unknown tool")
         }

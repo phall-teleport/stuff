@@ -70,14 +70,25 @@ enum BeamsUI {
 
     // MARK: Start
 
-    /// `addBeam`: start one, then offer to open it.
+    /// `addBeam`: start one, then offer to open it. `phase` preselects a
+    /// Phase in Start from (a Phase row's double-click / menu).
     @discardableResult
-    static func start(_ p: TeleportProfile, window: WindowModel? = nil) async -> Beam? {
-        let m = StartBeamModel(p: p)
-        let res: Beam? = await TUIModal.ask(window, title: "Start a beam", width: 520) { finish, _ in
+    static func start(_ p: TeleportProfile, phase: String = "", window: WindowModel? = nil) async -> Beam? {
+        let m = StartBeamModel(p: p, preselect: phase)
+        m.window = window
+        await m.load()
+        let res: StartBeamModel.Result? = await TUIModal.ask(window, title: "Start a beam", width: 520) { finish, _ in
             StartBeamView(m: m, finish: finish)
         }
-        guard let b = res else { return nil }
+        guard let res else { return nil }
+        let b: Beam
+        switch res {
+        case .builder(let from): phaseBuilder(p, from: from, window: window); return nil
+        case .phase(let from):
+            if from.isEmpty { newPhase(p, window: window) } else { newPhase(p, mode: "from", source: from, window: window) }
+            return nil
+        case .beam(let x): b = x
+        }
         TUIStatus.show("Beam \(b.id) started in \(b.region)", ms: 8000)
         await Inventory.shared.refreshBeams()
         let detail = ["Region: \(b.region)", b.requestedRegion.isEmpty ? "" : "(you asked for \(b.requestedRegion))",
@@ -163,7 +174,10 @@ enum BeamsUI {
 
     /// `beamMenu`: the right-click menu for one beam.
     static func menuItems(_ b: Beam, window: WindowModel? = nil) -> [CtxItem] {
-        var items: [CtxItem] = [.heading(b.id), CtxItem("Open a session") { open(b, window: window) }]
+        var items: [CtxItem] = [.heading(b.id)]
+        // Which image it is: a Phase, with its history, or the standard one.
+        items += phaseMenuItems(b, window: window)
+        items.append(CtxItem("Open a session") { open(b, window: window) })
         // Beside or below the focused pane, only when there is one.
         if Actions.shared.isEnabled("split-right", ActionContext(window: window)) {
             items.append(CtxItem("Open beside current (split right)", icon: "\u{216E}") { split(b, "right", window: window) })
@@ -175,6 +189,9 @@ enum BeamsUI {
             },
             CtxItem("Open the file browser", title: "A session with the files and no terminal") { open(b, filesOnly: true, window: window) },
             CtxItem("Run a command…") { exec(b, window: window) },
+            CtxItem("Services…", title: "What its Phase starts in it (beamctl list), and each one\u{2019}s log") {
+                Task { await showServices(b, window: window) }
+            },
             CtxItem("Active sessions in this beam…",
                     title: "Watch, join or moderate a session that is going on in it now — an agent at work, say") {
                 activeSessions(b, window: window)
@@ -234,46 +251,171 @@ struct BeamExpiryLabel: View {
 
 @MainActor
 final class StartBeamModel: ObservableObject {
+    enum Result { case beam(Beam), phase(String), builder(String) }
+
     let p: TeleportProfile
+    let preselect: String
+    weak var window: WindowModel?
     @Published var region = ""
     @Published var busy = false
     @Published var note = "A beam is a sandbox VM. It is created on demand, expires on its own, and "
         + "is meant to be thrown away — nothing on it survives the expiry."
-    init(p: TeleportProfile) { self.p = p }
+    /// What this tsh's `beams add` can do (beams.js `addSupport`).
+    @Published var can = BeamAddSupport()
+    /// Start from: "" is the standard image.
+    @Published var phase = ""
+    @Published var phaseNote = ""
+    @Published var ready: [BeamPhase] = []
+    @Published var waiting = 0
+    @Published var roleOn: [String: Bool] = [:]
+
+    init(p: TeleportProfile, preselect: String = "") { self.p = p; self.preselect = preselect }
+
+    /// Roles to hand the beam, from the ones this login holds.
+    var myRoles: [String] { can.roles ? p.roles.sorted() : [] }
+    var roles: [String] { myRoles.filter { roleOn[$0] == true } }
+
+    func load() async {
+        if let c = Inventory.shared.addSupport(p.proxy) { can = c }
+        else { can = await Beams.addSupport(proxy: p.proxy, home: p.homeDir) }
+        guard can.phases else { return }
+        phaseNote = "Reading Phases (tsh phase ls)…"
+        Task { @MainActor in
+            let r = await Beams.phases(proxy: p.proxy, home: p.homeDir)
+            applyPhases(r)
+        }
+    }
+
+    func applyPhases(_ r: TshList<BeamPhase>) {
+        guard r.ok else { phaseNote = r.error ?? "Could not read the Phases"; return }
+        ready = r.items.filter { $0.state == "ready" }
+        waiting = r.items.count - ready.count
+        if ready.isEmpty {
+            phaseNote = r.items.isEmpty
+                ? "No Phases yet — the beam starts from the standard image. `tsh phase add` makes one."
+                : "No Phase is ready yet (\(waiting) building or failed) — the beam starts from the standard image."
+            return
+        }
+        phaseNote = ""
+        setPhase(ready.contains { $0.name == preselect } ? preselect : "")
+    }
+
+    /// A Phase lives in a region; starting there avoids asking for one it is not in.
+    func setPhase(_ v: String) {
+        phase = v
+        if let ph = ready.first(where: { $0.name == v }), !ph.region.isEmpty,
+           BeamsUI.regions.contains(where: { $0.value == ph.region }) {
+            region = ph.region
+        }
+    }
+
+    var startFromHint: String {
+        "A Phase is a saved image: the beam starts with what was installed in it. "
+            + (waiting > 0 ? "\(waiting) more not ready yet. " : "") + "Latest snapshot of the one you pick."
+    }
+
+    /// The phases owner's picker (your folders and a search), or a plain menu.
+    func picker() -> AnyView? {
+        var v: AnyView?
+        Actions.shared.perform("phase-picker", window: window, args: [
+            "profileKey": p.key, "phases": ready, "value": phase, "standard": "The standard image",
+            "onChange": { [weak self] (x: String) in self?.setPhase(x) },
+            "reply": { (x: Any?) in v = x as? AnyView },
+        ])
+        return v
+    }
 }
 
 private struct StartBeamView: View {
     @ObservedObject var m: StartBeamModel
-    let finish: (Beam?) -> Void
+    let finish: (StartBeamModel.Result?) -> Void
     var body: some View {
+        let p = Theme.shared.p
         DialogScaffold(title: "Start a beam", subtitle: TUI.name(m.p), scroll: false) {
             VStack(alignment: .leading, spacing: 0) {
+                if m.can.phases {
+                    if !m.phaseNote.isEmpty {
+                        MiscHint(text: m.phaseNote).padding(.bottom, 9)
+                    } else if !m.ready.isEmpty {
+                        TUIField(label: "Start from", hint: m.startFromHint) {
+                            if let v = m.picker() { v } else {
+                                Picker("", selection: Binding(get: { m.phase }, set: { m.setPhase($0) })) {
+                                    Text("The standard image").tag("")
+                                    ForEach(m.ready) { Text($0.name).tag($0.name) }
+                                }.labelsHidden().frame(maxWidth: 300, alignment: .leading)
+                            }
+                        }
+                    }
+                }
+                if !m.myRoles.isEmpty {
+                    TUIField(label: "Delegate roles",
+                             hint: "Tick the roles the beam should act with. None ticked: the cluster\u{2019}s default for beams.") {
+                        FlowRoles(roles: m.myRoles, on: $m.roleOn)
+                    }
+                }
                 TUIField(label: "Region", hint: "The cluster may put it somewhere else if the region you ask for is unavailable.") {
                     Picker("", selection: $m.region) {
                         ForEach(BeamsUI.regions, id: \.value) { Text($0.label).tag($0.value) }
                     }.labelsHidden().frame(maxWidth: 300, alignment: .leading)
                 }
-                if !m.note.isEmpty { MiscHint(text: m.note, size: 11) }
+                if m.can.phases { saveNote(p) }
+                if !m.note.isEmpty { MiscHint(text: m.note, size: 11).padding(.top, 10) }
             }
         } footer: {
             Button("Cancel") { finish(nil) }.buttonStyle(.ghost).keyboardShortcut(.cancelAction)
             Button("Start it") {
                 if m.busy { return }
                 m.busy = true
-                m.note = "Starting a sandbox VM — this takes a moment…"
+                m.note = m.phase.isEmpty ? "Starting a sandbox VM — this takes a moment…"
+                    : "Starting a sandbox VM from \(m.phase) — this takes a moment…"
                 Task { @MainActor in
-                    let r = await Beams.add(proxy: m.p.proxy, home: m.p.homeDir, region: m.region.nilIfEmpty)
+                    let r = await Beams.add(proxy: m.p.proxy, home: m.p.homeDir, region: m.region.nilIfEmpty,
+                                            phase: m.phase.nilIfEmpty, roles: m.roles)
                     m.busy = false
                     if !r.ok || r.beam == nil {
                         m.note = ""
                         TUIStatus.toast(r.error ?? "Could not start a beam", "error", ms: 9000)
                         return
                     }
-                    finish(r.beam)
+                    finish(.beam(r.beam!))
                 }
             }.buttonStyle(.primary).disabled(m.busy)
         }
         .frame(width: 520)
+    }
+
+    /// A beam started here runs an image; it is not a build. `tsh phase
+    /// snapshot` only saves from a Phase's own build Beam, so work done in
+    /// this one cannot be kept as a Phase — said before it is started, with
+    /// the way that can.
+    private func saveNote(_ p: Palette) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Text("\u{26A0} ").foregroundStyle(p.amber)
+            Text("Work in this beam can\u{2019}t be saved as a Phase. To keep it, ").foregroundStyle(p.amber)
+            Button("start a Phase build instead") { finish(.phase(m.phase)) }
+                .buttonStyle(.link).help("tsh phase add: a build beam you can save with tsh phase snapshot")
+            if m.can.apply {
+                Text(", or ").foregroundStyle(p.amber)
+                Button("build one from setups") { finish(.builder(m.phase)) }
+                    .buttonStyle(.link).help("Tools, services and files picked as setups, built with tsh phase apply")
+            }
+            Text(".").foregroundStyle(p.amber)
+        }
+        .font(.system(size: 11)).padding(.top, 8)
+    }
+}
+
+/// The role checkboxes, wrapped as the original's `display:flex;flex-wrap`.
+private struct FlowRoles: View {
+    let roles: [String]
+    @Binding var on: [String: Bool]
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), alignment: .leading)], alignment: .leading, spacing: 4) {
+            ForEach(roles, id: \.self) { r in
+                Toggle(isOn: Binding(get: { on[r] == true }, set: { on[r] = $0 })) { Text(r).font(.system(size: 12)) }
+                    .toggleStyle(.checkbox)
+            }
+        }
     }
 }
 

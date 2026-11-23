@@ -232,6 +232,12 @@ enum TUIStatus {
     }
     static func clear() { StatusBus.shared.clear() }
 
+    /// `status(text, 0, 'login')`: the login-in-flight banner; "" takes it down.
+    static func login(_ text: String) {
+        StatusBus.shared.show(text, kind: .login, seconds: 0)
+        if text.isEmpty { StatusBus.shared.clear() }
+    }
+
     /// `toast(text, kind, ms)` with the original's kind names.
     static func toast(_ text: String, _ kind: String = "info", ms: Double? = nil) {
         let k: StatusBus.Kind = kind == "error" ? .error : kind == "success" ? .ok : kind == "warn" ? .warn : .info

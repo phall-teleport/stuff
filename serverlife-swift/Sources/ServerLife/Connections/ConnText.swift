@@ -159,7 +159,7 @@ echo "users_online=$(who 2>/dev/null | wc -l | tr -d ' ')"
 for p in apt dnf yum zypper apk pacman brew; do
   if command -v "$p" >/dev/null 2>&1; then echo "pkg=$p"; break; fi
 done
-for c in docker kubectl podman; do
+for c in docker kubectl podman helm kustomize; do
   if command -v "$c" >/dev/null 2>&1; then echo "has_$c=yes"; fi
 done
 # The script is a report, not a test. Without this its exit status is whatever

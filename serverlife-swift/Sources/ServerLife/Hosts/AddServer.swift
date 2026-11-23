@@ -13,8 +13,20 @@ enum AddServer {
         var port = 22
         var identityFile = ""
         var proxyJump = ""
-        var extraOptions = ""
+        /// nil: a new host starts with settings.defaultSshOptions (an alias = an existing one: none).
+        var extraOptions: String? = nil
+        var alias: String? = nil
         var destination = "config"
+        /// "New host in this config": the ssh config file to write the Host block into.
+        var configFile: String? = nil
+
+        var configLabel: String { AddServer.configLabel(configFile) }
+    }
+
+    /// `cfgLabel`: the file, with the home directory as ~.
+    nonisolated static func configLabel(_ file: String?) -> String {
+        guard let f = file?.nilIfEmpty else { return "~/.ssh/config" }
+        return f.replacingOccurrences(of: #"^/(Users|home)/[^/]+"#, with: "~", options: .regularExpression)
     }
 
     struct Result {
@@ -27,6 +39,7 @@ enum AddServer {
         var extraOptions: String
         var destination: String
         var saveProfile: Bool
+        var configFile: String? = nil
 
         var direct: DirectSpec {
             DirectSpec(hostname: hostname, user: user.nilIfEmpty, port: port, identityFile: identityFile.nilIfEmpty,
@@ -36,7 +49,8 @@ enum AddServer {
 
     static func openDialog(_ window: WindowModel?, initial: Initial = Initial()) {
         let model = AddServerModel(window: window, initial: initial)
-        Modal.sheet(window, title: "Add a server", width: 660) { handle in
+        let title = initial.configFile?.nilIfEmpty != nil ? "New host in \(initial.configLabel)" : "Add a server"
+        Modal.sheet(window, title: title, width: 660) { handle in
             AddServerView(model: model) { res in
                 handle.close()
                 if let res { Task { @MainActor in await commit(res, window: window) } }
@@ -49,7 +63,8 @@ enum AddServer {
         if res.destination == "config" {
             var entry = ManagedSSHHost(alias: res.alias, hostname: res.hostname, user: res.user.nilIfEmpty, port: res.port,
                                        identityFile: res.identityFile.nilIfEmpty, proxyJump: res.proxyJump.nilIfEmpty,
-                                       extraOptions: res.extraOptions)
+                                       extraOptions: res.extraOptions, file: res.configFile)
+            let label = configLabel(res.configFile)
             do {
                 do {
                     _ = try SSHConfig.addHost(entry)
@@ -68,8 +83,8 @@ enum AddServer {
                 HToast.error(hostsErrorText(error))
                 return
             }
-            StatusBus.shared.show("Added \(res.alias) to ~/.ssh/config")
-            HToast.ok("\(res.alias) added to ~/.ssh/config")
+            StatusBus.shared.show("Added \(res.alias) to \(label)")
+            HToast.ok("\(res.alias) added to \(label)")
         } else {
             StatusBus.shared.show("Saved \(res.alias)")
         }
@@ -148,6 +163,8 @@ final class AddServerModel: ObservableObject {
     @Published var destination: String
     @Published var saveProfile = true
     @Published var testing = false
+    let configFile: String?
+    let configLabel: String
 
     init(window: WindowModel?, initial: AddServer.Initial) {
         self.window = window
@@ -157,7 +174,9 @@ final class AddServerModel: ObservableObject {
         port = String(initial.port)
         jump = initial.proxyJump
         key = initial.identityFile
-        extra = initial.extraOptions
+        extra = initial.extraOptions ?? (initial.alias?.nilIfEmpty != nil ? "" : SSHPresets.defaultSshOptions)
+        configFile = initial.configFile?.nilIfEmpty
+        configLabel = initial.configLabel
         destination = initial.destination
     }
 
@@ -176,7 +195,7 @@ final class AddServerModel: ObservableObject {
         let p = QuickConnect.parseInt(port) ?? 0
         return AddServer.Result(alias: alias, hostname: host, user: user.trimmed, port: p != 0 ? p : 22,
                                 identityFile: key.trimmed, proxyJump: jump.trimmed, extraOptions: extra,
-                                destination: destination, saveProfile: saveProfile)
+                                destination: destination, saveProfile: saveProfile, configFile: configFile)
     }
 
     func test() {
@@ -199,7 +218,7 @@ private struct AddServerView: View {
     @FocusState private var nameFocused: Bool
 
     var body: some View {
-        DialogScaffold(title: "Add a server", width: 660) {
+        DialogScaffold(title: model.configFile != nil ? "New host in \(model.configLabel)" : "Add a server", width: 660) {
             VStack(alignment: .leading, spacing: 0) {
                 HFieldRow {
                     MiscField(label: "Name / alias", hint: "How you will refer to it") {
@@ -222,13 +241,16 @@ private struct AddServerView: View {
                 MiscField(label: "Jump host (ProxyJump)", hint: "Optional — reach this host through a bastion") {
                     HField(placeholder: "bastion.example.com (optional)", text: $model.jump)
                 }
-                MiscField(label: "Extra ssh options", hint: "One per line, as they appear in ssh_config") {
-                    HTextArea(text: $model.extra, placeholder: "ServerAliveInterval 30\nForwardAgent yes")
+                MiscField(label: "Extra ssh options", hint: "One per line, as they appear in ssh_config — pick a common one, or type your own") {
+                    VStack(alignment: .leading, spacing: 0) {
+                        HTextArea(text: $model.extra, placeholder: "ServerAliveInterval 30\nForwardAgent yes")
+                        SSHOptionPicker(text: $model.extra, format: "config", window: model.window)
+                    }
                 }
                 MiscRule()
                 MiscField(label: "Where to save it") {
                     HSelect(options: [
-                        ("config", "Write to ~/.ssh/config — usable by ssh, scp and everything else"),
+                        ("config", "Write to \(model.configLabel) — usable by ssh, scp and everything else"),
                         ("app", "Save in ServerLife only — leaves ~/.ssh/config untouched"),
                     ], selection: $model.destination)
                 }

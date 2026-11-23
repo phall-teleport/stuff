@@ -13,7 +13,10 @@ the host menu's "Open in tmux: …" routing submenu (sidebar) call the ids below
 
 | id | does | host / args |
 |---|---|---|
-| `tmux-open` | Open a host in tmux. With `session` it attaches straight away (`openTmux`); without, the **tmux on <host>** dialog lists the sessions already running and offers to start one (`openTmuxDialog`). `Host.localMachine` (type `local`) = tmux on this Mac. | host; `login` String, `session` String, `dialog` Bool (true = always the dialog, even with `session`) |
+| `tmux-open` | Open a host in tmux. With `session` it attaches straight away (`openTmux`); without, the **tmux on <host>** dialog lists the sessions already running and offers to start one (`openTmuxDialog`). `Host.localMachine` (type `local`) = tmux on this Mac. | host; `login` String, `session` String, `dialog` Bool (true = always the dialog, even with `session`); `reply` (Any?) -> Void — with `session`, called once settled with true (attached) / false |
+| `tmux-kill-pane` | Close a tmux pane by hand, in tmux too (`killTmuxPane`, 0.29): `kill-pane`, and tmux's next layout removes it here. The session's last pane asks first (*Close the last pane?*, danger). For Sessions' ✕ / ⌘W / *Close pane (in tmux too)* (`closePaneByHand`). | paneId; `reply` (Any?) -> Void, **asynchronous**: true = handled (killed, or the question declined — do nothing), false = not attached, close the view |
+| `tmux-restore-of` | What a saved layout keeps for a tmux pane (`tmuxRestoreOf`): `{kind:"tmux", hostId, home (beams only), local, label, login, session}`; nil once ended/detached. Also `ConsolesTmux.restoreOf(pane)`. | paneId; `reply` (Any?) -> Void, synchronous |
+| `tmux-restore-open` | Attach to a saved entry's session again (workspace.js restore: `openTmux(host, {login, session})`). Resolves the host itself: this machine, a beam rebuilt from its id `beam:<proxy>:<name>` + saved `home` (else the proxy's tsh profile home), else `SessionHooks.hostById`. Attaching brings back every window, so restore once per `ConsolesText.tmuxRestoreKey(spec)`. | `spec` JSON; `reply` (Any?) -> Void: true / false (false also = host not found → skipped) |
 | `serial-open` | A serial console in a tab (`openDeviceSession` kind serial). | host = device spec (below); `split` "right"/"down" |
 | `telnet-open` | A telnet session in a tab. | host = device spec; `split` |
 | `vnc-open` | A VNC screen in a pane (`openVncSession`). | host = VNC spec; `password` String (used once, never saved); `split` |
@@ -96,4 +99,12 @@ Misc: `MiscUI.prompt/confirm`, `CtxMenu`, `MiscField`, `MiscHint`.
 - A VNC session whose password prompt was cancelled shows "Not connected — the connection was closed" with Try again
   (the original left "Connecting…" on screen).
 - tmux checks over a connection time out as the original's (probe and list 15 s, `has-session` 10 s) via `TimedTmuxHost`.
-- tmux tabs are not saved in layouts (as in the original; Sessions skips them).
+- tmux panes are saved in layouts from 0.31 — Sessions calls `tmux-restore-of` when saving and `tmux-restore-open`
+  when restoring (one attach per `tmuxRestoreKey`; the session's other tabs come back with it).
+- Live stats (0.29): `bindPane` performs `live-stats-attach` and an ended session `live-stats-detach` (paneId) —
+  no-ops until Sessions registers them (monitor.js `attachMonitor`/`detachMonitor`).
+- Not yet, waiting on Sessions: `closePane(id, animate: false)` for a failed attach (`closeQuietly` is the one
+  place to change), `peek: true` (*Show terminal*) on the ended-session overlay, and dialling through
+  `connectWithRelogin` (the tmux path shares the shell path's log-back-in-and-retry, `ensureConnection`).
+- VNC: on connect the pane's `status` becomes "connected" — Sessions' ↻ Reconnect button should hide on that
+  (vnc.js 0.39 `reconnectBtn.classList.add('hidden')`).

@@ -331,9 +331,9 @@ private let statusText = """
 
 @Test func recordingsAndBeamsParse() throws {
     let recs = try #require(Teleport.parseRecordings("""
-    [{"sid":"a","session_start":"2026-10-06T10:00:00Z","session_stop":"2026-10-06T10:05:00Z","interactive":true,"server_hostname":"web"},
-     {"sid":"b","session_start":"2026-10-06T11:00:00Z","session_recording":"off","server_id":"id-2"},
-     {"sid":""}]
+    [{"sid":"a","proto":"ssh","session_start":"2026-10-06T10:00:00Z","session_stop":"2026-10-06T10:05:00Z","interactive":true,"server_hostname":"web"},
+     {"sid":"b","proto":"ssh","session_start":"2026-10-06T11:00:00Z","session_recording":"off","server_id":"id-2"},
+     {"sid":""}, {"sid":"beam-1","event":"beam.destroyed"}]
     """, proxy: "p"))
     #expect(recs.map(\.sid) == ["b", "a"] && !recs[0].playable && recs[0].node == "id-2" && recs[1].durationMs == 300_000)
     #expect(Teleport.toRecordingDate("2026-10-06") == "2026-10-06")

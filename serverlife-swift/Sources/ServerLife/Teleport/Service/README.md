@@ -27,6 +27,12 @@ Connections/TeleportSSH.swift; `Teleport.listClusters` feeds its leaf cache
 | `SSHConfig.swift` | ssh_config discovery, the managed ServerLife block, `tsh config` preview/write |
 | `WebAPIPing.swift` | `/webapi/ping` and its field layout |
 | `Inventory.swift` | `Inventory.shared`: the live model + loops |
+| `TshEnv.swift` | tsh variables (global / per home / per cluster), chosen tsh, `$VAR` homes (0.29, 0.28) |
+| `TeleportVersions.swift` | client/cluster version compatibility, `loginChecked`, deliberate-logout registry, login methods, inventory ids of requestable nodes/kube clusters |
+| `TeleportJoin.swift` | tctl lookup/run, join tokens, "Install Teleport on this host" commands (0.32) |
+| `BeamsPhases.swift` | beams by name, `addSupport`, Phases list/remove/ls-failed, Phase build argv, snapshot, services in a Beam |
+| `Vnet.swift` / `VnetActions.swift` | `VnetManager.shared` (one `tsh vnet` per cluster, scoped home) and its actions/menu items |
+| `SSHConfigEdit.swift` | delete / comment out any Host, block preview, read/check/write a config in the app, open in editor |
 
 ## Profile key (`tpKey`)
 
@@ -116,7 +122,65 @@ roleChoices, needsReason}`, `probeRequest`, `readProbe`, `roleChoicesFrom`,
 `saveTranscript(...)`, `chooseTranscriptDir()`. Live sessions:
 `listActiveSessions`, `parseSessionList`, `joinArgs`, `joinableKinds`, `joinModes`.
 
+## 0.16–0.39 additions
+
+**tsh variables (`TshEnv`).** `parse(text) -> Parsed{vars, order, errors}`
+(teleport:parseEnv), `setSettings`, `applySettings()` (from `tshEnvText`,
+`clusterTshEnv`, `tshHomeEnv`, `tshEnvInShells`; Inventory reapplies on change),
+`envFor(proxy)`, `envForShells()` (plain local shells, only when
+`tshEnvInShells`), `vars(home:proxy:)` (everyone's < home's < cluster's, plus
+`TELEPORT_TOOLS_VERSION=off` for a chosen tsh unless a version was asked for),
+`overrides(home:proxy:)` (TELEPORT_HOME + vars, for `Proc.run`/`RunningProcess`
+env), `proxyInArgs(argv)`, `chosenTsh()`, `chosenFrom()` (tshChosenFrom:
+"settings"/"TSH_PATH"/nil), `expandHome` (`~`, `$VAR`, `${VAR}`; unset → ""),
+`unsetVars`, `resolveHome(text) -> ResolvedHome{raw, resolved, exists, profiles,
+unset}` (teleport:resolveHome). Every `Teleport.run` already merges `vars`.
+Action **`tsh-env-for`** (host, or args `proxy`/`home`; `reply` gets
+`[String:String]`).
+
+**Versions / login.** `Teleport.majorOf`, `compatibility(client:server:)`,
+`parseVersionWarning`, `versionInfo`, `compatFor(proxy:home:)`;
+`loginChecked(LoginOptions) -> LoginResult`; `loginMethods(proxy:)` /
+`parseLoginMethods` (web `config.js`: authType, defaultConnector, local,
+passwordless, secondFactors, providers). Deliberate logout:
+`wasLoggedOutDeliberately(proxy:home:)` — set by `logout`, cleared by `login`
+(`noteDeliberateLogout`/`noteLoggedIn` for logins run elsewhere). Sessions'
+relogin-and-retry must not log back in while it is true.
+
+**Inventory ids.** `inventoryNodeIds(items, home:)`, `kubeInventoryId`,
+`inventoryKubeIds` (`tsh-kube:` prefix). `TeleportProfile.kubeUsers` /
+`kubeGroups` from `tsh status`. `searchRequestable(kubeKind:namespace:allNamespaces:)`
+and the `kube_resource` kind.
+
+**Join / install (`TeleportJoin.swift`).** `findTctl()`, `forgetTctl()`,
+`tctlRun(args, proxy:home:timeout:)`, `createJoinToken(type:ttl:proxy:home:cluster:)
+-> JoinToken` (checks `tctl status` names the cluster first),
+`nodeInstallCommand(proxy:token:labels:nodeName:) -> NodeInstall{ok, command,
+oneLine, error}` — for the sidebar's `add-to-teleport` wizard.
+
+**VNet.** `VnetManager.shared`: `start(proxy:home:)`, `stop(proxy:)`,
+`stopAll()`, `status`, `view(for:)`, `isActive`, `onState`. Actions
+`vnet-start`, `vnet-stop`, `vnet-log` (host, or args `proxy`/`cluster`),
+`vnet-status` (`reply` gets `[View]`), `vnet-menu` (args `menu` NSMenu: appends
+Start/Stop VNet + Show VNet log for the host's cluster). `VnetActions.tag(proxy:)`
+is the sidebar badge text.
+
+**Beams / Phases (`BeamsPhases.swift`).** `Beams.beamsByName(proxy)`,
+`addSupport(proxy:home:) -> BeamAddSupport{phases, roles, apply, copy, noConsole}`
+(cached per tsh + vars), `phases`, `failedPhases`, `removePhase`, `copyFlags`,
+`phaseAddArgs`, `phaseEditArgs`, `phaseApplyArgs`, `startNonInteractive`,
+`phaseSnapshot`, `beamServices`, `beamServiceLogs`; `Beams.add(phase:roles:)`.
+For the phases owner.
+
 ## SSHConfig (static)
+
+0.18+: `findHostBlock`, `hostBlockPreview(file:alias:)` (sshconfig:blockPreview),
+`removeHostFromFile(file:alias:mode:)` ("delete"/"comment"; backup kept),
+`knownConfigFile(_:)`, `readConfig`, `checkConfig`, `writeConfig` (checked by
+`ssh -G -F` first; backup; mode kept), `openInEditor` (`open -t`).
+`ManagedSSHHost.file` writes a new host into that config ("New host in this
+config"). ssh hosts carry `extra["identityFiles"]` / `extra["certificateFiles"]`
+(every one, not only the first).
 
 `listSshHosts(extra:)` (discovery:ssh), `listConfigFiles(extra)`,
 `collectAliases`, `resolveHost` (`ssh -G`), `readAliasFromFile` (no-ssh
@@ -147,6 +211,10 @@ licenseWarnings, note}` — no credentials, no redirects, 15 s, 2 MB.
 ## Not done / differences
 
 - One shared inventory for all windows (the original kept one per window).
-- Saved logins come from Data/'s `Store.listTshLogins()`; `markSavedLoginUsed`
-  forwards to `Store.markTshLoginUsed`.
+- Saved logins are read straight from `Store["tshLogins"]` (and
+  `markSavedLoginUsed` writes `lastUsed`/`useCount`) until data's store methods exist.
 - Connector sections of the ping list keys sorted (JS used insertion order).
+- tsh runs started outside this directory (`Tools.runTsh` directly,
+  Connections' `clusterSshConfigText` — upstream now 6 s — and Sessions' tsh
+  tabs) do not get the per-cluster tsh variables until their owners merge
+  `TshEnv.vars(home:proxy:)` / `overrides`.

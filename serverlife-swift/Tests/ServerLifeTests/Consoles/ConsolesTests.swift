@@ -211,3 +211,57 @@ private func layout(_ s: String) -> TmuxLayout { try! TmuxLayout.parse(s) }
         #expect(TimedTmuxHost.timeout(for: "tmux has-session -t '=work' 2>/dev/null && echo yes || echo no") == 10)
     }
 }
+
+// 0.39: tmux panes in saved layouts, closing the last pane, the dialog's hint.
+@Suite struct TmuxRestoreTests {
+    @Test func aHostSessionIsSavedWithItsHostAndLogin() {
+        let h = Host(json: ["type": "ssh", "id": "ssh:web-1", "alias": "web-1"])
+        let j = ConsolesText.tmuxRestore(host: h, local: false, login: "deploy", session: "work")
+        #expect(j["kind"].string == "tmux")
+        #expect(j["hostId"].string == "ssh:web-1")
+        #expect(j["local"].bool == false)
+        #expect(j["label"].string == "web-1")
+        #expect(j["login"].string == "deploy")
+        #expect(j["session"].string == "work")
+        // Only a beam carries a tsh home.
+        #expect(j.object?.keys.contains("home") == false)
+    }
+
+    @Test func thisMachineHasNoHostId() {
+        let j = ConsolesText.tmuxRestore(host: Host.localMachine, local: true, login: nil, session: "serverlife")
+        #expect(j["hostId"].isNull)
+        #expect(j["login"].isNull)
+        #expect(ConsolesText.tmuxRestoreKey(j) == "local||serverlife")
+        #expect(ConsolesText.tmuxRestoreSummary(j) == "tmux “serverlife” on this machine")
+    }
+
+    @Test func aBeamKeepsItsHomeAndIsRebuiltFromItsId() {
+        var b = Host(type: Host.beam, id: "beam:teleport.example.com:443:sharp-fox", name: "sharp-fox")
+        b.proxy = "teleport.example.com:443"
+        b.home = "/tmp/tsh-a"
+        let j = ConsolesText.tmuxRestore(host: b, local: false, login: nil, session: "serverlife")
+        #expect(j["home"].string == "/tmp/tsh-a")
+        let back = ConsolesText.beamHost(id: j["hostId"].string!, home: j["home"].string)
+        #expect(back?.isBeam == true)
+        #expect(back?.proxy == "teleport.example.com:443")
+        #expect(back?.name == "sharp-fox")
+        #expect(back?.home == "/tmp/tsh-a")
+        #expect(ConsolesText.beamHost(id: "ssh:web-1", home: nil) == nil)
+        #expect(ConsolesText.beamHost(id: "beam::x", home: nil) == nil)
+    }
+
+    @MainActor @Test func restoreHostFindsThisMachineAndBeams() {
+        #expect(ConsolesTmux.restoreHost(["local": true, "hostId": nil, "session": "s"])?.isLocal == true)
+        let b = ConsolesTmux.restoreHost(["local": false, "hostId": "beam:p:443:fox", "home": nil, "session": "s"])
+        #expect(b?.isBeam == true && b?.home == nil && b?.proxy == "p:443")
+    }
+
+    @Test func wording() {
+        #expect(ConsolesText.lastPaneMessage(session: "work")
+            == "It is the last pane in tmux session “work”, so closing it ends the session on the server.")
+        #expect(ConsolesText.lastPaneMessage(session: "").contains("“tmux”"))
+        let hint = ConsolesText.tmuxDialogHint(version: "3.4", label: "web-1")
+        #expect(hint.hasPrefix("tmux is a terminal multiplexer: a program that has to be installed and running on web-1 itself"))
+        #expect(hint.contains("tmux 3.4 is already there, so this is covered."))
+    }
+}

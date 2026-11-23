@@ -136,16 +136,16 @@ extension SessionsWindow {
     }
 
     func requestCloseTab(_ tabId: String) async {
-        if await confirmClosing(tabIds: [tabId]) { closeTab(tabId) }
+        if await confirmClosing(tabIds: [tabId]) { closeTab(tabId, animate: true) }
     }
 
     func requestCloseTabs(_ ids: [String]) async {
         guard !ids.isEmpty else { return }
-        if await confirmClosing(tabIds: ids) { for id in ids { closeTab(id) } }
+        if await confirmClosing(tabIds: ids) { for id in ids { closeTab(id, animate: true) } }
     }
 
     func requestClosePane(_ paneId: String) async {
-        if await confirmClosing(paneIds: [paneId]) { closePane(paneId) }
+        if await confirmClosing(paneIds: [paneId]) { await closePaneByHand(paneId) }
     }
 }
 

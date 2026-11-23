@@ -30,7 +30,7 @@ extension SessionsWindow {
             }
         }
         if !top.isEmpty || (p.kind == .device && p.reconnect != nil) { m.addItem(.separator()) }
-        if p.kind == .local && !p.isHosts {
+        if p.kind == .local && !p.isHosts && (p.attachments["kubeKind"] as? String) != "browser" {
             m.sessAdd("Open in tmux on this machine\u{2026}",
                       tooltip: "A tmux session here — what runs in it keeps running when this window closes") {
                 Actions.shared.perform("tmux-open", window: window, host: Host.localMachine)
@@ -48,9 +48,29 @@ extension SessionsWindow {
             let t = Clipboard.read()
             if !t.isEmpty, p.hasTerm { _ = self; p.backend?.write(Data(t.utf8)) }
         }
+        // nettools.js `decodeMenu`, when NetTools has it.
+        if Actions.shared.isRegistered("decode-menu") {
+            let dm = NSMenu()
+            Actions.shared.perform("decode-menu", window: window, paneId: p.id,
+                                   args: ["menu": dm, "input": hasSel ? (p.term?.selectionText ?? "") : ""])
+            if !dm.items.isEmpty {
+                let di = NSMenuItem(title: "Decode", action: nil, keyEquivalent: "")
+                di.toolTip = hasSel ? "Take the selected text apart" : "Open a decoder to paste into"
+                di.submenu = dm
+                m.addItem(di)
+            }
+        }
+        // The AI assistant, from here: give what is selected (or on screen)
+        // to the assistant, with where it came from.
+        if p.kind != .view && !p.isHosts && Actions.shared.isRegistered("ai-pane-ask") {
+            m.sessAdd(hasSel ? "Ask the AI about this" : "Ask the AI about what is on screen",
+                      tooltip: "Put it into the AI assistant, with the host it came from — then type your question") {
+                Actions.shared.perform("ai-pane-ask", window: window, paneId: p.id, connId: p.connId)
+            }
+        }
         m.addItem(.separator())
-        m.sessAdd("Split right — same host", key: "⌘⇧D") { [weak self] in Task { await self?.splitActivePane(.row) } }
-        m.sessAdd("Split down — same host", key: "⌘⇧E") { [weak self] in Task { await self?.splitActivePane(.col) } }
+        m.sessAdd("Split right — same tab", key: "⌘⇧D") { [weak self] in Task { await self?.splitActivePane(.row) } }
+        m.sessAdd("Split down — same tab", key: "⌘⇧E") { [weak self] in Task { await self?.splitActivePane(.col) } }
         m.sessAdd("Split right — another host…") { [weak self] in self?.pickHostForSplit(.row) }
         m.sessAdd("Split down — another host…") { [weak self] in self?.pickHostForSplit(.col) }
         let move = NSMenu()
@@ -96,10 +116,28 @@ extension SessionsWindow {
             StatusBus.shared.show("Terminal copied")
         }
         m.addItem(.separator())
+        PaneStyle.addPaneMenu(m, p, window: window)
+        if PaneStats.shared.canShow(p) {
+            m.sessAdd(PaneStats.shared.hasBar(p) ? "Hide live stats" : "Show live stats",
+                      tooltip: p.kind == .local
+                        ? "CPU, memory, disk and network for this computer, under every local shell — kept off once hidden, until shown again"
+                        : "CPU, memory, disk and network for this host, under the terminal") {
+                PaneStats.shared.toggle(p)
+            }
+        }
         m.sessAdd("Clear") { p.term?.clearScreen() }
+        m.sessAdd("Redraw", tooltip: "Fix muddled text: repaints the terminal and has the program in it (Claude Code, vim, htop) draw its screen again") { [weak self] in
+            self?.redrawPane(p)
+        }
         m.sessAdd("Reconnect", enabled: p.kind != .local) { [weak self] in Task { await self?.reconnectPane(p) } }
         m.addItem(.separator())
-        m.sessAdd("Close pane", key: "⌘W") { [weak self] in self?.closePane(paneId) }
+        // A tmux pane closes in tmux too; this one only stops showing it.
+        if p.kind == .tmux {
+            m.sessAdd("Close the view (keep it running in tmux)") { [weak self] in self?.closePane(paneId) }
+        }
+        m.sessAdd(p.kind == .tmux ? "Close pane (in tmux too)" : "Close pane", key: "⌘W") { [weak self] in
+            Task { await self?.closePaneByHand(paneId) }
+        }
         return m
     }
 

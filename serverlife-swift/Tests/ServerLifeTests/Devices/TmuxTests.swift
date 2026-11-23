@@ -209,18 +209,8 @@ private func isProbe(_ e: TmuxEvent) -> Bool { if case .probe = e { return true 
                         .activeWindow(session: "$0", window: "@1"), .session(id: "$0", name: "serverlife"),
                         .windowClose("@1"), .exit(nil)])
         #expect(feed(p, "%exit detached\n") == [.exit("detached")])
-        #expect(feed(p, "%unlinked-window-add @7\n%sessions-changed\n")
-            == [.windowAdd("@7"), .sessionsChanged])
-    }
-
-    /// `%session-renamed $0 newname` (checked against tmux 3.7c): the id is
-    /// not part of the name. Older tmux sent the name alone.
-    @Test func sessionRenamedCarriesOnlyTheName() {
-        let p = TmuxParser()
-        _ = feed(p, Tmux.DCS)
-        #expect(feed(p, "%session-renamed $0 newname\n") == [.sessionRenamed("newname")])
-        #expect(feed(p, "%session-renamed $12 two words\n") == [.sessionRenamed("two words")])
-        #expect(feed(p, "%session-renamed work\n") == [.sessionRenamed("work")])
+        #expect(feed(p, "%unlinked-window-add @7\n%sessions-changed\n%session-renamed work\n")
+            == [.windowAdd("@7"), .sessionsChanged, .sessionRenamed("work")])
     }
 
     @Test func flowControlOutputCarriesAge() {
@@ -266,17 +256,6 @@ private func isProbe(_ e: TmuxEvent) -> Bool { if case .probe = e { return true 
         #expect(odd.reason == "tmux is installed but did not report a version")
     }
 
-    @MainActor @Test func localTmuxGetsAUTF8Locale() {
-        let pe = ProcessInfo.processInfo.environment
-        let env = TmuxLocalHost.env()
-        if (pe["LANG"] ?? "").isEmpty && (pe["LC_ALL"] ?? "").isEmpty && (pe["LC_CTYPE"] ?? "").isEmpty {
-            #expect(env["LANG"] == .some("en_US.UTF-8"))
-        } else {
-            #expect(env["LANG"] == nil, "a locale the user set is left alone")
-        }
-        #expect(env.keys.contains("TMUX") && env["TMUX"]! == nil)
-    }
-
     @Test func sessionListParsing() {
         let out = "work\t$0\t3\t1\t1790000000\nscratch\t$1\t1\t0\t0\nbroken line\n"
         let s = TmuxControl.parseSessions(out)
@@ -296,8 +275,8 @@ private func isProbe(_ e: TmuxEvent) -> Bool { if case .probe = e { return true 
 
     @MainActor @Test func startCommand() {
         let s = TmuxSession(host: TmuxLocalHost.shared, sessionName: "it's", cols: 120, rows: 34)
-        #expect(s.startCommand() == "tmux -CC new-session -A -s 'it'\\''s' -x 120 -y 34")
-        #expect(s.startCommand(attach: false) == "tmux -CC new-session -s 'it'\\''s' -x 120 -y 34")
+        #expect(s.startCommand() == "tmux -u -CC new-session -A -s 'it'\\''s' -x 120 -y 34")
+        #expect(s.startCommand(attach: false) == "tmux -u -CC new-session -s 'it'\\''s' -x 120 -y 34")
         #expect(TmuxSession(host: TmuxLocalHost.shared).sessionName == "serverlife")
     }
 }
@@ -362,17 +341,9 @@ private final class PrivateTmuxHost: TmuxHost {
         for _ in 0..<50 where (s.windowList().first?.panes.count ?? 0) < 2 { try await Task.sleep(nanoseconds: 30_000_000) }
         #expect(s.windowList().first?.panes.count == 2)
 
-        // Renamed from elsewhere: the session keeps its real name, so End
-        // still finds it and "still there?" still asks about the right one.
-        _ = try await s.command("rename-session -t sl-test sl-renamed")
-        for _ in 0..<100 where s.sessionName != "sl-renamed" { try await Task.sleep(nanoseconds: 20_000_000) }
-        #expect(s.sessionName == "sl-renamed")
-        #expect(await TmuxService.shared.stillThere(s) == true)
-
         var ended: (String?, Bool?)?
         s.onEnded = { ended = ($0, $1) }
         await TmuxService.shared.kill(s.id)
-        #expect(await TmuxService.shared.stillThere(s) == false, "kill-session found it by its new name")
         #expect(ended?.0 == "ended" && ended?.1 == false)
         #expect(TmuxService.shared.sessions[s.id] == nil)
         await host.killServer()

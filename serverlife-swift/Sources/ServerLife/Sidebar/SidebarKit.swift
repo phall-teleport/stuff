@@ -23,7 +23,7 @@ enum SBZoom {
 /// What is being dragged inside the host list.
 @MainActor
 enum SBDrag {
-    enum Item { case host(id: String, groupKey: String, host: Host), folder(HostFolder), group(String) }
+    enum Item { case host(id: String, groupKey: String, host: Host), folder(HostFolder), group(String), macro(JSON) }
     static var current: Item?
     /// The payload the current drag carries. SwiftUI has no "drag ended", so a
     /// drag cancelled outside a target leaves `current` set; a drop only acts
@@ -89,7 +89,7 @@ extension View {
 
 /// `.tag`: a small rounded label on a row or heading.
 struct SBTag: View {
-    enum Kind { case plain, tunnel, mfa, stale, hb, req, gone, held, beams, live, expired, rule, pinned, ok }
+    enum Kind { case plain, tunnel, mfa, stale, hb, req, gone, held, beams, live, expired, rule, pinned, ok, soon, vnetOn, vnetBusy, vnetErr }
     let text: String
     var kind: Kind = .plain
     var help: String? = nil
@@ -109,6 +109,10 @@ struct SBTag: View {
             case .expired: return (p.red.opacity(0.75), p.panel3, nil)
             case .rule: return (p.text, p.accentDim, nil)
             case .pinned: return (p.text, .clear, nil)
+            case .soon: return (p.amber, p.amber.opacity(0.18), p.amber.opacity(0.45))
+            case .vnetOn: return (p.green, p.green.opacity(0.16), p.green.opacity(0.45))
+            case .vnetBusy: return (p.muted, p.panel3, p.border)
+            case .vnetErr: return (p.red, p.red.opacity(0.14), p.red.opacity(0.45))
             }
         }()
         Text(text)

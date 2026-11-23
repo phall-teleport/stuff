@@ -127,21 +127,34 @@ struct PaneView: View {
         let p = Theme.shared.p
         let focused = s.activePaneId == pane.id
         VStack(spacing: 0) {
+            // Show terminal: the notice as a bar above the head, covering nothing.
+            if let o = pane.overlay, pane.overlayPeek { PaneOverlayBar(s: s, pane: pane, overlay: o) }
             PaneHeaderView(s: s, pane: pane, focused: focused)
             PaneBodyView(s: s, pane: pane)
+            // Live stats for the host; a files-only pane has no session to show them for.
+            if pane.statsKey != nil && !pane.filesOnly { PaneStatsBar(pane: pane) }
         }
         .overlay {
-            if let o = pane.overlay { PaneOverlayView(s: s, pane: pane, overlay: o) }
+            if let o = pane.overlay, !pane.overlayPeek { PaneOverlayView(s: s, pane: pane, overlay: o) }
         }
         .overlay(RoundedRectangle(cornerRadius: 0).stroke(focused ? p.accentDim : Color.clear, lineWidth: 1))
         .overlay(dropping.on ? RoundedRectangle(cornerRadius: 0).stroke(p.accent, lineWidth: 2) : nil)
         .opacity(PaneDrag.shared.current == pane.id ? 0.55 : 1)
         .background(GeometryReader { g in
             Color.clear
-                .onAppear { pane.frame = g.frame(in: .named("sessions.workspace")) }
-                .onChange(of: g.frame(in: .named("sessions.workspace"))) { _, f in pane.frame = f }
+                .onAppear { pane.frame = g.frame(in: .named("sessions.workspace")); pane.windowFrame = g.frame(in: .global) }
+                .onChange(of: g.frame(in: .named("sessions.workspace"))) { _, f in pane.frame = f; pane.windowFrame = g.frame(in: .global) }
         })
         .onDrop(of: [UTType.text], delegate: PaneDropDelegate(s: s, target: pane, active: $dropping.on))
+        // Opt-in (Settings → "Focus follows the mouse"): hovering a pane makes
+        // it the active one with the keyboard in it, as a click would. Off by
+        // default: a stray pass of the mouse stealing keystrokes is worse
+        // than the click it saves.
+        .onHover { inside in
+            guard inside, Store.shared.setting("focusFollowsMouse", false), s.activePaneId != pane.id else { return }
+            s.setActivePane(pane.id)
+            s.focusActivePane()
+        }
     }
 }
 
@@ -171,7 +184,7 @@ struct PaneBodyView: View {
                             .frame(width: pane.filesOnly ? nil : (stacked ? nil : size),
                                    height: pane.filesOnly ? nil : (stacked ? size : nil))
                             .frame(maxWidth: pane.filesOnly ? .infinity : nil, maxHeight: pane.filesOnly ? .infinity : nil)
-                            .background(p.panel)
+                            .background((pane.chrome ?? p).panel)
                         if !pane.filesOnly {
                             SplitDivider(horizontal: !stacked) { delta in
                                 let base = accessorySize(g.size, stacked: stacked)
@@ -184,9 +197,12 @@ struct PaneBodyView: View {
                         }
                     }
                     if !pane.filesOnly {
-                        TermHostView(pane: pane, covered: pane.overlay != nil, ended: pane.tmuxEnded != nil)
+                        TermHostView(pane: pane, covered: pane.overlay != nil && !pane.overlayPeek,
+                                     ended: pane.tmuxEnded != nil && !pane.overlayPeek)
                             .padding(.top, 3).padding(.leading, 5)
-                            .background(Color(nsColor: pane.term?.nativeBackgroundColor ?? .black))
+                            // The padding round the terminal is the pane's, not the window's:
+                            // a light pane in a dark window has no dark rim.
+                            .background(pane.styleBackground ?? Color(nsColor: pane.term?.nativeBackgroundColor ?? .black))
                     }
                 }
             }
@@ -524,17 +540,57 @@ struct PaneOverlayView: View {
                     }
                     .padding(.bottom, 10)
                 }
-                HStack(spacing: 8) {
-                    if let alt = overlay.alt { Button(alt.label) { alt.run() }.buttonStyle(.primary) }
-                    if overlay.error != nil, let retry = overlay.retry {
-                        Button("Retry") { retry() }.buttonStyle(overlay.alt != nil ? .ghost : .primary)
-                    }
-                    Button(overlay.error != nil ? "Close pane" : "Cancel") { s.closePane(pane.id) }.buttonStyle(.ghost)
-                }
+                HStack(spacing: 8) { PaneOverlayButtons(s: s, pane: pane, overlay: overlay) }
             }
             .frame(maxWidth: 560)
             .padding(.horizontal, 24)
         }
         .onChange(of: connState) { _, st in if st == "prompting" { pane.overlaySawPrompt = true } }
+    }
+}
+
+/// The overlay's row of buttons — on the notice, and on its folded bar.
+struct PaneOverlayButtons: View {
+    let s: SessionsWindow
+    let pane: SessionPane
+    let overlay: PaneOverlay
+    var small = false
+
+    var body: some View {
+        let size: CGFloat = small ? 11 : 12
+        if let alt = overlay.alt { Button(alt.label) { alt.run() }.buttonStyle(.primary).font(.system(size: size)) }
+        if overlay.error != nil, let retry = overlay.retry {
+            Button("Retry") { retry() }.buttonStyle(overlay.alt != nil ? .ghost : .primary).font(.system(size: size))
+        }
+        Button(overlay.error != nil ? "Close pane" : "Cancel") { s.closePane(pane.id) }.buttonStyle(.ghost).font(.system(size: size))
+        if overlay.peek {
+            Button(pane.overlayPeek ? "Show notice" : "Show terminal") {
+                pane.overlayPeek.toggle()
+                if pane.overlayPeek { s.setActivePane(pane.id); s.focusActivePane() }
+            }
+            .buttonStyle(.ghost).font(.system(size: size))
+            .help("Read what was on screen; the buttons stay in a bar at the top")
+        }
+    }
+}
+
+/// The notice folded into a bar along the top of the pane: its title and
+/// its buttons, the terminal at full strength under it.
+struct PaneOverlayBar: View {
+    let s: SessionsWindow
+    let pane: SessionPane
+    let overlay: PaneOverlay
+
+    var body: some View {
+        let p = Theme.shared.p
+        HStack(spacing: 10) {
+            Text(overlay.title).font(.system(size: 12, weight: .semibold))
+                .lineLimit(1).truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            PaneOverlayButtons(s: s, pane: pane, overlay: overlay, small: true)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(p.panel2)
+        .overlay(alignment: .bottom) { p.border.frame(height: 1) }
     }
 }

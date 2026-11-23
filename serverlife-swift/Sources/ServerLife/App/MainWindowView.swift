@@ -79,6 +79,7 @@ struct MainWindowView: View {
         }
         .background(p.bg)
         .overlay(alignment: .bottomTrailing) { ToastsView().padding(.bottom, 30).padding(.trailing, 12) }
+        .overlay(alignment: .bottomTrailing) { LoginBannerView().padding(.bottom, 44).padding(.trailing, 16) }
         .overlay {
             ForEach(Array(Slots.overlays.enumerated()), id: \.offset) { _, make in make(window) }
         }
@@ -164,8 +165,29 @@ struct StatusBarView: View {
         switch k {
         case .info: return p.textDim
         case .ok: return p.green
-        case .warn: return p.amber
+        case .warn, .login: return p.amber
         case .error: return p.red
+        }
+    }
+}
+
+/// ui.js #login-banner: a login in flight, big enough not to miss.
+private struct LoginBannerView: View {
+    var body: some View {
+        let p = Theme.shared.p
+        if let text = StatusBus.shared.loginBanner {
+            HStack(spacing: 12) {
+                ProgressView().controlSize(.small).tint(p.amber)
+                Text(text).font(.system(size: 16, weight: .semibold)).foregroundStyle(p.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 16)
+            .frame(maxWidth: 420, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(p.panel3))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(p.amber))
+            .shadow(color: .black.opacity(0.5), radius: 16, y: 12)
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+            .allowsHitTesting(false)
         }
     }
 }

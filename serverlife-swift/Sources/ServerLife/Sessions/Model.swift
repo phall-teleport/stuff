@@ -37,6 +37,9 @@ struct PaneOverlay {
     var notes = ""
     /// The scene playing while it dials; none on an error.
     var scene: ConnectAnim?
+    /// The text behind the notice is worth reading (what was on screen when
+    /// a session ended): "Show terminal" folds the notice into a bar.
+    var peek = false
 }
 
 /// One pane: the port of the pane objects sessions.js kept in `state.panes`.
@@ -74,6 +77,11 @@ final class SessionPane: Identifiable {
     @ObservationIgnored var backend: TerminalBackend?
     /// Whether something is attached and running (the original's `termId`).
     var hasTerm = false
+    /// A local shell, not a program (live stats read this computer for it).
+    @ObservationIgnored var plainShell = false
+    /// Which machine's live stats bar this pane shows ("local" or a
+    /// connection id), nil when it shows none (monitor.js `statsBar`).
+    var statsKey: String?
 
     /// The terminal, for every kind but `view`.
     @ObservationIgnored private(set) var term: SessionTermView?
@@ -107,11 +115,26 @@ final class SessionPane: Identifiable {
     /// How a console with no connection is opened again after it ended.
     @ObservationIgnored var reconnect: (() async throws -> TerminalBackend)?
     var reconnectArmed = false
+    /// The header's "↻ Reconnect": shown the moment a session ends (not for
+    /// a local shell), hidden as soon as something reconnects it.
+    var showReconnect = false
+    /// The overlay folded into a bar along the top (PaneOverlay.peek).
+    var overlayPeek = false
 
     // MFA watch for tsh sessions that exit without reaching a shell.
     @ObservationIgnored var mfaTail = ""
     @ObservationIgnored var mfaSucceeded = false
     @ObservationIgnored var mfaOffered = false
+
+    /// panestyle.js: the pane's own look (`{theme, font}`; an empty object
+    /// is "as the app", not "as the host"), and whether changes carry on to
+    /// the host (nil = not asked yet).
+    var style: [String: String]?
+    @ObservationIgnored var styleForHost: Bool?
+    /// The window colours its style gives the header (nil = the app's).
+    var chrome: Palette?
+    /// The terminal background a styled pane paints its padding with.
+    var styleBackground: Color?
 
     /// Session log (⌘⇧L): where it is going, if anywhere.
     var logPath: String?
@@ -142,6 +165,8 @@ final class SessionPane: Identifiable {
 
     /// Where the pane is on screen (for "the pane to my left").
     @ObservationIgnored var frame: CGRect = .zero
+    /// The same, in the window's content (for the close animation's picture).
+    @ObservationIgnored var windowFrame: CGRect = .zero
     /// Partial UTF-8 sequence carried between chunks for the highlighter.
     @ObservationIgnored var pendingBytes = Data()
 

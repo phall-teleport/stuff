@@ -46,14 +46,16 @@ Sources/ServerLife/
   Core/        JSON, Store (sessions.json, compatible with the original), Proc,
                PTYProcess, ByteChannel/ProcessChannel, TerminalBackend/PTYBackend,
                Host (descriptor + prefKey/clusterPrefKey), Tools (ssh/tsh lookup,
-               tsh homes, runTsh), Util (Fmt, Posix, shellQuote, HostColor …)
+               tsh homes, runTsh), Util (Fmt, Posix, shellQuote, HostColor …),
+               TextUtil (toCsv, diffLines, Fmt.dateTimeTz)
   App/         Main/AppDelegate/Features, MainMenu (every menu item → action id),
                Actions (registry), Windows (WindowModel, WindowManager,
                WindowFeature), MainWindowView (Slots), Modal (sheets, panels,
                confirm/prompt/choose, pickers, Clipboard), Theme (Palette),
                Components (button styles, Badge, Chip, SearchField,
                DialogScaffold, FormRow, OutputBlock, ColorSwatchPicker,
-               EmojiPicker), DebugSnapshot, AppResources
+               EmojiPicker), Components/ (CodeEditor, YamlView, CodeSyntax,
+               onClickOrDoubleClick), BundledFonts, DebugSnapshot, AppResources
   <Feature>/   one directory per owner — see Ownership
 ```
 
@@ -110,6 +112,36 @@ in your final report. Never add stored properties to another owner's types.
   stored records are ms since epoch (`nowMs()`), as in the original.
 - Errors shown to people: throw `AppError("message")`; the message is shown
   verbatim, so write it the way the original does.
+
+## Shared pieces added for 0.39 (lead)
+
+- **Code editor** (`App/Components/CodeEditor.swift`, the original's
+  CodeMirror: yamleditor.js, yamlview.js, sshconfigeditor.js, cmtheme.js):
+  `CodeEditor(text: $s, language: .yaml | .sshConfig | .text, readOnly:,
+  tabIndents:, controller:, linter:, completer:, onChange:)` and read-only
+  `YamlView(text:)`. Line numbers, active line, find bar (⌘F), undo, kept
+  indentation, palette colours; Escape stays in the editor (closes its find
+  bar) and never reaches a dialog's Cancel. `linter` — `(text) async ->
+  [CodeDiagnostic]` (UTF-16 offsets), run 700 ms after typing (kube:validateYaml).
+  `completer` — `(text, cursor, explicit) async -> CodeCompletions?`
+  (kube:explainFields), asked as a word is typed and on ⌃Space.
+  `CodeEditorController().insert("Host x\n  HostName y")` inserts lines at the
+  cursor (sshconfigeditor.js `insert`). `SSHConfigSyntax.knownOptions` is
+  `KNOWN_SSH_OPTIONS`. `--actions dev-code-editor` shows a sample.
+- **Fonts**: `BundledFonts.list` (family, fixed) — bundledfonts.js; all are
+  registered at launch. `BundledFonts.font(family:size:)`,
+  `BundledFonts.resolve(stack:size:)` for a CSS-style font stack.
+- **Text helpers** (Core/TextUtil.swift): `toCsv(rows, columns:)` (csv.js),
+  `diffLines(a, b)` (textdiff.js), `Fmt.dateTimeTz(ms:)` (util.js).
+  `view.onClickOrDoubleClick(single:double:)` (util.js clickOrDblClick).
+- **Lifecycle events**: `app-will-quit` (Quit, SIGTERM, SIGINT — stop helpers
+  synchronously) and `app-resume` (wake / screen unlock — repaint terminals).
+  These are broadcast ids: every `register` adds a listener; all are called.
+- **Login banner**: `StatusBus.shared.show(text, kind: .login)` also shows the
+  big box low on the right (ui.js #login-banner); `show("", kind: .login)`
+  hides it. Only `.login` calls touch it.
+- `Modal.openFiles(…, packages: true)` lets the picker walk into a .app
+  (choosing tsh inside tsh.app). `SERVERLIFE_USER_DATA` = `--data-dir`.
 
 ## Working in parallel (mirrors)
 

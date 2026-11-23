@@ -36,8 +36,6 @@ only closes everything on quit.
   screen, minicom or another window"`, `"<path>: permission denied"`,
   `"<path> is not there — the adapter may have been unplugged"`,
   `"telnet: Unable to connect to remote host: Connection refused (h:23)"` …
-- All writes to the line (keys, telnet replies, NAWS) go through one serial
-  queue per backend: in order, never interleaved, never on the main thread.
 - Ports are opened exclusively (TIOCEXCL + flock, as serialport did);
   non-standard rates use IOSSIOSPEED; DTR/RTS are raised on open.
 - Pure helpers (tested): `Telnet.parse/nawsFrame/escapeIAC/greeting/errorText`,
@@ -158,10 +156,7 @@ persistent zlib streams with resets), ZRLE (one persistent stream; raw, solid,
 packed palette, RLE, palette RLE), Hextile, RRE, Raw; pseudo-encodings
 quality, compression, DesktopSize, LastRect, ExtendedDesktopSize
 (SetDesktopSize), Cursor. ServerCutText/ClientCutText (Latin-1), Bell,
-SetColourMapEntries/Fence skipped safely. Client messages go out on a serial
-background queue (pointer motion is dropped while over 1 MB is waiting); the
-desktop name (1 MB) and ServerCutText (16 MB) lengths are capped and fail
-cleanly.
+SetColourMapEntries/Fence skipped safely.
 
 ## Not done / differences
 
@@ -170,15 +165,13 @@ cleanly.
 - The original never resumed a pane that tmux flow control paused (tmux waits
   for `refresh-client -A '%N:continue'`); `continuePane` exists for the window
   to call — behaviour otherwise unchanged.
-- `%session-renamed $id name` updates `sessionName` with the name only, so
-  End and the ended-vs-detached check keep working after a rename. Local tmux
-  commands get `LANG=en_US.UTF-8` when no locale is set (main.js). Over a
-  connection the probe and session list use 15 s, has-session 10 s.
-- `.rdp` files open in whatever app the user chose for them; Microsoft's
-  clients by bundle id only when nothing claims the type.
 - tmux 3.6+ prints the tabs in `-F` output as `_` (control mode too), which
   broke the original's `list-sessions` / `list-windows` parsing on current
   tmux; lines are now matched from both ends (`TmuxControl.fields`).
+  As of 0.39 every tmux command also passes `-u` (`tmux -u list-sessions`,
+  `tmux -u -CC` / `-u -C`), as the original now does: without a UTF-8 locale
+  tmux rewrites tabs and non-ASCII text as `_`. The both-ends matching stays
+  as a second line of defence.
 - `vncbridge.js` has no equivalent: the client speaks TCP directly. TightPNG
   and the 8-bit low-bandwidth pixel modes noVNC offered are not implemented
   (never requested).

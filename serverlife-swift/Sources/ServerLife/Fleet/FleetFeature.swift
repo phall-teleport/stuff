@@ -70,8 +70,38 @@ enum FleetFeature {
         }
         SessionHooks.paneClosing.append { pane in Macros.shared.stopRepeatsForPane(pane.id) }
 
+        // Recording a macro (macrorecord.js): the badge, the pane menu entry, the ids.
+        MacroRecord.install()
+        func recordPane(_ ctx: ActionContext) -> SessionPane? {
+            let s = ctx.paneId.flatMap { SessionsCore.owner(ofPane: $0) } ?? ctx.window?.feature(SessionsWindow.self)
+            return s.flatMap { $0.pane(ctx.paneId) ?? $0.activePane }
+        }
+        a.register("macro-record-start") { ctx in
+            guard let p = recordPane(ctx) else { StatusBus.shared.toast("Open a session to record in", kind: .error); return }
+            MacroRecord.start(p)
+        }
+        a.register("macro-record-stop") { ctx in
+            guard let p = recordPane(ctx) else { return }
+            Task { @MainActor in await MacroRecord.stop(p, window: ctx.window) }
+        }
+        PaneMenuItems.shared.register("fleet.macro-record", section: .middle) { pane, w in
+            guard pane.kind != .view, pane.kind != .device, !pane.filesOnly else { return [] }
+            if let r = MacroRecord.recorder(pane) {
+                return [SessMenuItem("\u{25CF} Stop recording the macro (\(r.steps.count))\u{2026}") {
+                    Task { @MainActor in await MacroRecord.stop(pane, window: w) }
+                }]
+            }
+            return [SessMenuItem("\u{25CF} Record a macro", tooltip: "Run commands as usual; when you stop, they become a macro") {
+                MacroRecord.start(pane)
+            }]
+        }
+
+        // Scheduled multi-exec runs (mxschedule.js), app-wide so two windows cannot both fire one.
+        MXScheduler.shared.start()
+
         MultiExecService.shared.onDone.append { view in
             // Recent runs records the outcome, so it is written now that there is one.
+            MXScheduler.shared.runDone(view)
             FleetHistory.shared.finish(view)
             let failed = view.results.filter { $0.status != "done" }.count
             StatusBus.shared.show(failed > 0
@@ -104,6 +134,7 @@ enum FleetFeature {
                 a.register("fleet-debug-dock-\(t)") { ctx in ctx.window?.showDock(t) }
             }
             a.register("fleet-debug-mx-macros") { ctx in ctx.window?.feature(FleetWindow.self).mxView = "macros"; ctx.window?.showDock("multiexec") }
+            a.register("fleet-debug-mx-scheduled") { ctx in ctx.window?.feature(FleetWindow.self).mxView = "scheduled"; ctx.window?.showDock("multiexec") }
             a.register("fleet-debug-mx-history") { ctx in ctx.window?.feature(FleetWindow.self).mxView = "history"; ctx.window?.showDock("multiexec") }
             a.register("fleet-debug-macro-menu") { ctx in
                 FleetMenu.show(MacroMenu.build(kind: "remote", paneId: nil, window: ctx.window), at: NSPoint(x: 900, y: 800))

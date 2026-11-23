@@ -106,13 +106,11 @@ enum RDPLauncher {
     /// The installed Microsoft client, if any (by bundle id), else whatever
     /// claims `.rdp` files.
     static func clientApp(for file: URL? = nil) -> URL? {
-        // Whatever the user has chosen for .rdp files comes first, as
-        // `shell.openPath` did (Royal TSX, Jump Desktop …).
-        if let file, let u = NSWorkspace.shared.urlForApplication(toOpen: file) { return u }
-        if let t = UTType(filenameExtension: "rdp"), let u = NSWorkspace.shared.urlForApplication(toOpen: t) { return u }
         for id in bundleIds {
             if let u = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) { return u }
         }
+        if let file, let u = NSWorkspace.shared.urlForApplication(toOpen: file) { return u }
+        if let t = UTType(filenameExtension: "rdp") { return NSWorkspace.shared.urlForApplication(toOpen: t) }
         return nil
     }
 

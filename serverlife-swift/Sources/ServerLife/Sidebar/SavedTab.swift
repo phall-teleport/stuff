@@ -116,12 +116,22 @@ private struct SBMacrosPanel: View {
                 .padding(.horizontal, 10).padding(.vertical, 7)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .overlay(alignment: .bottom) { p.borderSoft.frame(height: 1) }
+                // At the top, not under the list: with the built-ins alone the
+                // list runs past the bottom of the sidebar.
+                SBFlow(spacing: 6) {
+                    Button("New macro…") { Task { await src.edit([:], window: window) } }.buttonStyle(.ghost)
+                    Button("Restore built-ins") { Task { await src.restoreBuiltins() } }.buttonStyle(.ghost)
+                        .help("Bring back any built-in macros you have hidden")
+                    Button("Export…") { Actions.shared.perform("backup-export", window: window, args: ["what": "macros"]) }
+                        .buttonStyle(.ghost).help("Write your macros to a file")
+                    Button("Import…") { SBActions.runImport(window: window) }.buttonStyle(.ghost)
+                        .help("Load macros, or a whole settings export, from a file")
+                }
+                .padding(.horizontal, 10).padding(.top, 2).padding(.bottom, 8)
                 if shown.isEmpty {
-                    VStack(alignment: .leading, spacing: 9) {
-                        Text(sw.filterText.isEmpty ? "No macros yet." : "No matching macros.")
-                        Button("New macro…") { Task { await src.edit([:], window: window) } }.buttonStyle(.ghost)
-                    }
-                    .font(SBZoom.font(12)).foregroundStyle(p.muted).padding(12)
+                    // The buttons above cover it, Restore built-ins included.
+                    Text(sw.filterText.isEmpty ? "No macros yet." : "No matching macros.")
+                        .font(SBZoom.font(12)).foregroundStyle(p.muted).padding(12)
                 } else {
                     let groups = src.categories(shown)
                     ForEach(Array(groups.enumerated()), id: \.offset) { i, g in
@@ -133,19 +143,11 @@ private struct SBMacrosPanel: View {
                                 }
                             }
                         } content: {
-                            ForEach(Array(g.items.enumerated()), id: \.offset) { _, m in macroRow(m, src) }
+                            ForEach(Array(g.items.enumerated()), id: \.offset) { _, m in
+                                SBMacroDrag(macro: m, src: src) { macroRow(m, src) }
+                            }
                         }
                     }
-                    HStack(spacing: 6) {
-                        Button("New macro…") { Task { await src.edit([:], window: window) } }.buttonStyle(.ghost)
-                        Button("Restore built-ins") { Task { await src.restoreBuiltins() } }.buttonStyle(.ghost)
-                            .help("Bring back any built-in macros you have hidden")
-                        Button("Export…") { Actions.shared.perform("backup-export", window: window, args: ["what": "macros"]) }
-                            .buttonStyle(.ghost).help("Write your macros to a file")
-                        Button("Import…") { SBActions.runImport(window: window) }.buttonStyle(.ghost)
-                            .help("Load macros, or a whole settings export, from a file")
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 9)
                 }
             }
         } else {
@@ -241,5 +243,38 @@ private struct SBMacrosPanel: View {
             CtxItem(builtin ? "Hide this built-in" : "Delete") { Task { _ = await src.delete(m, window: window) } },
         ]
         return items
+    }
+}
+
+/// Drag a macro to put it where you want it — the ▶ menu follows the same order.
+private struct SBMacroDrag<Content: View>: View {
+    let macro: JSON
+    let src: SidebarMacroSource
+    @ViewBuilder let content: () -> Content
+    @StateObject private var height = Local<CGFloat>(22)
+    @StateObject private var mark = Local<Bool?>(nil)
+
+    var body: some View {
+        let p = Theme.shared.p
+        let id = macro["id"].stringish ?? ""
+        content()
+            .background(SBHeightReader(height: $height.value))
+            .overlay(alignment: .top) { if mark.value == false { p.accent.frame(height: 2) } }
+            .overlay(alignment: .bottom) { if mark.value == true { p.accent.frame(height: 2) } }
+            .onDrag { SBDrag.begin(.macro(macro)) }
+            .onDrop(of: [.text], delegate: SBDropDelegate(height: height.value, canTake: {
+                if case .macro(let m) = SBDrag.current { return m["id"].stringish != id }
+                return false
+            }, onTarget: { mark.value = $0 }, perform: { after in
+                guard case .macro(let moving) = SBDrag.current, let mid = moving["id"].stringish else { return }
+                let from = moving["category"].stringish?.nilIfEmpty ?? "Custom"
+                let to = macro["category"].stringish?.nilIfEmpty ?? "Custom"
+                let name = moving["name"].stringish ?? ""
+                Task {
+                    if await src.moveMacro(mid, id, after: after) {
+                        SBActions.status(from == to ? "Macro order saved" : "Moved \(name) to \(to)")
+                    }
+                }
+            }))
     }
 }

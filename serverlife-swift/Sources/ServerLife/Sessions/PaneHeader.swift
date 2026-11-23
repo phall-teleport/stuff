@@ -10,7 +10,8 @@ struct PaneHeaderView: View {
     let focused: Bool
 
     var body: some View {
-        let p = Theme.shared.p
+        // A styled pane's header wears its theme's colours (paintChrome).
+        let p = pane.chrome ?? Theme.shared.p
         let colour = SessionsCore.hostColor(connId: pane.connId)
         let title = SessionsCore.paneTitle(pane)
         HStack(spacing: 6) {
@@ -22,6 +23,20 @@ struct PaneHeaderView: View {
                 .allowsHitTesting(false)
             if let ended = pane.tmuxEnded {
                 Text(ended).font(.system(size: 10.5)).foregroundStyle(p.amber).allowsHitTesting(false)
+            }
+            // Next to the name — the one place on the pane already being
+            // looked at, rather than a line in the scrollback.
+            if pane.showReconnect {
+                Button("↻ Reconnect") { s.reconnectFromBanner(pane) }
+                    .buttonStyle(HeaderButtonStyle(color: p.accent, size: 10))
+                    .help("Open this session again")
+            }
+            // Teleport, on a session whose host has no Teleport agent — the
+            // sidebar's offer, on the pane that is actually open.
+            if pane.kind != .local && SessPresence.shared.missing(connId: pane.connId) {
+                Button("⚡") { Task { await SessPresence.shared.installClicked(pane.connId, window: s.window) } }
+                    .buttonStyle(HeaderButtonStyle(color: p.amber))
+                    .help("No Teleport agent on this host — install Teleport and join it to a cluster…")
             }
             Spacer(minLength: 4)
             if pane.kind != .view {
@@ -35,7 +50,7 @@ struct PaneHeaderView: View {
                                            args: ["connId": pane.connId ?? "", "tool": "ports"])
                 }
                 .buttonStyle(HeaderButtonStyle())
-                .help("Network tools from this host — reachability, HTTP and its own addresses")
+                .help("Network and certificate tools from this host — reachability, HTTP and its own addresses")
             }
             let tmuxCtl = PaneHeaderItems.shared.views(.tmuxControls, pane)
             if !tmuxCtl.isEmpty {
@@ -62,7 +77,7 @@ struct PaneHeaderView: View {
                     .help("Show/hide this file explorer (⌘E)\nRight-click for every pane in this tab")
                     .contextMenu { explorerScopeMenu() }
             }
-            Button("×") { s.closePane(pane.id) }
+            Button("×") { Task { await s.closePaneByHand(pane.id) } }
                 .buttonStyle(HeaderButtonStyle(size: 13))
                 .help("Close pane")
         }

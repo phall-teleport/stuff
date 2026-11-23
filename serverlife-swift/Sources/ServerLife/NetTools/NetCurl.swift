@@ -25,13 +25,20 @@ struct CurlOptions: Equatable {
     var proxy: String?
     var http2 = false
     var compressed = false
+    /// `--resolve host:port:address` entries, one per line.
+    var resolve = ""
+    /// A private CA bundle, and a client certificate/key for mutual TLS.
+    var caCert = ""
+    var clientCert = ""
+    var clientKey = ""
 
     var json: JSON {
         var o: [String: JSON] = [
             "method": .string(method), "url": .string(url), "headers": .string(headers), "body": .string(body),
             "contentType": .string(contentType), "bearer": .string(bearer), "basicUser": .string(basicUser),
             "basicPass": .string(basicPass), "insecure": .bool(insecure), "followRedirects": .bool(followRedirects),
-            "timeout": .number(Double(timeout)),
+            "timeout": .number(Double(timeout)), "resolve": .string(resolve), "caCert": .string(caCert),
+            "clientCert": .string(clientCert), "clientKey": .string(clientKey),
         ]
         if http2 { o["http2"] = true }
         if compressed { o["compressed"] = true }
@@ -54,6 +61,10 @@ struct CurlOptions: Equatable {
         timeout = ntStoredTimeout(o["timeout"])
         http2 = o["http2"].truthy
         compressed = o["compressed"].truthy
+        resolve = o["resolve"].string ?? ""
+        caCert = o["caCert"].string ?? ""
+        clientCert = o["clientCert"].string ?? ""
+        clientKey = o["clientKey"].string ?? ""
     }
 }
 
@@ -136,6 +147,14 @@ enum NetCurl {
         if o.insecure { args.append("-k") }
         if o.http2 { args.append("--http2") }
         if o.compressed { args.append("--compressed") }
+        // "What would this look like after the cutover" without touching DNS
+        // or /etc/hosts: curl's own way to pin a name to an address.
+        for entry in try resolveEntries(o.resolve) { args += ["--resolve", entry] }
+        // A private CA, or mutual TLS — both common enough against an
+        // internal proxy or a service mesh that "just use -k" is the wrong answer.
+        if !o.caCert.isEmpty { args += ["--cacert", o.caCert] }
+        if !o.clientCert.isEmpty { args += ["--cert", o.clientCert] }
+        if !o.clientKey.isEmpty { args += ["--key", o.clientKey] }
 
         let lines = headerLines(o.headers)
         for h in lines { args += ["-H", h] }
@@ -152,6 +171,18 @@ enum NetCurl {
         }
         args += ["--", try checkUrl(o.url)]
         return (args, method)
+    }
+
+    /// `--resolve` entries, one per line or comma-separated. Only checked for
+    /// the right shape — curl is the authority on whether the address itself
+    /// makes sense.
+    static func resolveEntries(_ text: String) throws -> [String] {
+        let shape = try! NSRegularExpression(pattern: #"^.+:\d{1,5}:.+$"#)
+        return try text.components(separatedBy: CharacterSet(charactersIn: "\n,")).map { $0.ntTrimmed }
+            .filter { !$0.isEmpty }.map { entry in
+                if !shape.matches(entry) { throw AppError("\"\(entry)\" is not host:port:address for --resolve.") }
+                return entry
+            }
     }
 
     static func headerLines(_ text: String) -> [String] {

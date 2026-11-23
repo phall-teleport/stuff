@@ -22,6 +22,11 @@ struct FilesConn: Sendable {
     var login: String?
     /// The remote home the identity probe found, if it has run.
     var homeDir: String?
+    /// On tsh because it had to be (a leaf cluster, no ssh client) rather than
+    /// for per-session MFA — where a command costs nothing extra.
+    var tshByNecessity: Bool = false
+    /// `state === 'connected'`.
+    var connected: Bool = true
 }
 
 @MainActor
@@ -36,11 +41,20 @@ enum FilesBridge {
         try await ConnectionManager.shared.exec(connId, cmd, timeout: timeout).stdout
     }
 
+    /// Run a command; stdout and the exit code, never throwing for a failed
+    /// command (`conn.execResult` in the original). Throws only when the
+    /// connection has gone.
+    static var execResult: (String, String, TimeInterval) async throws -> (stdout: String, code: Int32) = { connId, cmd, timeout in
+        let r = try await ConnectionManager.shared.execResult(connId, cmd, timeout: timeout)
+        return (r.stdout, r.code)
+    }
+
     /// The connection, or nil when it is not open any more.
     static var connection: (String) -> FilesConn? = { connId in
         guard let c = ConnectionManager.shared.connection(connId) else { return nil }
         return FilesConn(id: connId, label: c.label, type: c.type, transport: c.transportKind, target: c.target,
-                         host: c.host, login: c.login?.nilIfEmpty ?? c.remoteUser, homeDir: c.homeDir)
+                         host: c.host, login: c.login?.nilIfEmpty ?? c.remoteUser, homeDir: c.homeDir,
+                         tshByNecessity: c.tshByNecessity, connected: c.state == .connected)
     }
 
     static func require(_ connId: String) throws -> FilesConn {

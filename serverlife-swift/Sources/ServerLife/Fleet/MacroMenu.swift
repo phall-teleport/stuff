@@ -67,9 +67,12 @@ enum MacroMenu {
             }
         }
 
-        for (category, group) in ms.categories(macros) {
-            if !items.isEmpty { items.append(.separator) }
-            items.append(.heading(category))
+        // In a beam its own macros come first: they are why it is a beam.
+        let cats = ms.categories(macros)
+        let ordered = kind == "beam" ? cats.filter { $0.0 == "Beams" } + cats.filter { $0.0 != "Beams" } : cats
+        var sections: [(category: String, entries: [FleetMenuItem])] = []
+        for (category, group) in ordered {
+            var entries: [FleetMenuItem] = []
             for m in group {
                 let canRepeat = !m.interactive && !m.noEnter
                 let ticking = paneId.map { ms.isRepeating($0, m.id) } ?? false
@@ -116,7 +119,7 @@ enum MacroMenu {
                              m.interactive ? "Does not finish on its own \u{2014} follows a log." : "",
                              m.noEnter ? "Pasted at the prompt without Enter, to finish by hand." : "",
                              vars.isEmpty ? "" : "Fills in: " + vars.map(\.name).joined(separator: ", ")].filter { !$0.isEmpty }
-                items.append(FleetMenuItem(
+                entries.append(FleetMenuItem(
                     label: m.name, key: key,
                     title: (m.description.isEmpty ? "" : m.description + "\n\n") + m.command
                         + (m.noEnter ? "\n\n(pasted without pressing Enter)" : ""),
@@ -124,6 +127,7 @@ enum MacroMenu {
                     submenu: sub,
                     onClick: { Task { @MainActor in await ms.send(m, window: window) } }))
             }
+            sections.append((category, entries))
         }
 
         /*
@@ -131,8 +135,9 @@ enum MacroMenu {
          * have just typed the command for the third time — and you are looking at
          * this menu, not at the Saved tab.
          */
-        items.append(.separator)
-        items.append(FleetMenuItem(label: "New macro\u{2026}", icon: "+", title: "Write one, and it appears in this menu on every host",
+        var tail: [FleetMenuItem] = []
+        tail.append(.separator)
+        tail.append(FleetMenuItem(label: "New macro\u{2026}", icon: "+", title: "Write one, and it appears in this menu on every host",
                                    onClick: {
             Task { @MainActor in
                 // Where it was written is the best guess at where it belongs.
@@ -143,8 +148,60 @@ enum MacroMenu {
                 }
             }
         }))
-        items.append(FleetMenuItem(label: "Manage macros\u{2026}", title: "The full list, including the built-in ones",
-                                   onClick: { Macros.openManager(window: window) }))
-        return items
+        // Or show it: run the commands as usual and they become the macro.
+        if let pid = paneId, let pane = SessionsCore.owner(ofPane: pid)?.pane(pid),
+           pane.hasTerm, pane.kind != .view, pane.kind != .device {
+            if let rec = MacroRecord.recorder(pane) {
+                tail.append(FleetMenuItem(label: "Stop recording (\(rec.steps.count))\u{2026}", icon: "\u{25CF}", onClick: {
+                    Task { @MainActor in await MacroRecord.stop(pane, window: window) }
+                }))
+            } else {
+                tail.append(FleetMenuItem(label: "Record a macro", icon: "\u{25CF}",
+                                          title: "Run the commands here as usual; when you stop, they become a macro",
+                                          onClick: { MacroRecord.start(pane) }))
+            }
+        }
+        tail.append(FleetMenuItem(label: "Manage macros\u{2026}", title: "The full list, including the built-in ones",
+                                  onClick: { Macros.openManager(window: window) }))
+
+        /*
+         * Listed down, folding only what does not fit.
+         *
+         * Built-ins and your own together can run past the height of a laptop
+         * screen, and a menu taller than the window had its top pushed off the
+         * edge — the first category simply could not be reached. Folding every
+         * category into a submenu fixed that and cost the quick glance down the
+         * list everywhere else, so it is done one category at a time, largest
+         * first, and only until the rest fits: a tall screen shows everything, a
+         * short one folds the long categories and keeps the short ones open. If
+         * even fully folded it is too tall, it scrolls.
+         */
+        let head = items
+        func layout(_ folded: Set<String>) -> [FleetMenuItem] {
+            var out = head
+            for (i, sec) in sections.enumerated() {
+                let fold = folded.contains(sec.category)
+                // No rule between two folded rows: together they read as one list of sections.
+                let rule = (i > 0 || !head.isEmpty) && !(fold && i > 0 && folded.contains(sections[i - 1].category))
+                if rule { out.append(.separator) }
+                if fold {
+                    out.append(FleetMenuItem(label: sec.category, key: String(sec.entries.count), submenu: sec.entries))
+                } else {
+                    out.append(.heading(sec.category))
+                    out += sec.entries
+                }
+            }
+            return out + tail
+        }
+        let room = FleetMenu.screenRoom() - 16
+        var folded = Set<String>()
+        var menu = layout(folded)
+        for sec in sections.enumerated().sorted(by: { $0.element.entries.count != $1.element.entries.count
+                                                     ? $0.element.entries.count > $1.element.entries.count : $0.offset < $1.offset }) {
+            if FleetMenu.contentHeight(menu) <= room { break }
+            folded.insert(sec.element.category)
+            menu = layout(folded)
+        }
+        return menu
     }
 }

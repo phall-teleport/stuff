@@ -44,6 +44,10 @@ final class FilesService {
             return c
         }
         opening[connId] = t
+        // A same-cluster copy needs tsh 18; know the version before anyone asks.
+        if FilesBridge.connection(connId)?.type == "teleport", CrossTransfer.knownTshVersion == nil {
+            Task.detached { await CrossTransfer.refreshTshVersion() }
+        }
         do {
             let c = try await t.value
             opening[connId] = nil
@@ -176,39 +180,116 @@ final class FilesService {
         try await FindFiles.searchRemote(connId: connId, o)
     }
 
+    /// `conn:diskSpace`: free and total space on the filesystem holding
+    /// `dir`, for the file browser's footer. One `df -Pk` — POSIX output, so
+    /// the same columns on Linux, macOS and the BSDs — and nil rather than an
+    /// error wherever it cannot be had cheaply: "No background commands on
+    /// servers" (quietRemote), a per-session-MFA host (an approval nobody
+    /// asked for, same reasoning as Server profile), a connection not up, a
+    /// restricted shell, a `df` that printed something unparseable. A footer
+    /// that says nothing is fine; one that throws is not.
+    func diskSpace(_ connId: String, _ dir: String?) async throws -> DiskSpace? {
+        if Store.shared.filesQuietRemote { return nil }
+        let c = try FilesBridge.require(connId)
+        if c.transport == "tsh" && !c.tshByNecessity { return nil }
+        if !c.connected { return nil }
+        let r = try await FilesBridge.execResult(connId, "df -Pk -- \(shellQuote(dir?.nilIfEmpty ?? ".")) 2>/dev/null", 8)
+        return Self.parseDf(r.stdout)
+    }
+
+    /// The second line of `df -Pk`: 1024-blocks in column 2, available in column 4.
+    nonisolated static func parseDf(_ stdout: String) -> DiskSpace? {
+        let lines = stdout.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
+        guard lines.count > 1 else { return nil }
+        let cols = lines[1].split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard cols.count > 3, let total = Double(cols[1]), let free = Double(cols[3]),
+              total.isFinite, free.isFinite, total > 0 else { return nil }
+        return DiskSpace(total: Int64(total * 1024), free: Int64(free * 1024))
+    }
+
     // MARK: - xfer:*
 
-    /// `xfer:upload`: local files and folders into a remote directory. Returns the job id.
+    /*
+     * Uploads/downloads show up — and can be cancelled — the moment they're
+     * asked for, not once the whole directory tree has been walked and
+     * stat'd. addPlanning() puts a placeholder job in the queue (and in front
+     * of the user) immediately; the walk runs in the background and
+     * finishPlanning()/failPlanning() turn it into a real job once it's done.
+     * A cancel mid-walk is seen by planUpload()/planDownload() between
+     * directories — the walk's own PlanCancelled is swallowed here since
+     * cancel() has already marked the job cancelled; anything else becomes a
+     * visible error row, the same as a failed byte-transfer already is.
+     */
+
+    /// `xfer:upload`: local files and folders into a remote directory. Returns
+    /// the job id at once; the file list is read in the background.
     @discardableResult
     func upload(_ connId: String, localPaths: [String], remoteDir: String) async throws -> String {
         _ = try await sftp(connId)
-        var items: [Transfers.Item] = [], dirs: [String] = []
-        for lp in localPaths {
-            let plan = try await Transfers.planUpload(lp, remoteDir: remoteDir)
-            items += plan.files; dirs += plan.dirs
-        }
         let label = localPaths.count == 1 ? (localPaths[0] as NSString).lastPathComponent : "\(localPaths.count) items"
-        return queue(connId).add(TransferJobSpec(kind: "upload", label: "\(label) → \(remoteDir)", items: items, dirs: dirs))
+        let q = queue(connId)
+        let (id, isCancelled) = q.addPlanning(kind: "upload", label: "\(label) → \(remoteDir)")
+        Task { @MainActor in
+            do {
+                var items: [Transfers.Item] = [], dirs: [String] = []
+                for lp in localPaths {
+                    let plan = try await Transfers.planUpload(lp, remoteDir: remoteDir, isCancelled: isCancelled)
+                    items += plan.files; dirs += plan.dirs
+                }
+                q.finishPlanning(id, items: items, dirs: dirs)
+            } catch is Transfers.PlanCancelled {
+            } catch {
+                q.failPlanning(id, errorText(error))
+            }
+        }
+        return id
     }
 
-    /// `xfer:download`: remote entries into a local directory. Returns the job id.
+    /// `xfer:download`: remote entries into a local directory. Returns the job
+    /// id at once; the file list is read in the background.
     @discardableResult
     func download(_ connId: String, entries: [FileEntry], localDir: String) async throws -> String {
         let s = try await sftp(connId)
-        var items: [Transfers.Item] = [], dirs: [String] = []
-        for e in entries {
-            let plan = try await Transfers.planDownload(s, remotePath: e.path, localDir: localDir, known: e)
-            items += plan.files; dirs += plan.dirs
-        }
         let label = entries.count == 1 ? (entries[0].name.isEmpty ? Posix.basename(entries[0].path) : entries[0].name)
                                        : "\(entries.count) items"
-        return queue(connId).add(TransferJobSpec(kind: "download", label: "\(label) → \(localDir)", items: items, dirs: dirs,
-                                                 roots: entries.map(\.path).filter { !$0.isEmpty }))
+        let q = queue(connId)
+        let (id, isCancelled) = q.addPlanning(kind: "download", label: "\(label) → \(localDir)")
+        Task { @MainActor in
+            do {
+                var items: [Transfers.Item] = [], dirs: [String] = []
+                for e in entries {
+                    let plan = try await Transfers.planDownload(s, remotePath: e.path, localDir: localDir, known: e,
+                                                                isCancelled: isCancelled)
+                    items += plan.files; dirs += plan.dirs
+                }
+                q.finishPlanning(id, items: items, dirs: dirs, roots: entries.map(\.path).filter { !$0.isEmpty })
+            } catch is Transfers.PlanCancelled {
+            } catch {
+                q.failPlanning(id, errorText(error))
+            }
+        }
+        return id
     }
 
-    /// `xfer:crossPlan`: which route a server-to-server copy would take, without starting it.
+    /// `xfer:crossPlan`: which route a server-to-server copy would take,
+    /// without starting it. Asks tsh for its version (a direct copy needs tsh
+    /// 18 or newer).
+    func crossRoute(_ srcConnId: String, _ destConnId: String) async throws -> CrossTransfer.Route {
+        await CrossTransfer.planRoute(try FilesBridge.require(srcConnId), try FilesBridge.require(destConnId))
+    }
+
+    /// The same answer without waiting, from the tsh version the last check
+    /// saw (asked for in the background when none has run yet — until then a
+    /// same-cluster pair reads as "version unknown", relayed). Prefer
+    /// `await crossRoute`; `cross` itself always checks afresh, so a stale
+    /// answer here can never pick a route tsh cannot do.
     func crossPlan(_ srcConnId: String, _ destConnId: String) throws -> CrossTransfer.Route {
-        CrossTransfer.planRoute(try FilesBridge.require(srcConnId), try FilesBridge.require(destConnId))
+        let src = try FilesBridge.require(srcConnId), dest = try FilesBridge.require(destConnId)
+        guard let known = CrossTransfer.knownTshVersion else {
+            if CrossTransfer.sameCluster(src, dest) { Task { await CrossTransfer.refreshTshVersion() } }
+            return CrossTransfer.planRoute(src, dest, tshVersion: nil)
+        }
+        return CrossTransfer.planRoute(src, dest, tshVersion: known)
     }
 
     /// `xfer:cross`.
@@ -246,6 +327,9 @@ extension Store {
         get { setting("transferLimitKb", 0) }
         set { setSetting("transferLimitKb", newValue) }
     }
+
+    /// settings.quietRemote — "No background commands on servers".
+    var filesQuietRemote: Bool { setting("quietRemote", false) }
 
     /// settings.externalEditor — the command for *Edit in my editor…*, or "" for the OS default.
     var filesExternalEditor: String { setting("externalEditor", "") }

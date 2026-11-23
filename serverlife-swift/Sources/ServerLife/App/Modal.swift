@@ -215,10 +215,18 @@ enum Modal {
 
     static func openFiles(_ owner: WindowModel? = nil, directories: Bool = false, files: Bool = true,
                           multiple: Bool = true, directory: String? = nil, prompt: String? = nil,
-                          types: [UTType]? = nil, title: String? = nil, message: String? = nil) async -> [URL] {
+                          types: [UTType]? = nil, title: String? = nil, message: String? = nil,
+                          packages: Bool = false) async -> [URL] {
         let p = NSOpenPanel()
         if let title { p.title = title }
-        if let message { p.message = message }
+        // main.js dialog:openFiles: the title is also the message (the Mac
+        // panel does not show a title).
+        if let m = message ?? title { p.message = m }
+        /* `packages`: let the picker open a macOS .app as the folder it is,
+         * for choosing the binary inside one — tsh lives at
+         * tsh.app/Contents/MacOS/tsh, and copied out of the bundle it fails
+         * its signature and is killed on launch. */
+        p.treatsFilePackagesAsDirectories = packages
         p.canChooseFiles = files
         p.canChooseDirectories = directories
         p.allowsMultipleSelection = multiple

@@ -7,7 +7,7 @@ import SwiftUI
 @MainActor
 enum XPSearch {
     static func open(_ ex: ExplorerModel) async {
-        if ex.isS3 { xpToast("Search does not reach into buckets yet", "error"); return }
+        if ex.isS3 || ex.isKube { xpToast("Search does not reach into a pod’s filesystem yet", "error"); return }
         guard ex.isLocal || ex.isRemote else { return }
         let local = ex.isLocal
         let startDir = ex.view.path ?? (local ? NSHomeDirectory() : "/")

@@ -12,14 +12,52 @@ enum ConsolesFeature {
 
         // tmux-open: host; args `login`, `session` (attach to it straight
         // away; without it, or with `dialog: true`, the dialog that asks which).
+        // `reply` (Any?) -> Void, when attaching straight away: called once it
+        // is settled with true (attached) or false (failed, refused, cancelled).
         a.register("tmux-open") { ctx in
-            guard let host = ctx.host else { return }
+            let reply = ctx.arg("reply", as: ((Any?) -> Void).self)
+            guard let host = ctx.host else { reply?(false); return }
             let window = ctx.window ?? WindowManager.shared.current()
             let login: String? = ctx.arg("login")
             if ctx.arg("dialog", as: Bool.self) != true, let session: String = ctx.arg("session"), !session.isEmpty {
-                Task { await ConsolesTmux.open(host, login: login, session: session, window: window) }
+                Task {
+                    let rec = await ConsolesTmux.open(host, login: login, session: session, window: window)
+                    reply?(rec != nil)
+                }
             } else {
                 ConsolesTmux.openDialog(host, login: login, window: window)
+            }
+        }
+        // tmux-kill-pane: paneId. Close a tmux pane by hand — in tmux too
+        // (the last pane of a session asks first). `reply` gets true when it
+        // was handled (killed, or the question was declined), false when the
+        // pane is not attached and only its view should close. Asynchronous.
+        a.register("tmux-kill-pane") { ctx in
+            let reply = ctx.arg("reply", as: ((Any?) -> Void).self)
+            guard let id = ctx.paneId, let p = SessionsCore.owner(ofPane: id)?.pane(id) else { reply?(false); return }
+            Task {
+                let handled = await ConsolesTmux.killPane(p, window: ctx.window)
+                reply?(handled)
+            }
+        }
+        // tmux-restore-of: paneId; `reply` (synchronous) gets the JSON a saved
+        // layout keeps for the pane's session, or nil once it has ended.
+        a.register("tmux-restore-of") { ctx in
+            let reply = ctx.arg("reply", as: ((Any?) -> Void).self)
+            guard let id = ctx.paneId, let p = SessionsCore.owner(ofPane: id)?.pane(id) else { reply?(nil); return }
+            reply?(ConsolesTmux.restoreOf(p))
+        }
+        // tmux-restore-open: args `spec` JSON (what tmux-restore-of gave).
+        // Attach to that session again; `reply` gets true / false, false also
+        // when its host cannot be found (the restore counts it as skipped).
+        a.register("tmux-restore-open") { ctx in
+            let reply = ctx.arg("reply", as: ((Any?) -> Void).self)
+            guard let spec: JSON = ctx.arg("spec"), let host = ConsolesTmux.restoreHost(spec) else { reply?(false); return }
+            let window = ctx.window ?? WindowManager.shared.current()
+            Task {
+                let rec = await ConsolesTmux.open(host, login: spec["login"].string?.nilIfEmpty,
+                                                  session: spec["session"].string ?? "serverlife", window: window)
+                reply?(rec != nil)
             }
         }
         a.register("serial-open") { ctx in

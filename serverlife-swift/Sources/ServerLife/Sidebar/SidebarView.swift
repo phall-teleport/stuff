@@ -11,6 +11,8 @@ struct SidebarRoot: View {
         VStack(spacing: 0) {
             SBTabStrip(window: window, sw: sw)
             if sw.tab == "saved" { SBSubTabs(sw: sw) }
+            // All / SSH / K8s: only on Resources, and only while KubeLife is on.
+            if sw.tab == "hosts" && SBKube.enabled { SBKindTabs(sw: sw) }
             SBSearchBlock(window: window, sw: sw)
             Group {
                 switch sw.tab {
@@ -22,6 +24,7 @@ struct SidebarRoot: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .overlay(alignment: .bottom) { SBPresenceOffer(window: window) }
             SBFooter(window: window)
         }
         .background(p.panel)
@@ -38,7 +41,7 @@ private struct SBTabStrip: View {
         let inv = Inventory.shared
         let s = inv.requestSummary()
         HStack(spacing: 0) {
-            tab("hosts", "Hosts")
+            tab("hosts", "Resources")
             tab("saved", "Saved")
             tab("teleport", "Teleport", badge: true)
                 .help(RequestWatchUI.tabTooltip)
@@ -78,6 +81,30 @@ private struct SBSubTabs: View {
         let p = Theme.shared.p
         let on = sw.savedView == id
         return Button { sw.savedView = id } label: {
+            Text(title).font(SBZoom.font(11))
+                .frame(maxWidth: .infinity).padding(.vertical, 3)
+                .foregroundStyle(on ? Color.white : p.muted)
+                .background(RoundedRectangle(cornerRadius: 5).fill(on ? p.accentDim : p.panel2))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(on ? p.accentDim : p.border))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// `#sb-kind-filter`: which kind of resource is listed.
+private struct SBKindTabs: View {
+    let sw: SidebarWindow
+    var body: some View {
+        HStack(spacing: 4) {
+            sub("all", "All"); sub("ssh", "SSH"); sub("kube", "K8s")
+        }
+        .padding(.horizontal, 8).padding(.top, 7)
+    }
+    private func sub(_ id: String, _ title: String) -> some View {
+        let p = Theme.shared.p
+        let on = sw.hostKindShown == id
+        return Button { sw.setHostKind(id) } label: {
             Text(title).font(SBZoom.font(11))
                 .frame(maxWidth: .infinity).padding(.vertical, 3)
                 .foregroundStyle(on ? Color.white : p.muted)
@@ -160,7 +187,9 @@ private struct SBSearchBlock: View {
                 }
             }
             .zIndex(10)
-            SBFilterButtons(window: window, sw: sw)
+            // Tags, heartbeats, quiet nodes, folders, the ticked hosts and the
+            // match count are all about host rows; the filter box itself is shared.
+            if sw.tab == "hosts" { SBFilterButtons(window: window, sw: sw) }
         }
         .padding(.horizontal, 8).padding(.vertical, 7)
         .zIndex(10)
@@ -197,6 +226,14 @@ private struct SBFilterButtons: View {
                 Actions.shared.perform("folders-browser", window: window)
             }
             .tourAnchor("btn-folders")
+            // Only worth screen space once something is actually ticked.
+            if !sw.checkedHosts.isEmpty {
+                let c = sw.checkedHosts.count
+                SBToolButton(title: "Clear selection (\(c))",
+                             help: "\(c) host\(c == 1 ? "" : "s") ticked for multi-exec \u{2014} click to untick all of them") {
+                    sw.checkedHosts.removeAll()
+                }
+            }
             if !sw.filterText.isEmpty {
                 SBBadge(text: "\(shown) of \(all.count)", kind: shown == 0 ? "warn" : "")
             }
@@ -215,6 +252,10 @@ private struct SBFooter: View {
         HStack(spacing: 8) {
             Button("+\u{00A0}Add") { Actions.shared.perform("add-server", window: window) }
                 .buttonStyle(.ghost).help("Define a new server (⌘⇧N)").fixedSize()
+            // A new cluster is not a server: the same login dialog the empty
+            // Teleport tab offers.
+            Button("+ Connect Teleport") { Actions.shared.perform("tsh-login", window: window) }
+                .buttonStyle(.ghost).help("Log in to a Teleport cluster").fixedSize()
             Button("Refresh") { Actions.shared.perform("refresh", window: window) }
                 .buttonStyle(.ghost).help("Refresh inventory (⌘R)").fixedSize()
             SBBadge(text: b.text, kind: b.kind)
@@ -260,7 +301,9 @@ struct SBHostsPanel: View {
                 ForEach(entries) { e in
                     switch e {
                     case .group(let g): SBGroupView(window: window, sw: sw, group: g)
-                    case .note(_, let lines, let kind): SBEmptyBlock(window: window, sw: sw, lines: lines, kind: kind)
+                    case .note(_, let lines, let kind):
+                        if case .loading = kind { SBRadar(text: lines.first ?? "") }
+                        else { SBEmptyBlock(window: window, sw: sw, lines: lines, kind: kind) }
                     }
                 }
             }
@@ -292,6 +335,9 @@ struct SBGroupView: View {
                 if !icon.isEmpty { Text(icon).font(SBZoom.font(12)) }
                 Text(g.title.uppercased()).kerning(0.6).lineLimit(1).truncationMode(.tail)
                     .foregroundStyle(color ?? (hover.on ? p.textDim : p.muted))
+                if let note = SBGroupMenuExtra.proxyNote(g.profile) {
+                    Text(note).font(SBZoom.font(10.5)).foregroundStyle(p.muted).lineLimit(1).truncationMode(.tail)
+                }
                 ForEach(Array(g.tags.enumerated()), id: \.offset) { _, t in SBGroupTagView(window: window, tag: t, headHover: hover.on) }
                 Spacer(minLength: 4)
                 Text(String(g.count)).fontWeight(.regular).opacity(0.65).foregroundStyle(p.muted)
@@ -349,6 +395,27 @@ private struct SBGroupTagView: View {
             ClusterRequestTag(p: pr, window: window)
         case .expired:
             SBTag(text: "expired", kind: .expired, help: "The certificate has lapsed — log in again")
+        case .loggedOut:
+            SBTag(text: "logged out", kind: .expired,
+                  help: "Not in tsh status — shown because this saved cluster is pinned to the Hosts tab")
+        case .vnet(let pr):
+            if let t = VnetActions.tag(proxy: pr.proxy) {
+                SBTag(text: t.text, kind: t.kind == "vnet-on" ? .vnetOn : t.kind == "vnet-err" ? .vnetErr : .vnetBusy, help: t.tip)
+                    .onTapGesture { Actions.shared.perform("vnet-log", window: window, args: ["proxy": pr.proxy]) }
+                    .sbContextMenu {
+                        let m = NSMenu()
+                        Actions.shared.perform("vnet-menu", window: window, args: ["menu": m, "proxy": pr.proxy, "home": pr.homeDir])
+                        if !m.items.isEmpty { m.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) }
+                        return []
+                    }
+            }
+        case .env(let pr):
+            TshEnvTag(proxy: pr.proxy, cluster: pr.cluster, window: window)
+        case .soon(let pr):
+            // The heading collapses when clicked; aiming at the badge must not.
+            SBTag(text: "⏳ \(TUI.formatUntil(pr.validUntil)) left", kind: .soon,
+                  help: "Certificate expires soon — click to log out and back in now")
+                .onTapGesture { Task { await TeleportPanel.doRelogin(pr, window: window) } }
         case .refresh(let key, let title, let profile):
             let busy = Inventory.shared.refreshingGroups.contains(profile?.key ?? key)
             Text("\u{27F3}")
@@ -362,7 +429,9 @@ private struct SBGroupTagView: View {
                 .help(busy ? "Refreshing…" : title)
                 .onTapGesture {
                     if busy { return }
-                    if let profile { SBActions.refreshProfile(profile) } else { SBActions.refreshSshConfigs(key) }
+                    if let profile { SBActions.refreshProfile(profile) }
+                    else if key.hasPrefix("tp:") { Actions.shared.perform("refresh", window: window) }
+                    else { SBActions.refreshSshConfigs(key) }
                 }
         case .beams(let n):
             SBTag(text: "\(n) beams", kind: .beams, help: "\(n) beam(s) running on this cluster")
@@ -394,16 +463,23 @@ struct SBItemView: View {
 
     var body: some View {
         switch item {
-        case .host(let h): SBHostRow(window: window, sw: sw, item: h, groupIds: groupIds)
+        case .host(let h):
+            if SBKube.isKube(h.host) { SBKubeRow(window: window, sw: sw, item: h) }
+            else { SBHostRow(window: window, sw: sw, item: h, groupIds: groupIds) }
         case .folder(let f, let count, let depth, let gk): SBFolderRow(window: window, sw: sw, folder: f, count: count, depth: depth, groupKey: gk)
         case .more(let gk, let hidden): SBMoreRow(window: window, groupKey: gk, hidden: hidden)
         case .empty(_, let lines, let kind): SBEmptyBlock(window: window, sw: sw, lines: lines, kind: kind)
         case .narrowed(let p, let granted): SBNarrowedNote(profile: p, granted: granted)
-        case .expired(let p): SBExpiredBlock(window: window, profile: p)
-        case .beamHead(_, let count): SBBeamHead(count: count)
+        case .expired(let p, let saved): SBExpiredBlock(window: window, profile: p, saved: saved)
+        case .beamHead(let p, let count):
+            if BeamPhaseLists.shared.phasesSupported(p.proxy) { BeamTabsHeader(profile: p, beamCount: count).sbBeamHeadPadding() }
+            else { SBBeamHead(count: count) }
+        case .phases(let p): BeamsPhasesPane(profile: p, window: window)
+        case .kubeLocal: if let make = Slots.sidebarSections["kube"] { make(window) }
         case .beam(let b): SBBeamRow(window: window, beam: b)
         case .beamAdd(let p, let first): SBBeamAddRow(window: window, profile: p, first: first)
-        case .local(let which): SBLocalRow(window: window, which: which)
+        case .local(let which):
+            if which == "ai" { SBAIRow(window: window) } else { SBLocalRow(window: window, which: which) }
         }
     }
 }
@@ -540,7 +616,7 @@ struct SBHostRow: View {
         .padding(.leading, SBZoom.px(leftPad)).padding(.trailing, 10)
         .padding(.top, SBZoom.px(5)).padding(.bottom, SBZoom.px(expanded ? 6 : 5))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .opacity(host.watchMissing ? 0.72 : host.isHeldBack ? 0.55 : hidden ? 0.45 : 1)
+        .opacity(host.watchMissing ? 0.72 : host.isHeldBack ? 0.55 : host.watchUnconfirmed ? 0.6 : hidden ? 0.45 : 1)
         .background(conn == .connected ? p.panel3 : (hover.on ? p.panel2 : .clear))
         .overlay(alignment: .leading) {
             if let hostColor { hostColor.frame(width: 2) } else if conn == .connected { p.accent.frame(width: 2) }
@@ -583,7 +659,9 @@ struct SBHostRow: View {
                 .contentShape(Rectangle())
                 .onTapGesture { HostPrefs.setStarred(host, !starred) }
                 .help(starred ? "Starred — click to unstar" : "Star this host to keep it at the top")
-            if HostWatch.showWatchMark && HostWatch.isWatched(host) && !host.watchMissing && !host.watchUnconfirmed {
+            // Kept on an unconfirmed row on purpose: the watch is still in
+            // force, logout included; `missing` has its own "gone" tag.
+            if HostWatch.showWatchMark && HostWatch.isWatched(host) && !host.watchMissing {
                 Text("\u{1F514}").font(SBZoom.font(10.5)).help("Watched — you will be told if this host leaves the inventory")
             }
             HStack(spacing: 5) {
@@ -592,6 +670,14 @@ struct SBHostRow: View {
                     .foregroundStyle(hostColor ?? (hover.on ? p.text : p.textDim))
                     .strikethrough(host.watchMissing || hidden)
                     .lineLimit(1).truncationMode(.tail)
+                // What kind of thing it is: ☸ for a Kubernetes cluster drawn
+                // here (a watched one gone missing), a server otherwise.
+                if SBKube.isKubeHost(host) {
+                    if let marks = SidebarHooks.kubeMarks?(host) { marks }
+                } else {
+                    HostsServerIcon(title: host.type == Host.teleport ? "Teleport SSH server" : "SSH server")
+                        .opacity(host.watchMissing ? 0.55 : 0.8)
+                }
                 if HostPrefs.isCareful(host) { Text("!").font(SBZoom.font(12.5, .bold)).foregroundStyle(p.amber) }
                 if !icon.isEmpty { Text(icon).font(SBZoom.font(11)).help("Right-click → Icon… to change it") }
                 if host.ambiguous == true, let uuid = host.uuid {
@@ -603,7 +689,15 @@ struct SBHostRow: View {
             .layoutPriority(1)
             Spacer(minLength: 0)
             stateTag().fixedSize()
-            if HostPrefs.isMfaHost(host.id) { SBTag(text: "mfa", kind: .mfa, help: "Requires per-session MFA").fixedSize() }
+            // A requestable watch keeps its req tag when checks stop landing,
+            // and says how long it has been.
+            if host.isRequestableRow, let since = host.extra["requestUncheckedSince"]?.double {
+                SBTag(text: "? unchecked " + HostWatch.goneFor(since), kind: .stale, help: HostWatch.requestUncheckedLine(host)).fixedSize()
+            }
+            if HostPrefs.isMfaHost(host.id) || (host.extra["mfaId"]?.string?.nilIfEmpty).map(HostPrefs.isMfaHost) == true {
+                SBTag(text: "mfa", kind: .mfa, help: "Requires per-session MFA").fixedSize()
+            }
+            if conn == .connected { SBPresenceTag(host: host, window: window).fixedSize() }
             if !expanded && !item.label.isEmpty { SBTag(text: item.label) }
             else if host.tunnel == true { SBTag(text: "tunnel", kind: .tunnel, help: "Reached over a reverse tunnel").fixedSize() }
         }
@@ -795,16 +889,24 @@ private struct SBNarrowedNote: View {
 private struct SBExpiredBlock: View {
     let window: WindowModel
     let profile: TeleportProfile
+    var saved: JSON? = nil
     var body: some View {
         let p = Theme.shared.p
         VStack(alignment: .leading, spacing: 0) {
-            Text("Session expired.").foregroundStyle(p.textDim)
+            Text(saved != nil ? "Not logged in." : "Session expired.").foregroundStyle(p.textDim)
             HStack(spacing: 6) {
                 Button("tsh login") { Task { await SBActions.loginExpired(profile, window: window) } }.buttonStyle(.ghostSmall)
                 Button("Copy login cmd") { SBActions.copyLoginCommand(profile) }.buttonStyle(.ghostSmall)
                     .help("Copy the tsh login command, ready to paste into a terminal")
-                Button("Remove") { Task { await SBActions.removeExpiredProfile(profile, window: window) } }.buttonStyle(.ghostSmall)
-                    .help("Delete this profile from the tsh home, so it stops being listed")
+                if let saved {
+                    // A pinned saved cluster has no profile files to remove.
+                    Button("Unpin") { SBPinned.unpin(saved, name: saved["name"].stringish?.nilIfEmpty ?? profile.cluster.nilIfEmpty ?? profile.proxy) }
+                        .buttonStyle(.ghostSmall)
+                        .help("Stop showing this saved cluster here while it is not logged in. The saved login is kept.")
+                } else {
+                    Button("Remove") { Task { await SBActions.removeExpiredProfile(profile, window: window) } }.buttonStyle(.ghostSmall)
+                        .help("Delete this profile from the tsh home, so it stops being listed")
+                }
             }
             .padding(.top, 7)
         }
@@ -849,6 +951,10 @@ private struct SBBeamRow: View {
             Text(beam.id).font(SBZoom.font(12.5)).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
             SBTag(text: "beam", kind: .beams)
             if !beam.region.isEmpty { SBTag(text: beam.region) }
+            if !beam.phase.isEmpty {
+                SBTag(text: String(beam.phase.split(separator: "@", omittingEmptySubsequences: false).first ?? ""),
+                      help: "Started from Phase " + beam.phase)
+            }
             Group {
                 if beam.expires == nil { Text("no expiry").font(SBZoom.font(9.5)).foregroundStyle(p.muted) }
                 else { BeamExpiryLabel(beam: beam) }
@@ -907,7 +1013,7 @@ private struct SBLocalRow: View {
         let (name, color, help): (String, Color, String) = {
             switch which {
             case "keys": return ("SSH keys", p.amber, "Keypairs in ~/.ssh, their fingerprints and what the agent holds (⌘⇧K)")
-            case "nettools": return ("Network tools", p.accent, "Ping, traceroute, DNS, ports, TLS, HTTP and cluster info (⌘⇧T)")
+            case "nettools": return ("Network and certificate tools", p.accent, "Ping, traceroute, DNS, ports, TLS, HTTP and cluster info (⌘⇧T)")
             default: return ("Local shell", p.purple, "Open a shell on this machine")
             }
         }()
@@ -947,7 +1053,7 @@ private struct SBLocalRow: View {
                         Actions.shared.perform("local-files", window: window, args: ["path": NSHomeDirectory() + "/.ssh"])
                     }]
         case "nettools":
-            return [CtxItem("Open network tools…") { open() }]
+            return [CtxItem("Open network and certificate tools…") { open() }]
         default:
             return SBMenus.localShellMenu(window: window)
         }

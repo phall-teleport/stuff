@@ -7,13 +7,19 @@ struct MacroVar: Equatable {
     var name: String
     var choices: [String]?
     var defaultValue: String
+    /// Where to suggest values from ("proxy" | "user") — a free field with
+    /// suggestions, unlike `choices`.
+    var suggest: String?
 
     var json: JSON {
-        ["name": .string(name), "choices": choices.map { JSON($0) } ?? .null, "default": .string(defaultValue)]
+        var o: [String: JSON] = ["name": .string(name), "choices": choices.map { JSON($0) } ?? .null,
+                                 "default": .string(defaultValue)]
+        if let suggest { o["suggest"] = .string(suggest) }
+        return .object(o)
     }
 
-    init(name: String, choices: [String]? = nil, defaultValue: String = "") {
-        self.name = name; self.choices = choices; self.defaultValue = defaultValue
+    init(name: String, choices: [String]? = nil, defaultValue: String = "", suggest: String? = nil) {
+        self.name = name; self.choices = choices; self.defaultValue = defaultValue; self.suggest = suggest
     }
 
     init?(json j: JSON) {
@@ -21,6 +27,7 @@ struct MacroVar: Equatable {
         name = n
         choices = j["choices"].array.map { $0.compactMap(\.stringish) }
         defaultValue = j["default"].stringish ?? ""
+        suggest = j["suggest"].string
     }
 }
 
@@ -32,9 +39,11 @@ struct Macro: Identifiable, Equatable {
     var description = ""
     var category = "Custom"
     var command = ""
-    /// "all" | "hosts" | "local", or nil for a record saved before scopes.
+    /// "all" | "hosts" | "beams" | "local" | "kube", or nil for a record saved before scopes.
     var whereScope: String?
     var confirm = false
+    /// What running it costs, said in the confirm instead of "Run this on the target host?".
+    var warning: String?
     var interactive = false
     var noEnter = false
     /// Declared blanks; nil when the record has none (then `variableSpec` is read).
@@ -46,10 +55,11 @@ struct Macro: Identifiable, Equatable {
     var lastUsed: Double?
 
     init(id: String, category: String, name: String, description: String, command: String,
-         interactive: Bool = false, noEnter: Bool = false, confirm: Bool = false, where w: String? = nil) {
+         interactive: Bool = false, noEnter: Bool = false, confirm: Bool = false, where w: String? = nil,
+         variables: [MacroVar]? = nil, warning: String? = nil) {
         self.id = id; self.category = category; self.name = name; self.description = description
         self.command = command; self.interactive = interactive; self.noEnter = noEnter; self.confirm = confirm
-        self.whereScope = w
+        self.whereScope = w; self.variables = variables; self.warning = warning
     }
 
     init(json j: JSON, builtin: Bool = false) {
@@ -60,6 +70,7 @@ struct Macro: Identifiable, Equatable {
         command = j["command"].stringish ?? ""
         whereScope = j["where"].string
         confirm = j["confirm"].truthy
+        warning = j["warning"].string?.nilIfEmpty
         interactive = j["interactive"].truthy
         noEnter = j["noEnter"].truthy
         variables = j["variables"].array.map { $0.compactMap(MacroVar.init(json:)) }
@@ -79,6 +90,7 @@ struct Macro: Identifiable, Equatable {
             "variables": .array((variables ?? []).map(\.json)), "repeatSeconds": .number(Double(repeatSeconds)),
         ]
         if let whereScope { o["where"] = .string(whereScope) }
+        if let warning { o["warning"] = .string(warning) }
         if !builtin && !id.isEmpty { o["id"] = .string(id) }
         return .object(o)
     }
@@ -116,17 +128,45 @@ final class Macros {
             Macro(id: "b:tp-status", category: "Teleport", name: "Teleport service status",
                   description: "Is the agent running, and since when.",
                   command: "sudo systemctl status teleport --no-pager || sudo service teleport status"),
+            /*
+             * Running is not the same as connected: the unit can be up for a week while
+             * the agent has been failing to reach its proxy the whole time.
+             */
+            Macro(id: "b:tp-readyz", category: "Teleport", name: "Teleport agent health",
+                  description: "Whether the agent is actually connected and ready, not just running. Newer agents only (the debug service).",
+                  command: "sudo teleport debug readyz"),
             // Never useful headless: it does not end.
             Macro(id: "b:tp-journal", category: "Teleport", name: "Follow Teleport logs",
                   description: "Live agent log. Ctrl-C to stop.", command: "sudo journalctl -fu teleport", interactive: true),
             Macro(id: "b:tp-journal-recent", category: "Teleport", name: "Teleport errors, last hour",
                   description: "Recent agent problems without following the log.",
                   command: "sudo journalctl -u teleport --since \"1 hour ago\" -p warning --no-pager | tail -n 80"),
+            // The next question when a node drops out of the cluster: can it get there?
+            Macro(id: "b:tp-reach", category: "Teleport", name: "Can the agent reach its proxy?",
+                  description: "Reads the proxy address from /etc/teleport.yaml and pings it: DNS, firewall and TLS in one go.",
+                  command: "f=/etc/teleport.yaml; a=$(sudo awk '/^[[:space:]]*(proxy_server|auth_server):/ { print $2; exit } /^[[:space:]]*auth_servers:/ { getline; sub(/^[[:space:]]*-[[:space:]]*/, \"\"); print; exit }' $f | tr -d '\"'); echo \"configured: ${a:-nothing found in $f}\"; [ -n \"$a\" ] && curl -sS --max-time 5 \"https://$a/webapi/ping\" | head -c 600; echo"),
+            /*
+             * Certificates carry a validity window, so a clock that has drifted reads
+             * as "not yet valid" or "expired" — one of the commoner reasons a join or a
+             * login fails, and nothing else on the list points at it.
+             */
+            Macro(id: "b:tp-clock", category: "Teleport", name: "Clock sync",
+                  description: "Is this host's clock synchronised? Drift breaks certificate checks.",
+                  command: "timedatectl 2>/dev/null || date -u"),
             Macro(id: "b:tp-version", category: "Teleport", name: "Teleport version",
                   description: "Agent build on this host.", command: "teleport version; tsh version 2>/dev/null | head -1"),
             Macro(id: "b:tp-status-session", category: "Teleport", name: "Teleport session status",
                   description: "Who this host is logged in as: cluster, user, roles and how long the certificate lasts.",
                   command: "tsh status"),
+            /*
+             * The other side of the same question: not who the host is logged in as,
+             * but what this session is — its id, the cluster and node it landed on,
+             * and the address it came from. Only answers inside a Teleport SSH
+             * session, which is where it is asked.
+             */
+            Macro(id: "b:tp-session-info", category: "Teleport", name: "Teleport ssh session status",
+                  description: "This SSH session as Teleport sees it: session id, cluster, host UUID and where you connected from.",
+                  command: "teleport status"),
             /*
              * The client commands, which run here rather than on a server.
              *
@@ -147,12 +187,66 @@ final class Macros {
                   description: "Pasted without Enter, to finish by hand: `./file user@node:/tmp/`, "
                       + "or `-r` for a directory. Either side can be the remote one.",
                   command: "tsh scp ", noEnter: true, where: "local"),
+            /*
+             * Headless auth has no persisted profile to fall back on — the whole
+             * point is a one-off login approved from a second device — so `--proxy`
+             * and `--user` are never optional the way they are for an ordinary `tsh
+             * ssh` with a profile already active. Both are asked for explicitly
+             * rather than guessed at. Not a fixed `choices` list (a bare dropdown
+             * would refuse a proxy or user not already logged in from this machine) —
+             * suggested from profiles already logged into here, but still freely typed.
+             */
+            Macro(id: "b:tsh-headless-ssh", category: "Teleport", name: "Headless SSH\u{2026}",
+                  description: "tsh ssh with no local session \u{2014} approved from another device (tsh running there, or the web UI). For a CI box or a terminal with no browser of its own.",
+                  command: "tsh ssh --headless --proxy={{proxy}} --user={{user}} {{host}}", where: "local",
+                  variables: [MacroVar(name: "proxy", suggest: "proxy"), MacroVar(name: "user", suggest: "user"), MacroVar(name: "host")]),
+            Macro(id: "b:tsh-headless-kube", category: "Teleport", name: "Headless kubectl\u{2026}",
+                  description: "Same headless login, for a Kubernetes cluster: approves from another device, then points kubectl at it.",
+                  command: "tsh kube login --headless --proxy={{proxy}} --user={{user}} {{kubeCluster}} && kubectl get pods", where: "local",
+                  variables: [MacroVar(name: "proxy", suggest: "proxy"), MacroVar(name: "user", suggest: "user"), MacroVar(name: "kubeCluster")]),
             Macro(id: "b:tp-config", category: "Teleport", name: "Teleport config",
                   description: "The agent\u{2019}s teleport.yaml.", command: "sudo cat /etc/teleport.yaml"),
             Macro(id: "b:tp-restart", category: "Teleport", name: "Restart Teleport",
                   description: "Restarts the agent \u{2014} drops this host\u{2019}s tunnel briefly.",
                   command: "sudo systemctl restart teleport && sleep 2 && sudo systemctl status teleport --no-pager",
                   confirm: true),
+
+            /*
+             * ---- Kubernetes ----
+             *
+             * Only offered inside a kube exec session (macroKindOf reads the pane's
+             * kubeExec mark), and nothing else gets these: `kubectl` run from inside
+             * the container it would be managing is not a thing anyone means, and a
+             * container this minimal usually has no `kubectl` to run anyway. Every
+             * command here is plain POSIX sh with a fallback chain — many images
+             * ship nothing but BusyBox, some ship nothing but the application
+             * itself, and a macro that only works on Debian answers for little of
+             * what KubeLife actually connects to.
+             */
+            Macro(id: "b:kube-identity", category: "Kubernetes", name: "Container identity",
+                  description: "Hostname, OS, and architecture \u{2014} what this container actually is.",
+                  command: "hostname; echo; cat /etc/os-release 2>/dev/null || cat /etc/alpine-release 2>/dev/null || uname -a", where: "kube"),
+            Macro(id: "b:kube-env", category: "Kubernetes", name: "Environment variables",
+                  description: "Everything the pod spec, ConfigMaps and Secrets injected \u{2014} sorted.",
+                  command: "env | sort", where: "kube"),
+            Macro(id: "b:kube-serviceaccount", category: "Kubernetes", name: "Service account",
+                  description: "Whether this pod can talk to the Kubernetes API as itself, and as whom.",
+                  command: "d=/var/run/secrets/kubernetes.io/serviceaccount; if [ -f \"$d/token\" ]; then echo \"namespace: $(cat \"$d/namespace\" 2>/dev/null)\"; echo \"token: $(wc -c < \"$d/token\") bytes mounted\"; else echo \"No service account token mounted.\"; fi", where: "kube"),
+            Macro(id: "b:kube-api-reach", category: "Kubernetes", name: "Can this pod reach the API server?",
+                  description: "Hits https://kubernetes.default.svc/healthz \u{2014} DNS, network policy and RBAC all have to let this through.",
+                  command: "curl -sS -k --max-time 5 https://kubernetes.default.svc/healthz 2>/dev/null || wget -q -O- --no-check-certificate --timeout=5 https://kubernetes.default.svc/healthz 2>/dev/null || echo \"no curl or wget in this image\"; echo", where: "kube"),
+            Macro(id: "b:kube-dns", category: "Kubernetes", name: "Cluster DNS",
+                  description: "Resolves kubernetes.default \u{2014} the first thing to doubt when a pod \"can't reach\" another service.",
+                  command: "getent hosts kubernetes.default 2>/dev/null || nslookup kubernetes.default 2>/dev/null || echo \"no getent or nslookup; resolv.conf:\"; cat /etc/resolv.conf 2>/dev/null", where: "kube"),
+            Macro(id: "b:kube-limits", category: "Kubernetes", name: "Resource limits, from inside",
+                  description: "The memory and CPU limits this container actually sees \u{2014} cgroup v2 first, v1 fallback.",
+                  command: "echo \"memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)\"; echo \"cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo unknown)\"", where: "kube"),
+            Macro(id: "b:kube-mounts", category: "Kubernetes", name: "Mounted volumes",
+                  description: "What is actually mounted \u{2014} ConfigMaps, Secrets, PVCs \u{2014} with the container-runtime plumbing filtered out.",
+                  command: "mount 2>/dev/null | grep -Ev \"^(overlay|proc|tmpfs|shm|devpts|sysfs|cgroup|mqueue) \" ; echo; df -h 2>/dev/null", where: "kube"),
+            Macro(id: "b:kube-listening", category: "Kubernetes", name: "Listening ports",
+                  description: "What this container has bound, and on which interface.",
+                  command: "ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null || (echo \"no ss or netstat; /proc/net/tcp:\"; cat /proc/net/tcp 2>/dev/null)", where: "kube"),
 
             /* ---- System ---- */
             // df is df everywhere, so this one is useful in the local shell too.
@@ -186,6 +280,108 @@ final class Macros {
                   description: "Whether the box is waiting on a restart.",
                   command: "[ -f /var/run/reboot-required ] && cat /var/run/reboot-required || echo \"no reboot required\"; "
                       + "echo; (sudo needs-restarting -r 2>/dev/null || true)"),
+
+            /* ---- Beams ---- */
+            /*
+             * For a beam — Teleport's sandbox VM — and offered only in a beam's
+             * session. A beam runs its long-lived processes under `beamctl`, its own
+             * service manager, rather than systemd; it can publish one app, on port
+             * 8080; it reaches the cluster's LLM gateways through environment it is
+             * given; and it comes with examples in ~/examples. Everything here is
+             * what the beam's own motd and ~/AGENTS.md point at.
+             */
+            Macro(id: "b:beam-services", category: "Beams", name: "Services (beamctl list)",
+                  description: "The services beamctl is running in this beam, and their state.",
+                  command: "beamctl list | grep . || echo \"(no services running under beamctl)\"", where: "beams"),
+            Macro(id: "b:beam-service-show", category: "Beams", name: "Show a service",
+                  description: "Everything beamctl knows about one service: its command, state and liveness.",
+                  command: "beamctl show {{service}}", where: "beams"),
+            Macro(id: "b:beam-service-logs", category: "Beams", name: "Service logs",
+                  description: "What a service has printed so far.",
+                  command: "beamctl logs {{service}} | tail -n 200", where: "beams"),
+            Macro(id: "b:beam-service-follow", category: "Beams", name: "Follow service logs",
+                  description: "A service\u{2019}s output as it happens. Ctrl-C to stop.",
+                  command: "beamctl logs --follow {{service}}", interactive: true, where: "beams"),
+            Macro(id: "b:beam-service-start", category: "Beams", name: "Start a service on 8080",
+                  description: "Run a command under beamctl as a named service \u{2014} it keeps running after the session ends. 8080 is the port a beam can publish.",
+                  command: "beamctl start --name {{service}} --liveness-port 8080 -- {{command}}", confirm: true, where: "beams",
+                  variables: [MacroVar(name: "service", defaultValue: "app"), MacroVar(name: "command", defaultValue: "python3 -m http.server 8080")]),
+            Macro(id: "b:beam-service-restart", category: "Beams", name: "Restart a service",
+                  description: "Stop a service if it is running, and start it again.",
+                  command: "beamctl restart {{service}}", confirm: true, where: "beams"),
+            Macro(id: "b:beam-service-stop", category: "Beams", name: "Stop a service",
+                  description: "Stop one of the beam\u{2019}s services.",
+                  command: "beamctl stop {{service}}", confirm: true, where: "beams"),
+            Macro(id: "b:beam-service-remove", category: "Beams", name: "Stop and remove a service",
+                  description: "Stop it and take it off beamctl\u{2019}s list, so it is not there to restart.",
+                  command: "beamctl stop --prune {{service}}", confirm: true, where: "beams"),
+            /*
+             * Freezing pauses every process in the service where it stands, without
+             * stopping it: memory and open connections are kept, and thawing carries on
+             * from the same instruction. Cheaper than a restart for "hold that a moment".
+             */
+            Macro(id: "b:beam-service-freeze", category: "Beams", name: "Freeze a service",
+                  description: "Pause all of a service\u{2019}s processes where they are, without stopping it.",
+                  command: "beamctl freeze {{service}}", confirm: true, where: "beams"),
+            Macro(id: "b:beam-service-thaw", category: "Beams", name: "Thaw a service",
+                  description: "Resume a frozen service from where it was paused.",
+                  command: "beamctl thaw {{service}}", where: "beams"),
+            Macro(id: "b:beam-service-attach", category: "Beams", name: "Attach to a service",
+                  description: "Its terminal, live \u{2014} for a service started with --pty.",
+                  command: "beamctl attach {{service}}", interactive: true, where: "beams"),
+            Macro(id: "b:beam-service-wait", category: "Beams", name: "Wait for a service state",
+                  description: "Return once a service reaches a state \u{2014} running after a start, stopped after a stop \u{2014} or give up after the timeout.",
+                  command: "beamctl wait --state {{state}} --timeout {{seconds}} {{service}}", where: "beams",
+                  variables: [MacroVar(name: "service", defaultValue: "app"), MacroVar(name: "state", choices: ["running", "stopped", "exited", "frozen", "stopping"], defaultValue: "running"), MacroVar(name: "seconds", defaultValue: "60")]),
+            Macro(id: "b:beam-publish", category: "Beams", name: "Publish the app on 8080",
+                  description: "Make what listens on port 8080 a Teleport app \u{2014} https://<name>.<cluster>. One app at a time.",
+                  command: "tsh beams publish \"$BEAM_ALIAS\"", confirm: true, where: "beams"),
+            Macro(id: "b:beam-publish-tcp", category: "Beams", name: "Publish port 8080 as TCP",
+                  description: "The same, for a TCP service rather than HTTP.",
+                  command: "tsh beams publish --tcp \"$BEAM_ALIAS\"", confirm: true, where: "beams"),
+            Macro(id: "b:beam-unpublish", category: "Beams", name: "Unpublish the app",
+                  description: "Take the published app down again; what listens on 8080 keeps running.",
+                  command: "tsh beams unpublish \"$BEAM_ALIAS\"", confirm: true, where: "beams"),
+            Macro(id: "b:beam-identity", category: "Beams", name: "Who this beam is",
+                  description: "Its alias, id, cluster and Teleport identity.",
+                  command: "echo \"beam:    $BEAM_ALIAS ($BEAM_ID)\"; echo \"cluster: $TELEPORT_CLUSTER\"; echo; tsh status", where: "beams"),
+            Macro(id: "b:beam-resources", category: "Beams", name: "What it can reach",
+                  description: "The apps, databases, GitHub orgs, SSH nodes and Kubernetes clusters this beam\u{2019}s identity is allowed.",
+                  command: "echo \"== apps\"; tsh apps ls; echo; echo \"== databases\"; tsh db ls; echo; echo \"== GitHub orgs\"; tsh git ls 2>&1; echo; echo \"== SSH nodes\"; tsh ls; echo; echo \"== Kubernetes\"; tsh kube ls", where: "beams"),
+            Macro(id: "b:beam-ai-env", category: "Beams", name: "AI gateway settings",
+                  description: "The Anthropic and OpenAI addresses this beam is given \u{2014} the cluster\u{2019}s gateways, not the public APIs. Keys are hidden.",
+                  command: "env | grep -E \"^(ANTHROPIC|OPENAI)_\" | sed -E \"s/^([A-Z_]*(KEY|TOKEN))=.*/\\1=<set>/\" | sort", where: "beams"),
+            Macro(id: "b:beam-ai-hello", category: "Beams", name: "Try the AI gateway",
+                  description: "Runs the beam\u{2019}s own hello-world against Anthropic, through the gateway.",
+                  command: "cd ~/examples && sh anthropic_hello.sh", where: "beams"),
+            Macro(id: "b:beam-examples", category: "Beams", name: "Examples and guide",
+                  description: "What came with the beam: ~/AGENTS.md and the examples folder.",
+                  command: "cat ~/AGENTS.md; echo; ls ~/examples", where: "beams"),
+            /*
+             * Inside a build beam — the console `tsh phase add` and `tsh phase edit`
+             * open — where the beam's own tsh saves the image. Offered in every beam's
+             * session; outside a build tsh says there is no build to save.
+             */
+            Macro(id: "b:beam-phase-add", category: "Beams", name: "Start a new Phase build",
+                  description: "tsh phase add: a new Phase, built in a console on a new build beam \u{2014} install what it needs, then save and end the build.",
+                  command: "tsh phase add {{name}}", confirm: true, where: "beams",
+                  variables: [MacroVar(name: "name")],
+                  warning: "This starts a new Phase build on the cluster: a build beam is created, and this terminal becomes its console until the build is saved and ended."),
+            Macro(id: "b:beam-phase-snapshot", category: "Beams", name: "Save this build (Phase snapshot)",
+                  description: "In a Phase build console: save the files so far to the Phase and keep working.",
+                  command: "tsh phase snapshot", where: "beams"),
+            Macro(id: "b:beam-phase-final", category: "Beams", name: "Save and end this build",
+                  description: "In a Phase build console: save the snapshot and end the build. Changes after it are discarded.",
+                  command: "tsh phase snapshot --final", confirm: true, where: "beams",
+                  warning: "This saves the snapshot and ends the build: the build console closes, and anything changed after this snapshot is discarded."),
+            Macro(id: "b:beam-phase-fork", category: "Beams", name: "Fork this build into a new Phase",
+                  description: "In a Phase build console: start a new Phase from this build beam\u{2019}s files as they are now.",
+                  command: "tsh phase add {{name}} --fork", confirm: true, where: "beams",
+                  variables: [MacroVar(name: "name")],
+                  warning: "This creates a new Phase on the cluster from this build beam\u{2019}s files as they are now."),
+            Macro(id: "b:beam-version", category: "Beams", name: "beamctl version",
+                  description: "The beam\u{2019}s service manager and init, and the image it runs.",
+                  command: "beamctl version; echo; . /etc/os-release && echo \"$PRETTY_NAME\"", where: "beams"),
         ]
         /*
          * `where` is left off above and filled in here: every built-in is aimed at a
@@ -202,10 +398,59 @@ final class Macros {
 
     // MARK: Loading
 
-    /// Built-ins the user has not dismissed, plus their own (`loadMacros`).
+    /// Built-ins the user has not dismissed, plus their own, in the order
+    /// they were dragged into (`loadMacros`).
     var all: [Macro] {
         let hidden = Set(FleetStore.hiddenMacros())
-        return Macros.builtins.filter { !hidden.contains($0.id) } + FleetStore.savedMacros().map { Macro(json: $0) }
+        return Macros.arranged(Macros.builtins.filter { !hidden.contains($0.id) } + FleetStore.savedMacros().map { Macro(json: $0) },
+                               FleetStore.macroOrder())
+    }
+
+    /**
+     * Macros in the order they were dragged into. One not yet placed keeps its
+     * default position behind the placed ones, so a new macro or a new built-in
+     * turns up at the end of its category rather than reshuffling it.
+     */
+    nonisolated static func arranged(_ macros: [Macro], _ order: [String]) -> [Macro] {
+        var at: [String: Int] = [:]
+        for (i, id) in order.enumerated() { at[id] = i }
+        var ranked: [(m: Macro, rank: Int, i: Int)] = []
+        for (i, m) in macros.enumerated() { ranked.append((m, at[m.id] ?? order.count + i, i)) }
+        ranked.sort { (a, b) -> Bool in a.rank != b.rank ? a.rank < b.rank : a.i < b.i }
+        return ranked.map { $0.m }
+    }
+
+    /**
+     * Drop a macro before or after another, and remember it.
+     *
+     * Landing in another category moves it there: your own macro is saved with
+     * the new category. A built-in's category is part of the shipped set, so it
+     * only moves within its own.
+     *
+     * Like the category order, the saved order is rewritten from the whole list
+     * as it now stands, so the first drag fixes everything where it already was.
+     */
+    @discardableResult
+    func moveMacro(_ id: String, _ targetId: String, after: Bool = false) -> Bool {
+        var list = all
+        guard let from = list.firstIndex(where: { $0.id == id }), let target = list.first(where: { $0.id == targetId }),
+              id != targetId else { return false }
+        var moving = list[from]
+        let category = target.category.nilIfEmpty ?? "Custom"
+        if (moving.category.nilIfEmpty ?? "Custom") != category {
+            if moving.builtin {
+                StatusBus.shared.toast("A built-in macro stays in its own category \u{2014} drag it within that group", kind: .error)
+                return false
+            }
+            moving.category = category
+            _ = FleetStore.upsertMacro(moving.json)
+        }
+        list.remove(at: from)
+        let to = (list.firstIndex { $0.id == targetId } ?? list.count) + (after ? 1 : 0)
+        list.insert(moving, at: to)
+        FleetStore.setMacroOrder(list.map(\.id))
+        Macros.headersChanged()
+        return true
     }
 
     var categoryOrder: [String] { FleetStore.macroCategoryOrder() }
@@ -219,7 +464,9 @@ final class Macros {
     static let pinScopes: [(value: String, label: String)] = [
         ("all", "Every session and the local shell"),
         ("hosts", "Host sessions only"),
+        ("beams", "Beam sessions only"),
         ("local", "The local shell only"),
+        ("kube", "Kubernetes exec sessions only"),
     ]
 
     /**
@@ -230,7 +477,13 @@ final class Macros {
     static let runScopes: [(value: String, label: String)] = [
         ("all", "Hosts and the local shell"),
         ("hosts", "Hosts only"),
+        // A beam is a host too, so "hosts" macros run in one; these run nowhere else.
+        ("beams", "Beams only"),
         ("local", "The local shell only"),
+        // A kube exec session is 'local'-kind underneath (see macroKindOf) but
+        // runs inside a container, not on this machine — kubectl/env/cgroup
+        // checks belong here and nowhere else.
+        ("kube", "Kubernetes exec sessions only"),
     ]
 
     static func scopeLabel(_ w: String?) -> String {
@@ -245,14 +498,32 @@ final class Macros {
     /// A macro's run scope, with the default for one that does not carry it:
     /// `all`, because a macro saved before this existed was offered everywhere.
     static func runScopeOf(_ w: String?) -> String {
-        ["all", "hosts", "local"].contains(w ?? "") ? w! : "all"
+        ["all", "hosts", "beams", "local", "kube"].contains(w ?? "") ? w! : "all"
     }
 
-    /// Does this macro belong in a pane of this kind ("remote" | "local")?
-    static func runsOn(_ m: Macro, _ kind: String = "remote") -> Bool {
-        let w = runScopeOf(m.whereScope)
+    /**
+     * Does this macro belong in a pane of this kind? `kind` is "local",
+     * "remote" (a host), "kube", or "beam" — a host that is also a beam, which
+     * takes the host macros as well as its own.
+     */
+    nonisolated static func runsOn(_ m: Macro, _ kind: String = "remote") -> Bool {
+        runsOn(where: m.whereScope, kind)
+    }
+
+    nonisolated static func runsOn(where ws: String?, _ kind: String = "remote") -> Bool {
+        let w = ["all", "hosts", "beams", "local", "kube"].contains(ws ?? "") ? ws! : "all"
         if w == "all" { return true }
-        return kind == "local" ? w == "local" : w == "hosts"
+        if kind == "local" { return w == "local" }
+        if kind == "kube" { return w == "kube" }
+        if w == "beams" { return kind == "beam" }
+        return w == "hosts"
+    }
+
+    /// The pin scopes shown for a pane of this kind.
+    nonisolated static func pinScopesFor(_ kind: String) -> [String] {
+        kind == "local" ? ["all", "local"]
+            : kind == "kube" ? ["all", "kube"]
+            : kind == "beam" ? ["all", "hosts", "beams"] : ["all", "hosts"]
     }
 
     /// The macros that can run in a pane of this kind, in the stored order.
@@ -265,7 +536,7 @@ final class Macros {
     /// macro brings its button back); nor is one where its macro would not run.
     func pinnedMacros(kind: String) -> [(macro: Macro, icon: String, where: String)] {
         let byId = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        let wanted = kind == "local" ? ["all", "local"] : ["all", "hosts"]
+        let wanted = Macros.pinScopesFor(kind)
         return pins.compactMap { p in
             let w = p["where"].string?.nilIfEmpty ?? "hosts"
             guard wanted.contains(w), let id = p["id"].string, let m = byId[id], Macros.runsOn(m, kind) else { return nil }
@@ -451,7 +722,9 @@ final class Macros {
 
     private func allowed(_ m: Macro, window: WindowModel?) async -> Bool {
         if !m.confirm { return true }
-        return await MiscUI.confirm(window, title: m.name, message: "Run this on the target host?", detail: m.command,
+        // What running it costs, where the macro says: "Run this?" is no warning
+        // for a command that ends a build and discards its changes.
+        return await MiscUI.confirm(window, title: m.name, message: m.warning ?? "Run this on the target host?", detail: m.command,
                                     confirmLabel: "Run", danger: true)
     }
 
@@ -459,9 +732,25 @@ final class Macros {
         if !m.builtin { FleetStore.markMacroUsed(m.id) }
     }
 
-    /// "remote" or "local": what a pane is, for scopes. A console or a tmux
-    /// pane takes the same commands a host does.
-    static func paneKind(_ p: SessionPane) -> String { p.kind == .local ? "local" : "remote" }
+    /**
+     * The kind of pane, as macros see it: "local", "beam", "kube" or "remote"
+     * (`macroKindOf`). A console or a tmux pane takes the same commands a host
+     * does. A kube exec pane is local-kind underneath (kubectl runs the way a
+     * local shell runs a program, with no connection behind it) but has its
+     * own macro set, not a local shell's: kube-ui marks it with
+     * `attachments["kubeExec"]`.
+     */
+    static func paneKind(_ p: SessionPane) -> String {
+        if p.attachments["kubeExec"] != nil { return "kube" }
+        if p.kind == .local { return "local" }
+        if let id = p.connId, ConnectionManager.shared.connection(id)?.type == "beam" { return "beam" }
+        return "remote"
+    }
+
+    /// "the local shell", "a beam session", "a host session" — what the wrong pane is.
+    static func kindPhrase(_ kind: String) -> String {
+        ["local": "the local shell", "beam": "a beam session"][kind] ?? "a host session"
+    }
 
     private func sessions(_ window: WindowModel?) -> SessionsWindow? {
         (window ?? WindowManager.shared.focused)?.feature(SessionsWindow.self)
@@ -488,7 +777,7 @@ final class Macros {
         let wrong = targets.filter { !Macros.runsOn(mIn, Macros.paneKind($0)) }
         if !wrong.isEmpty {
             let detail = wrong.count == targets.count
-                ? "The focused pane is \(wrong[0].kind == .local ? "the local shell" : "a host session")."
+                ? "The focused pane is \(Macros.kindPhrase(Macros.paneKind(wrong[0])))."
                 : "\(wrong.count) of \(targets.count) panes are not what it is set for."
             let ok = await MiscUI.confirm(window, title: "Run it here?",
                                           message: "\u{201C}\(mIn.name)\u{201D} is set to run in \(Macros.runScopeLabel(mIn.whereScope).lowercased()).",

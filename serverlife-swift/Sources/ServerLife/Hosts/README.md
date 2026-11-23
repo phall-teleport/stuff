@@ -25,7 +25,7 @@ addserver.js (⌘⇧N), quickconnect.js (⌘⌥C) and history.js (command histor
 | `HostsPane.swift` | the hosts pane (an `open-view-pane` pane with `isHosts`), leaf picker `root › leaf` read with its own `tsh ls` (30 s cache) |
 | `HostsHooks.swift` | what the folder views need from sidebar/teleport-ui, with working defaults |
 | `FolderBits.swift`, `HostsUI.swift`, `HostsOpen.swift` | shared views, right-click catcher, drop delegate, how things are opened |
-| `_HostsDataStandIn.swift` | forwarders to Data/'s store.js port (see below) |
+| `_HostsDataStandIn.swift` | store.js stand-in (see below) |
 
 ## Action ids registered
 
@@ -92,8 +92,7 @@ default empty). Requestable/missing rows are recognised by `extra["requestable"]
 `markUsed`, `profileFolders`, `upsertProfileFolder`, `deleteProfileFolder`,
 `listHistory`, `listRecent` (pure overload tested), `clearHistory`. Named
 `_HostsDataStandIn.swift` because SwiftPM refuses two files called
-`_DataStandIn.swift` in one target. Every function now forwards to Data/'s
-store.js port (Data/StoreRecords.swift).
+`_DataStandIn.swift` in one target (teleport-ui has one). Swap for Data's.
 
 ## Not done / differences
 
@@ -108,3 +107,32 @@ store.js port (Data/StoreRecords.swift).
   and record which view started them (`HostsDrag`), since SwiftUI has no
   drag-end: a cancelled drag can never be completed by a later drop.
 - The export save panel has no "Export folders" title (`Modal.saveText` takes none).
+
+## 0.39 sync (hosts)
+
+New files: `SSHPresets.swift` (sshpresets.js, `SSHOptionPicker`),
+`SSHOptionsUI.swift` (renderer sshoptions.js: dialog + host-menu entry),
+`SSHConfigEditor.swift` (sshconfigeditor.js dialog on lead's CodeEditor, plus
+"Remove from ssh config"), `KubeHostKeys.swift` (kube row pref-key migration),
+`HostsPaneView.swift` / `HostsPaneRows.swift` (hosts pane views),
+`_HostsSSHOptionsStandIn.swift` (`HostsSSHOpts`, main/sshoptions.js — belongs
+to connections; delete when theirs lands).
+
+New action ids:
+- `ssh-options` (host; args `login`) — the SSH options dialog.
+- `ssh-options-menu` (host; args `menu` NSMenu, `login`, `openX11` `() -> Void`) — appends the "SSH options (…)" submenu.
+- `ssh-config-edit` (args `path`, `host`) · `ssh-config-remove-host` (host).
+- `hosts-migrate-kube-keys` (args `hosts` [JSON] kube rows) — kube-ui calls it once rows load.
+- `hosts-pane-picked` (`paneId`; args `reply: ([Host]) -> Void`) — hostspane.js `pickedHostsOf`.
+- `add-server` now takes args `configFile`, `alias`; `launch-profile` takes `forceTerminal`, `split`.
+
+Calls (owner registers): `kube-browser` (args `context`, `spec`, `title`,
+`view`, `namespace`, `profileId`, `reply: (Bool) -> Void`), `kube-host-open`,
+`kube-host-menu` (args `menu`, `groupKey`), `kube-request-access`,
+`kube-request-resource` (host) [kube-ui]; `access-request-new` (args
+`cluster`, `proxy`, `home`, `resourceIds`) [teleport-ui]; `open-host` with
+`sshOptions`, `reuse`, `filesOnly`, `profileSshOptions` [sessions/connections].
+
+New hooks: `hostKindShown` / `setHostKind` (All·SSH·K8s, default state in
+`HostKindState.shared`), `kubeHostsForProfile`, `kubeMarks`, `kubeBeat`,
+`kubeBeatTime` (kube-ui). `HostsHooks.requestAccessForMany(hosts, window:)`.

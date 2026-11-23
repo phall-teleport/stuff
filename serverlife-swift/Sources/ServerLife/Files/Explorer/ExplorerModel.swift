@@ -60,6 +60,8 @@ final class XPViewState {
     /// `_mfaFailed`: the file channel was refused; wait for a click.
     var mfaFailed = false
     var refreshing = false
+    /// Free/total space on the folder's volume, for the footer (`_loadDisk`).
+    var disk: XPDisk?
 }
 
 /// A starred folder or file, as the pane shows it.
@@ -282,6 +284,14 @@ final class ExplorerModel: Identifiable {
         if let p, p.kind == "remote" || p.kind == "tmux" {
             opts.append(XPSourceOption(value: "pane", label: paneConn.map { "This session: \($0.label)" } ?? "This session"))
         }
+        // A kube exec pane is 'local'-kind underneath — no connId, so none of
+        // the branches above apply — but its explorer is just as pinned to
+        // "this session" as a remote pane's is. Leaving it out would make the
+        // current value unmatched, and the explorer would be silently reset
+        // to the local machine every time this ran.
+        if isKube {
+            opts.append(XPSourceOption(value: sourceValue, label: "This pod: \(kubeSpec?.podName ?? "")"))
+        }
         opts.append(XPSourceOption(value: "local", label: "Local machine"))
         for c in XPConn.all where c.connected {
             if let p, c.id == p.connId { continue }   // already offered as "this session"
@@ -316,7 +326,7 @@ final class ExplorerModel: Identifiable {
         else if value == "pane" { source = .remote(nil) }
         else if value.hasPrefix("conn:") { source = .remote(String(value.dropFirst(5))) }
         else { source = .other(value) }
-        if isS3, city != nil { toggle3d(false) }
+        if isS3 || isKube, city != nil { toggle3d(false) }
         // A different source has a different shell behind it, so what was
         // followed before says nothing about this one.
         followedCwd = nil
@@ -335,8 +345,15 @@ final class ExplorerModel: Identifiable {
              * the file channel would otherwise race the terminal's prompt — two
              * OS dialogs at once, which macOS cancels. So the first load waits
              * for an explicit click, and a failure does not retry itself.
+             *
+             * Only where there is an approval to spend, though — a host actually
+             * known to need per-session MFA (`isMfaHost`), not merely "this
+             * connection happens to be on tsh": a leaf cluster, no local ssh
+             * client, tmux, or a duplicate hostname dialled by id all put a
+             * connection on tsh for reasons that have nothing to do with MFA.
+             * Those load like any other host.
              */
-            if conn.transport == "tsh" && !conn.needsMfaApproval && view.path == nil && !user {
+            if conn.transport == "tsh" && !XP.isMfaHost(conn.hostId) && view.path == nil && !user {
                 // Nothing to approve: fall through and load.
             } else if conn.transport == "tsh" && !user && view.path == nil { render(); return }
             if view.mfaFailed && !user { render(); return }
@@ -350,6 +367,11 @@ final class ExplorerModel: Identifiable {
             } catch {
                 if conn.transport == "tsh" { view.mfaFailed = true }
             }
+            return
+        }
+        if isKube {
+            if let p = view.path, !p.isEmpty, !force { render(); return }
+            try? await navigate((view.path?.isEmpty ?? true) ? "/" : view.path)
             return
         }
         if isS3 || !isLocal {
@@ -371,13 +393,13 @@ final class ExplorerModel: Identifiable {
         setStatus("Reconnecting…")
         defer { reconnecting = false }
         do {
-            try await ConnectionManager.shared.connect(connId)
+            try await Self.connectWithRelogin(connId)
             view.error = nil
             view.mfaFailed = false
             reconnecting = false
             await ensureLoaded(force: true, user: !quiet)
         } catch {
-            view.error = errorText(error)
+            view.error = XP.explainConnectError(error)
             reconnecting = false
             render()
             if !quiet { xpToast(errorText(error), "error") }
@@ -421,13 +443,35 @@ final class ExplorerModel: Identifiable {
                 view.hIndex = view.history.count - 1
             }
         } catch {
-            view.error = errorText(error)
+            view.error = XP.explainConnectError(error)
             view.loading = false
             render()
             throw error
         }
         view.loading = false
         render()
+        Task { await loadDisk(); render() }
+    }
+
+    /// sessions.js `connectWithRelogin`, the retry half: a teleport host's
+    /// non-interactive transport can fail with what looks like per-session
+    /// MFA while the node is merely not reachable yet, so it is tried again a
+    /// few times — unless the host is already known to need MFA, where it
+    /// would fail identically every time.
+    static func connectWithRelogin(_ connId: String) async throws {
+        do { try await ConnectionManager.shared.connect(connId); return } catch {
+            let msg = (error as? AppError)?.message ?? error.localizedDescription
+            let mfa = (error as? AppError)?.code == "mfa" || msg.hasSuffix(" [mfa]")
+            let c = ConnectionManager.shared.connection(connId)
+            guard mfa, let c, c.type == "teleport" else { throw error }
+            if XP.isMfaHost(c.hostId) { throw error }
+            var last: Error = error
+            for waitMs in [1200, 2000, 3000, 4000] {
+                try? await Task.sleep(nanoseconds: UInt64(waitMs) * 1_000_000)
+                do { try await ConnectionManager.shared.connect(connId); return } catch { last = error }
+            }
+            throw last
+        }
     }
 
     func refresh() async {
@@ -489,7 +533,7 @@ final class ExplorerModel: Identifiable {
         if isRemote {
             guard let conn else { return false }
             if !conn.connected { return false }
-            if conn.transport == "tsh" && view.path == nil && conn.needsMfaApproval { return false }
+            if conn.transport == "tsh" && view.path == nil { return false }
         }
         return view.error == nil && view.path != nil
     }
@@ -569,7 +613,7 @@ final class ExplorerModel: Identifiable {
         if isRemote {
             guard let conn else { return ("", false) }
             if !conn.connected { return ("", false) }
-            if conn.transport == "tsh" && view.path == nil && conn.needsMfaApproval { return ("", false) }
+            if conn.transport == "tsh" && view.path == nil && !view.loading && !view.firstLoading { return ("", false) }
         }
         if let e = view.error { return (e, true) }
         if view.path == nil { return ("", false) }
@@ -753,7 +797,7 @@ final class ExplorerModel: Identifiable {
         let on = force ?? (city == nil)
         if on == (city != nil) { return }
         if on && !Store.shared.xpShow3d { return }
-        if on && isS3 { xpToast("The 3D view does not reach into buckets yet", "error"); return }
+        if on && (isS3 || isKube) { xpToast("The 3D view does not reach into buckets or pods yet", "error"); return }
         if on {
             guard Actions.shared.isRegistered("city-open") else {
                 xpToast("3D is not available in this build", "error")

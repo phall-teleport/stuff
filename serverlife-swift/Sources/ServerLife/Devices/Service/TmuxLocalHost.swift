@@ -21,23 +21,16 @@ final class TmuxLocalHost: TmuxHost {
     /// make every `tmux new-session` refuse to nest.
     static func env(_ extra: [String: String?] = [:]) -> [String: String?] {
         var e: [String: String?] = ["TERM": "xterm-256color", "TMUX": nil, "TMUX_PANE": nil, "ELECTRON_RUN_AS_NODE": nil]
-        // An app started from the Dock has no locale, and tmux without one
-        // prints every non-ASCII character as `_` — a session called café is
-        // listed as caf_. As main.js did: a locale the user set is left alone.
-        let pe = ProcessInfo.processInfo.environment
-        if (pe["LANG"] ?? "").isEmpty && (pe["LC_ALL"] ?? "").isEmpty && (pe["LC_CTYPE"] ?? "").isEmpty {
-            e["LANG"] = "en_US.UTF-8"
-        }
         for (k, v) in extra { e[k] = v }
         return e
     }
 
     func execResult(_ cmd: String) async -> ProcResult {
-        await execResult(cmd, timeout: nil)
+        await execResult(cmd, timeout: 20)
     }
 
-    func execResult(_ cmd: String, timeout: TimeInterval?) async -> ProcResult {
-        await Proc.run("/bin/sh", ["-c", cmd], env: Self.env(), cwd: homeDir, timeout: timeout ?? 20)
+    func execResult(_ cmd: String, timeout: TimeInterval) async -> ProcResult {
+        await Proc.run("/bin/sh", ["-c", cmd], env: Self.env(), cwd: homeDir, timeout: timeout)
     }
 
     /// `exec`: stdout, or throw with stderr.

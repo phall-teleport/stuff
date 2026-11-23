@@ -11,7 +11,8 @@ import Foundation
 enum ControlVerbs {
     nonisolated static let mainVerbs: Set<String> = ["status", "list_hosts", "list_clusters", "login_command", "list_layouts",
                                          "list_beams", "list_forwards", "open_forward", "list_requests", "run_request",
-                                         "sync_preview", "sync_apply"]
+                                         "sync_preview", "sync_apply", "list_kube_resource_types",
+                                         "list_kube_resources", "get_kube_resource", "describe_kube_resource"]
 
     nonisolated static var all: [String] { (mainVerbs.union(AutomationWindow.verbs)).sorted() }
 
@@ -31,6 +32,10 @@ enum ControlVerbs {
         case "run_request": return try await runRequest(p)
         case "sync_preview": return try await syncPreview(p)
         case "sync_apply": return try await syncApply(p)
+        case "list_kube_resource_types": return try await ControlKube.listTypes(p)
+        case "list_kube_resources": return try await ControlKube.listResources(p)
+        case "get_kube_resource": return try await ControlKube.getResource(p)
+        case "describe_kube_resource": return try await ControlKube.describeResource(p)
         default:
             throw AppError("Unknown verb \"\(verb)\". Known: \(all.joined(separator: ", "))")
         }
@@ -58,22 +63,65 @@ enum ControlVerbs {
         let s = Store.shared.settings
         let ssh = await SSHConfig.listSshHosts(extra: s["sshConfigFiles"].stringArray)
         let tp = await Teleport.status()
+        let kubeCtx = await Kube.listContexts(extraPaths: Store.shared.kubeSettingConfigPaths)
+        let kubeContexts = kubeCtx["ok"].truthy ? kubeCtx["contexts"].items : []
         let starred = Set(s["starredHosts"].stringArray)
-        var hosts: [JSON] = []
+        var nodes: [JSON] = [], beamList: [JSON] = [], kubeList: [JSON] = []
         for prof in tp.profiles where !prof.expired {
+            /*
+             * Beams by the name they are opened with. Each also registers as a
+             * `beam-<uuid>` node, which is listed too but says which beam it is —
+             * opened as a plain node it fails, so the beam's name is the one to use.
+             */
+            let probe = await Beams.supported(proxy: prof.proxy, home: prof.homeDir)
+            let bs = probe.ok ? await Beams.list(proxy: prof.proxy, home: prof.homeDir).items : []
+            var byNode: [String: String] = [:]
+            for b in bs where !b.uuid.isEmpty { byNode["beam-" + b.uuid] = b.id }
+            for b in bs {
+                beamList.append(["kind": "beam", "name": .string(b.id), "uuid": .string(b.uuid), "cluster": .string(prof.cluster),
+                                 "proxy": .string(prof.proxy), "region": .string(b.region),
+                                 "expires": b.expires.map { .string(AutomationWindow.isoString(ms: $0)) } ?? .null])
+            }
             let r = await Teleport.listNodes(proxy: prof.proxy, cluster: prof.cluster, home: prof.homeDir)
             for n in r.items {
                 // What the window would do with this host, so a caller does not
                 // have to guess at the account or wonder why a session used another one.
-                hosts.append([
+                var o: JSON = [
                     "kind": "teleport", "name": .string(n.name), "cluster": JSON(n.cluster), "home": JSON(n.home),
                     "addr": JSON(n.addr), "labels": .object(n.labels.mapValues { .string($0) }), "logins": JSON(prof.logins),
                     "starred": .bool(starred.contains(n.id)),
                     "preferredUser": JSON(s["hostUsers"][n.prefKey].string?.nilIfEmpty),
                     "agentForward": .bool(ConnPrefs.agentForward(for: n)),
-                ])
+                ]
+                if let b = byNode[n.name] { o["beam"] = .string(b) }
+                nodes.append(o)
+            }
+            // Kube clusters, named like a host for exactly this reason — see
+            // MCP.md's own "KubeLife" section. Logged in first; available-but-
+            // not-logged-in ones fill in the rest, not double-counting a name
+            // already in the first group. Requestable-only clusters are left
+            // out, same as list_hosts never surfaces an SSH node you would
+            // first have to request — a mutating action this interface still
+            // does not offer.
+            let mineKube = ControlKube.contexts(kubeContexts, cluster: prof.cluster, proxy: prof.proxy)
+            let mineNames = Set(mineKube.map(ControlKube.nameOf))
+            for c in mineKube {
+                kubeList.append(["kind": "kube", "name": .string(ControlKube.nameOf(c)), "cluster": .string(prof.cluster),
+                                 "proxy": .string(prof.proxy), "home": JSON(prof.homeDir.nilIfEmpty), "loggedIn": true,
+                                 "contextName": c["contextName"]])
+            }
+            let avail = await Kube.listKubeClusters(proxy: prof.proxy, home: prof.homeDir)
+            if avail["ok"].truthy {
+                for cl in avail["clusters"].items {
+                    let name = cl["name"].string ?? ""
+                    if mineNames.contains(name) { continue }
+                    kubeList.append(["kind": "kube", "name": .string(name), "cluster": .string(prof.cluster),
+                                     "proxy": .string(prof.proxy), "home": JSON(prof.homeDir.nilIfEmpty), "loggedIn": false,
+                                     "labels": cl["labels"].object != nil ? cl["labels"] : [:]])
+                }
             }
         }
+        var hosts: [JSON] = beamList + nodes + kubeList
         for h in ssh {
             var o: JSON = ["kind": "ssh", "name": .string(h.alias ?? h.name),
                            // Which config file it came from; null means ~/.ssh/config.
@@ -86,8 +134,15 @@ enum ControlVerbs {
             hosts.append(o)
         }
         for prof in Store.shared.autoListProfiles() {
+            // Where it actually points — useful for an sftp/ssh profile
+            // especially, where the name alone does not say what it dials.
+            func pick(_ k: String) -> JSON {
+                for v in [prof[k], prof["direct"][k]] where v.truthy { return v }
+                return .null
+            }
             hosts.append(["kind": "profile", "name": prof["name"], "type": prof["type"],
-                          "cluster": prof["cluster"].string?.nilIfEmpty.map(JSON.string) ?? .null])
+                          "cluster": prof["cluster"].string?.nilIfEmpty.map(JSON.string) ?? .null,
+                          "hostname": pick("hostname"), "port": pick("port"), "user": pick("user")])
         }
         let q = (p["query"].stringish ?? "").lowercased()
         let matched = q.isEmpty ? hosts : hosts.filter { $0.text().lowercased().contains(q) }

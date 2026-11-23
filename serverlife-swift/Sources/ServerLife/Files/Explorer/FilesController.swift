@@ -28,7 +28,14 @@ final class XPPaneExplorers {
         // A tmux pane on this machine has no connection: its files are this
         // machine's (the original switched such a pane's source to local).
         let remote = info?.kind == "remote" || (info?.kind == "tmux" && info?.connId != nil)
-        let main = ExplorerModel(source: remote ? .remote(nil) : .local, paneId: paneId, window: info?.window)
+        // A kube exec pane is local-kind underneath, but its explorer is pinned
+        // to the pod — picked up front, not raced against its own first load.
+        var source: XPSource = remote ? .remote(nil) : .local
+        if let spec = XPPanes.kubeSpec(paneId) {
+            XPKube.register(paneId, spec)
+            source = .other(XPKube.value(paneId))
+        }
+        let main = ExplorerModel(source: source, paneId: paneId, window: info?.window)
         main.onChange = { [weak self] what in
             if what == "hide" { XPPanes.setVisible(paneId, false) }
             if what == "toggle-local" { self?.toggleLocal(paneId) }
@@ -91,6 +98,7 @@ final class XPPaneExplorers {
     /// The pane is closing for good.
     func close(_ paneId: String) {
         guard let e = entries.removeValue(forKey: paneId) else { return }
+        XPKube.forget(paneId)
         e.local?.destroy()
         e.main.destroy()
     }
@@ -179,6 +187,8 @@ enum XPFiles {
         await followTerminals(live)
         for e in live {
             if isMfaSession(e) { continue }                                   // polling would re-prompt
+            // "No background commands on servers": a remote list is re-read when asked.
+            if Store.shared.xpQuietRemote && e.isRemote { continue }
             e.pollPaused = false
             await e.autoRefresh()
         }

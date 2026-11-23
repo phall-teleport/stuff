@@ -132,16 +132,37 @@ extension Teleport {
 
     static func parseRecordings(_ text: String, proxy: String?) -> [Recording]? {
         guard let raw = try? JSON.parse(text) else { return nil }
-        var out = raw.items.map { e -> Recording in
+        // A non-ssh session (app, db, kube) emits its own differently-shaped
+        // events rather than one session.end — a real `app` session came back
+        // as three `app.session.chunk` events sharing one sid. Keep the last
+        // event seen per sid: the one most likely to be the summary. `tsh
+        // recordings ls` also surfaces audit events that are not a recording
+        // at all (a `beam.destroyed` sharing the beam's id as `sid`); every
+        // genuine recording event carries `proto`, so that is the filter.
+        var order: [String] = []
+        var bySid: [String: JSON] = [:]
+        for e in raw.items {
+            guard let sid = e["sid"].stringish?.nilIfEmpty, e["proto"].truthy else { continue }
+            if bySid[sid] == nil { order.append(sid) }
+            bySid[sid] = e
+        }
+        var out = order.compactMap { bySid[$0] }.map { e -> Recording in
+            // A kube session.end carries both `server_hostname` (the
+            // kube_service's own registration, not what anyone searches by)
+            // and `kubernetes_cluster`, which is checked first for that reason.
+            let sid = e["sid"].stringish ?? ""
+            let name = [e["kubernetes_cluster"], e["server_hostname"], e["app_name"], e["db_service_name"],
+                        e["db_name"], e["server_id"]].lazy.compactMap { $0.stringish?.nilIfEmpty }.first
+                ?? String(sid.prefix(8))
             let start = TPText.parseDate(e["session_start"].string)
             let stop = TPText.parseDate(e["session_stop"].string)
             let mode = e["session_recording"].string
             return Recording(
                 sid: e["sid"].stringish ?? "", cluster: e["cluster_name"].string, proxy: proxy,
                 user: e["user"].string, login: e["login"].string,
-                node: e["server_hostname"].string?.nilIfEmpty ?? e["server_id"].string,
+                node: name,
                 nodeId: e["server_id"].string, addr: e["server_addr"].string,
-                proto: e["proto"].string?.nilIfEmpty ?? "ssh", interactive: e["interactive"].truthy,
+                proto: e["proto"].string?.nilIfEmpty ?? "ssh", interactive: e["interactive"] != .bool(false),
                 participants: e["participants"].items.compactMap(\.stringish), recordingMode: mode,
                 labels: e["server_labels"].entries.compactMapValues(\.stringish),
                 startedAt: start, endedAt: stop,

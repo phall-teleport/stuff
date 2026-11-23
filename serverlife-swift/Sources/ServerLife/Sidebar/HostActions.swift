@@ -14,9 +14,34 @@ enum SBHostActions {
             if c.state != .connected { try await cm.connect(c.id) }
             return c.id
         }
-        let c = try await cm.create(host: host, options: ConnectOptions(login: login))
-        try await cm.connect(c.id)
-        return c.id
+        // A host remembered as needing per-session MFA goes over tsh: the
+        // shared (mux) path only proxies the long-lived certificate, which the
+        // node refuses every time without ever attempting the ceremony.
+        let known = host.type == Host.teleport && HostPrefs.isMfaHost(host.id)
+        do {
+            return try await dial(host, login: login, mfa: known)
+        } catch {
+            // First time seeing this host fail this way: connect tags the
+            // error [mfa] so a caller can retry over tsh — and remember it.
+            let msg = (error as? AppError)?.message ?? error.localizedDescription
+            guard !known, host.type == Host.teleport, msg.range(of: #"\[mfa\]\s*$"#, options: .regularExpression) != nil else { throw error }
+            HostPrefs.setMfaHost(host, true)
+            return try await dial(host, login: login, mfa: true)
+        }
+    }
+
+    private static func dial(_ host: Host, login: String?, mfa: Bool) async throws -> String {
+        let cm = ConnectionManager.shared
+        let c = try await cm.create(host: host, options: ConnectOptions(login: login, transport: mfa ? "tsh" : nil))
+        do {
+            try await cm.connect(c.id)
+            return c.id
+        } catch {
+            // A connection that never came up is nothing worth keeping —
+            // least of all one about to be retried over another transport.
+            await cm.disconnectAndWait(c.id)
+            throw error
+        }
     }
 
     // MARK: Choosing a host
@@ -118,12 +143,12 @@ enum SBHostActions {
 
     // MARK: Run a command
 
-    /// The last ad-hoc command, offered for the empty case.
-    static var lastQuickCommand = ""
-
-    static func openRunCommand(_ host: Host, login: String?, connId: String? = nil, command: String? = nil,
+    static func openRunCommand(_ host: Host, login: String?, logins: [String] = [], connId: String? = nil, command: String? = nil,
                                title: String? = nil, autoRun: Bool = true, window: WindowModel?) {
-        let model = RunCommandModel(host: host, login: login, connId: connId, command: command ?? lastQuickCommand)
+        // A caller that supplies a command has already chosen it; the last
+        // ad-hoc one is only a convenience for the empty case.
+        let model = RunCommandModel(host: host, login: login, logins: logins, connId: connId,
+                                    command: command ?? SBCommandHistory.list.first ?? "")
         Modal.sheet(window, title: title ?? "Run a command", width: 720) { handle in
             RunCommandView(model: model, title: title ?? "Run a command", window: window) { handle.close() }
         }
@@ -307,7 +332,7 @@ final class ServerInfoModel: ObservableObject {
         // The probe's own order, as Object.entries(info) gave it.
         let order = ["kernel_sys", "kernel", "arch", "hostname", "user", "shell", "os_pretty", "os_name", "os_version", "os_id",
                      "uptime", "cpus", "cpu_model", "mem_total_kb", "mem_avail_kb", "load", "disk_root", "virt", "init",
-                     "users_online", "pkg", "has_docker", "has_kubectl", "has_podman"]
+                     "users_online", "pkg", "has_docker", "has_kubectl", "has_podman", "has_helm", "has_kustomize"]
         var lines: [String] = order.compactMap { k in info.values[k].map { "\(k)=\($0)" } }
         lines += info.values.keys.filter { !order.contains($0) }.sorted().map { "\($0)=\(info.values[$0]!)" }
         lines.append("osLabel=\(info.osLabel)")
@@ -376,7 +401,8 @@ private struct ServerInfoView: View {
     private func infoBody(_ info: ServerInfo, _ p: Palette) -> some View {
         let osId = (info["os_id"] ?? "").lowercased()
         let tooling = [info["has_docker"] != nil ? "docker" : nil, info["has_kubectl"] != nil ? "kubectl" : nil,
-                       info["has_podman"] != nil ? "podman" : nil].compactMap { $0 }.joined(separator: ", ")
+                       info["has_podman"] != nil ? "podman" : nil, info["has_helm"] != nil ? "helm" : nil,
+                       info["has_kustomize"] != nil ? "kustomize" : nil].compactMap { $0 }.joined(separator: ", ")
         let cpu: String? = info["cpu_model"].map { "\(info["cpus"] ?? "?") × \($0)" } ?? info["cpus"]
         let mem: String? = info.memTotal.map { "\(Fmt.bytes($0)) total\(info.memAvail.map { " · \(Fmt.bytes($0)) available" } ?? "")" }
         let virt = info["virt"].flatMap { $0 == "none" ? nil : $0 }
@@ -419,101 +445,6 @@ private struct ServerInfoView: View {
                 }
             }
             MiscHint(text: "Probed \(Fmt.date(ms: info.fetchedAt)) over the existing connection.", size: 11).padding(.top, 14)
-        }
-    }
-}
-
-// MARK: - Run a command
-
-@MainActor
-final class RunCommandModel: ObservableObject {
-    let host: Host
-    let login: String?
-    private var id: String?
-    @Published var command: String
-    @Published var output = "Output appears here."
-    @Published var failed = false
-    @Published var meta = ""
-    private var running = false
-    private var lastOutput = ""
-
-    init(host: Host, login: String?, connId: String?, command: String) {
-        self.host = host; self.login = login; self.id = connId; self.command = command
-    }
-
-    func run() {
-        let cmd = command.trimmed
-        if cmd.isEmpty { SBActions.toast("Enter a command", .error); return }
-        if running { return }
-        running = true
-        SBHostActions.lastQuickCommand = cmd
-        output = "Running…"; failed = false; meta = ""
-        let t0 = nowMs()
-        Task { @MainActor in
-            defer { self.running = false }
-            do {
-                let cid: String
-                if let id { cid = id } else { cid = try await SBHostActions.ensureConnection(host, login: login) }
-                self.id = cid
-                let r = try await ConnectionManager.shared.exec(cid, cmd)
-                lastOutput = r.stdout
-                output = r.stdout.trimmed.nilIfEmpty ?? "(no output)"
-                failed = false
-                meta = "Finished in \(Fmt.duration(ms: nowMs() - t0)) · \(r.stdout.utf8.count) bytes"
-            } catch {
-                lastOutput = error.localizedDescription
-                output = error.localizedDescription.nilIfEmpty ?? "Command failed"
-                failed = true
-                meta = "Failed after \(Fmt.duration(ms: nowMs() - t0))"
-            }
-        }
-    }
-
-    func copyOutput() {
-        if lastOutput.isEmpty { SBActions.toast("Nothing to copy yet", .info); return }
-        Clipboard.write(lastOutput)
-        SBActions.status("Output copied")
-    }
-}
-
-private struct RunCommandView: View {
-    @ObservedObject var model: RunCommandModel
-    let title: String
-    let window: WindowModel?
-    let close: () -> Void
-
-    var body: some View {
-        let p = Theme.shared.p
-        DialogScaffold(title: title, subtitle: HostPrefs.label(model.host), width: 720) {
-            VStack(alignment: .leading, spacing: 4) {
-                MiscField(label: "Command", hint: "Enter runs it · Shift+Enter for a new line") {
-                    SBCommandEditor(text: $model.command, placeholder: "systemctl status nginx") { model.run() }
-                        .frame(height: 78)
-                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(p.border))
-                }
-                Text("Output").font(.system(size: 11)).foregroundStyle(p.muted).padding(.bottom, 1)
-                ScrollView {
-                    Text(model.output)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(model.failed ? p.red : p.text)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 11).padding(.vertical, 9)
-                }
-                .frame(minHeight: 64, maxHeight: 320)
-                .background(RoundedRectangle(cornerRadius: 5).fill(p.panel2))
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(p.border))
-                if !model.meta.isEmpty { MiscHint(text: model.meta, size: 11).padding(.top, 6) }
-            }
-        } footer: {
-            Button("Copy output") { model.copyOutput() }.buttonStyle(.ghost)
-            Button("Save as snippet") {
-                let cmd = model.command.trimmed
-                if cmd.isEmpty { SBActions.toast("Enter a command first", .error); return }
-                Actions.shared.perform("snippet-from-selection", window: window, args: ["text": cmd])
-            }.buttonStyle(.ghost)
-            Button("Run") { model.run() }.buttonStyle(.primary)
-            Button("Close") { close() }.buttonStyle(.ghost).keyboardShortcut(.cancelAction)
         }
     }
 }

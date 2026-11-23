@@ -4,7 +4,9 @@ Settings, themes, the guide, the tour, version history, About, the backup
 dialogs and the ui.js pieces App/ does not have. Ports index.js
 `openSettings`/`locateTsh`/`openAbout`, themes.js (+ the skin/accent blocks of
 styles.css and term.js `activeTheme`), guide.js, tour.js, changelog.js,
-versions.js, backup.js (renderer), ui.js leftovers.
+versions.js, backup.js (renderer), ui.js leftovers — and, new for 0.39, settingsnav.js
+(Settings sections + search), fonts.js/bundledfonts.js, search.js (Search everything),
+tshenv.js (the tsh variables editor), index.js `remindCustomTeleport` and the homes dialog.
 
 ## Action ids (registered in `MiscFeature.install`)
 
@@ -18,6 +20,8 @@ versions.js, backup.js (renderer), ui.js leftovers.
 | `tour` | Start the guided tour in the window | — |
 | `backup-export` | Export all / macros to a JSON file | `what` "all"/"macros", `ids` [String] (macros subset) |
 | `backup-import` | Pick a file, show its contents, merge or replace | `reply` `(Bool) -> Void` (true when imported) |
+| `search-everything` | Put the keyboard in the title bar's search box (also ⌘P, a key monitor) | — |
+| `search-data` | search.js `searchData` for an agent (MCP `serverlife_search`) | `query`, `limit` Int, `kinds` [String], `reply: (Any?) -> Void` → JSON `{query,total,groups:[{kind,title,next,more,results}]}` |
 
 Actions Misc **calls** (owners please register):
 
@@ -30,6 +34,13 @@ Actions Misc **calls** (owners please register):
 - `automation-rotate` — args `reply: (JSON) -> Void`.
 - `automation-copy-command` — args `what: "mcp" | "bridge"` (copies to the clipboard).
   Unregistered automation actions → the section says "not available in this build".
+- Search everything calls: `open-host-from-list` (host), `launch-profile` (`profile`), `beam-open`
+  (`beam`), `teleport-panel`, `snippets`, every menu id in `MiscSearch.commands`, and the [ai] ids
+  below (it is empty / a no-op until they exist):
+  - `ai-saved-prompts`, `ai-saved-responses` — query actions, `reply: (Any?) -> Void` with `[JSON]`
+    (`{name,text}` / `{title,file,path,mtime}`), ai.js `savedPrompts()` / `ai:savedList`.
+  - `ai-ask` with args `text`, `send: true` (a saved prompt is sent); `ai-saved-open` (ai.js `openSavedResponses`).
+- `ai-clients` [ai] — Settings → Assistants "AI clients…" button.
 
 ## Hooks (`MiscHooks`, set from your `install()`)
 
@@ -48,7 +59,28 @@ nodeRefreshSeconds, staleNodeMinutes, sidebarHostLimit, fontSize, sidebarFontSiz
 cursorBlink, followTerminalFolder, showHiddenFiles, showFileDetails, foldersFirst, show3dView, externalEditor,
 highlight, showShellInTitle, showPaneNetIcon, showTabActivity, confirmLinkOpen, confirmQuitWithSessions,
 confirmCloseWithSessions, tmuxDefault, tmuxSessionName, requestMonitorAutoOpen, showWatchMark, agentForward,
-starredMode, autoFlagLocal, autoFlagHost. "Stop watching all" clears `watchedHosts`.
+starredMode, autoFlagLocal, autoFlagHost, plus the 0.39 keys: cursorStyle, heartbeatStyle,
+showServerIcon, liveStats, localStats, statsOncePerTab, quietRemote, paneCloseAnimations,
+confirmLoginToConnect, focusFollowsMouse, detectTeleportOnSsh, kubeEnabled, aiStartup, aiWorkdir,
+aiLauncher, aiKeys, expiredListMode/expiredListHours, automationTyping, tshHomeEnv (home → variables).
+"Stop watching all" clears `watchedHosts`. `fontSize` is always in the patch; panes compare with the
+before value (`settingsSaved`). Keys not in `StoreDefaults` are read with the original's defaults in code.
+
+Sections and search (settingsnav.js, `SettingsNav`): the groups get titled sections, a "Show"
+picker for one section and a search box that keeps only matching settings; `SettingsDialog.open(window,
+query:)` opens it filtered (Search everything's "Search settings for …" row).
+
+Teleport homes: each home has a dialog (`MiscHomeDialog.run`) with Browse… (packages browsable as
+folders), the resolved path line (`MiscTshEnv.homeNote`) and its own tsh variables (`MiscEnvBox`).
+`MiscTshEnv` reads/checks the variable text; applying it is Teleport/Service's `TshEnv`.
+`MiscEnvBox(text:placeholder:)` is the variables editor with Insert example — reusable by
+teleport-ui's `tsh-env-edit` dialog.
+
+Fonts (`MiscFonts`): `stack(setting)` (fonts.js `fontStack`), `font(setting, size:)` → NSFont
+(the first family of the stack that exists), `registerBundled()` (Resources/fonts, 51 OFL fonts, done
+lazily by Settings' font picker and by `font`), `choices()` for a picker.
+
+Launch reminder (`MiscTeleportReminder`): once at install, outside `--snapshot`.
 
 `SettingsDialog.apply(patch)` = main.js `settings:set`: writes, and applies `tshHomes` → `Tools.homes`,
 `tshPath`/`sshPath` → `Tools.setTshPath/setSshPath`. Use it when you change those keys.
@@ -58,7 +90,8 @@ Theme/accent/skin preview live while the dialog is open (`MiscThemes.preview`); 
 ## Themes
 
 `Theme.shared.p` and `Theme.shared.terminal` reflect theme/accent/skin/terminalPalette (resolver installed
-first in `Theme.shared.resolvers`). 37 named themes (`MiscThemes.appThemes`), 9 skins, 7 accents,
+first in `Theme.shared.resolvers`). 38 named themes (`MiscThemes.appThemes`, matrix new), 10 skins
+(Thug Life new; `MiscThemes.skinDisplayFont(size:)` gives its UnifrakturMaguntia heading font, nil otherwise), 7 accents,
 terminal palettes (`MiscThemes.terminalPalettes`: app, Solarized dark/light, Gruvbox, Nord, Dracula, High
 contrast, plus every theme with its own colours). Precedence as the original: skin > accent > named theme
 for the window; for the terminal named palette > named theme (unless a skin) > skin-derived > plain dark/light.
@@ -89,8 +122,14 @@ that is hidden or smaller than 4×4 is skipped and the step is shown centred).
 | `toggle-files` | title-bar explorer button | whoever fills `Slots.titlebarActions` |
 | `toggle-multiexec` | title-bar multi-exec button | 〃 |
 | `toggle-transfers` | title-bar transfers/dock button | 〃 |
+| `global-search` | the Search everything box (`#global-search`) | **tagged by Misc** |
+| `toggle-ai` | the ✦ AI button | whoever draws it |
+| `sb-kind-filter` | the sidebar's kind filter (servers / Kubernetes) | sidebar — **not tagged yet** (centred) |
 
-The tour is offered once per `Tour.version` (settings.`tourSeenVersion` = 3) via
+Four 0.39 steps (cluster browser, Helm, port-forwarding, 3D view) point at things inside the
+Kubernetes browser, which is not open when the tour runs; they are centred cards (`target: nil`).
+
+The tour is offered once per `Tour.version` (settings.`tourSeenVersion` = 6) via
 `WindowManager.didOpen` 1.5 s after the first window opens, not in a second window, not when
 `windowHasSessions`, never under `--snapshot`. Escape / ←/→/Return drive it.
 
@@ -108,7 +147,8 @@ The tour is offered once per `Tour.version` (settings.`tourSeenVersion` = 3) via
 ## Backup
 
 `BackupUI.exportSettings / importSettings / reloadAfterImport`. The envelope functions in
-`BackupOps.swift` forward to Data/'s port of main/backup.js (`Backup`, Data/Backup.swift).
+`BackupOps.swift` are a faithful stand-in for main/backup.js because Data/ had not published them;
+when Data/ publishes, each `BackupOps` function should forward to Data's.
 
 ## Not done / differences
 
@@ -116,3 +156,9 @@ The tour is offered once per `Tour.version` (settings.`tourSeenVersion` = 3) via
 - Guide search marks every occurrence (the original marked the first per DOM text node) and a hit under
   a `###` heading marks its enclosing section in the list.
 - Settings shows an extra `ssh:` line next to the `tsh:` line.
+- Search everything's "Search settings for …" opens Settings filtered (Settings' own "No setting
+  matches."); the original's status line "No setting mentions “…”" and the row flash are not ported.
+- Resources/CHANGELOG.md and Resources/GUIDE.md (lead's) still end at 0.15.2: Version history and the
+  guide show the old text until they are copied from upstream.
+- The bundled fonts are registered lazily from Misc (`MiscFonts.registerBundled`), not at launch;
+  the terminal uses `fontFamily` only if Sessions resolves it with `MiscFonts.font`.

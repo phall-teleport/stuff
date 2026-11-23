@@ -126,17 +126,33 @@ private func exchange(_ path: String, _ lines: [String], count: Int) throws -> [
         #expect(i["result"]["capabilities"]["tools"].object != nil)
         let l = MCPBridge.respond(["jsonrpc": "2.0", "id": "a", "method": "tools/list"])!
         let tools = l["result"]["tools"].items
-        #expect(tools.count == 21)
+        #expect(tools.count == 30)
         #expect(l["id"].string == "a")
         let names = tools.compactMap { $0["name"].string }
-        #expect(names.first == "serverlife_status" && names.last == "serverlife_run_macro")
+        #expect(names.first == "serverlife_status" && names.last == "serverlife_read_output")
+        for n in ["serverlife_get_settings", "serverlife_set_settings", "serverlife_type_into_session", "serverlife_search",
+                  "serverlife_list_kube_resource_types", "serverlife_list_kube_resources",
+                  "serverlife_get_kube_resource", "serverlife_describe_kube_resource"] {
+            #expect(names.contains(n))
+        }
         let open = tools.first { $0["name"].string == "serverlife_open_session" }!
-        #expect(open["inputSchema"]["required"].stringArray == ["host"])
+        #expect(open["inputSchema"]["required"] == .null)  // `host` or `beam`
         #expect(open["inputSchema"]["properties"]["split"]["enum"].stringArray == ["right", "down"])
         #expect(open["inputSchema"]["properties"]["tmux"]["description"].string?.contains("host\u{2019}s own setting") == true)
         // Every tool forwards to a verb the app knows.
         let verbs = Set(ControlVerbs.mainVerbs.union(AutomationWindow.verbs))
         #expect(MCPTools.all.allSatisfy { verbs.contains($0.verb) })
+    }
+
+    @Test func initializeNamesTheClient() {
+        _ = MCPBridge.respond(["id": 1, "method": "initialize", "params": ["clientInfo": ["name": "claude-code"]]])
+        var seen: JSON?
+        _ = MCPBridge.respond(["id": 2, "method": "tools/call", "params": ["name": "serverlife_status"]]) { _, p in
+            seen = p; return [:]
+        }
+        #expect(seen?["_client"].string == "claude-code")
+        _ = MCPBridge.respond(["id": 3, "method": "initialize", "params": [:]])
+        #expect(MCPBridge.clientName == nil)
     }
 
     @Test func callsAndErrors() {
@@ -147,6 +163,8 @@ private func exchange(_ path: String, _ lines: [String], count: Int) throws -> [
             return ["count": 0]
         }!
         #expect(seen?.0 == "list_hosts" && seen?.1["query"].string == "db")
+        // Every call says which client asked (null before an initialize named one).
+        #expect(seen?.1.object?["_client"] != nil)
         #expect(ok["result"]["content"][0]["type"].string == "text")
         #expect(JSON.tryParse(ok["result"]["content"][0]["text"].string ?? "")["count"].int == 0)
 
@@ -228,5 +246,72 @@ private func exchange(_ path: String, _ lines: [String], count: Int) throws -> [
             #expect(JSON.tryParse(text)["verb"].string == "list_layouts")
             #expect(p.terminationStatus == 0)
         }
+    }
+}
+
+struct AutomationKubeTests {
+    let ctxs: [JSON] = [
+        ["contextName": "corp-prod", "kubeClusterName": "prod", "source": "teleport", "teleportCluster": "corp"],
+        ["contextName": "corp-dev", "kubeClusterName": "dev", "source": "teleport", "teleportCluster": "corp"],
+        ["contextName": "other-dev", "kubeClusterName": "dev", "source": "teleport", "teleportProxy": "other.example.com:443"],
+        ["contextName": "minikube", "name": "minikube", "source": "kubeconfig"],
+    ]
+
+    @Test func pickByContextThenKubeName() throws {
+        #expect(try ControlKube.pick("corp-dev", from: ctxs)["contextName"].string == "corp-dev")
+        #expect(try ControlKube.pick("prod", from: ctxs)["contextName"].string == "corp-prod")
+        #expect(throws: AppError.self) { try ControlKube.pick("dev", from: ctxs) }
+        do { _ = try ControlKube.pick("dev", from: ctxs) } catch {
+            #expect("\(error)".contains("matches 2 logged-in contexts: corp-dev, other-dev. Give the exact context name."))
+        }
+        do { _ = try ControlKube.pick("nope", from: ctxs) } catch {
+            #expect("\(error)".contains("No logged-in cluster called \"nope\"."))
+        }
+    }
+
+    @Test func contextsForProfile() {
+        #expect(ControlKube.contexts(ctxs, cluster: "corp", proxy: "corp.example.com:443").map(ControlKube.nameOf) == ["prod", "dev"])
+        #expect(ControlKube.contexts(ctxs, cluster: "other", proxy: "other.example.com:443").map { $0["contextName"].string } == ["other-dev"])
+        #expect(ControlKube.nameOf(ctxs[3]) == "minikube")
+    }
+
+    @Test func kubeByName() throws {
+        let names = ["prod-eu", "prod-us", "dev"]
+        #expect(try AutomationWindow.pickKube("dev", names) == 2)
+        #expect(try AutomationWindow.pickKube("EU", names) == 0)
+        #expect(try AutomationWindow.pickKube("nothing", names) == nil)
+        #expect(throws: AppError.self) { try AutomationWindow.pickKube("prod", names) }
+    }
+}
+
+struct AutomationWindowPureTests {
+    @Test func beamFlags() {
+        #expect(AutomationWindow.beamFlag(true) == true)
+        #expect(AutomationWindow.beamFlag(false) == false)
+        #expect(AutomationWindow.beamFlag(.null) == nil)
+        #expect(AutomationWindow.beamFlag("x") == nil)
+        #expect(AutomationWindow.isBeamNodeName("beam-0b9c4a5e-1f2d-4c3b-9a8e-7d6c5b4a3f21"))
+        #expect(!AutomationWindow.isBeamNodeName("beam-web"))
+    }
+
+    @Test func macroWaitAndOutput() {
+        #expect(AutomationWindow.waitSeconds(.null) == 0)
+        #expect(AutomationWindow.waitSeconds(.number(5)) == 5)
+        #expect(AutomationWindow.waitSeconds(.number(600)) == 60)
+        #expect(AutomationWindow.waitSeconds(.number(-3)) == 0)
+        #expect(AutomationWindow.waitSeconds("abc") == 0)
+        let text = (1...10).map { "line \($0)" }.joined(separator: "\n")
+        #expect(AutomationWindow.lastLines(text, 3) == "line 8\nline 9\nline 10")
+        #expect(AutomationWindow.lastLines("a\nb", 5) == "a\nb")
+    }
+
+    @Test func newVerbsAreKnown() {
+        for v in ["get_settings", "set_settings", "search", "type_text", "read_output"] {
+            #expect(AutomationWindow.verbs.contains(v))
+        }
+        for v in ["list_kube_resource_types", "list_kube_resources", "get_kube_resource", "describe_kube_resource"] {
+            #expect(ControlVerbs.mainVerbs.contains(v))
+        }
+        #expect(ControlVerbs.mainVerbs.isDisjoint(with: AutomationWindow.verbs))
     }
 }

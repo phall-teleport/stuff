@@ -16,8 +16,14 @@ import Foundation
 enum Teleport {
     // MARK: - Running tsh
 
-    static func run(_ args: [String], home: String? = nil, timeout: TimeInterval = 25) async -> ProcResult {
-        await Tools.runTsh(args, home: home?.nilIfEmpty, timeout: timeout)
+    /// With the tsh variables from Settings for the home and the proxy in the
+    /// arguments (`tshEnv(home, proxyInArgs(args))`) — see TshEnv.swift.
+    static func run(_ args: [String], home: String? = nil, timeout: TimeInterval = 25,
+                    stdin: Data? = nil) async -> ProcResult {
+        let proxy = TshEnv.proxyInArgs(args)
+        let h = home?.nilIfEmpty ?? Tools.home(forProxy: proxy)
+        let extra = TshEnv.vars(home: h, proxy: proxy).mapValues { Optional($0) }
+        return await Tools.runTsh(args, home: h, timeout: timeout, stdin: stdin, env: extra)
     }
 
     /// `findTsh()`.
@@ -125,18 +131,26 @@ enum Teleport {
             let proxy = url.map { $0.replacingOccurrences(of: #"^https?://"#, with: "", options: .regularExpression) }
                 ?? p["proxy"].stringish ?? ""
             let validUntil = p["valid_until"].string
-            let expired = validUntil.flatMap { TPText.parseDate($0) }.map { $0 < now } ?? false
+            // A profile with no certificate behind it (logged out, or a login
+            // that never finished) still lists, with no roles and a valid_until
+            // of the moment tsh was asked — "expired" only by milliseconds, so
+            // say it outright: anything run against it is a relogin, MFA and all.
+            let roles = p["roles"].items.compactMap(\.stringish)
+            let expired = roles.isEmpty || (validUntil.flatMap { TPText.parseDate($0) }.map { $0 < now } ?? false)
             // Each entry is `{ id: { cluster, kind, name } }`; older tsh put the
             // fields at the top level. Read either.
             let allowed = p["allowed_resources"].items.map { r -> String in
                 let id = r["id"].isNull ? r : r["id"]
                 return "\(id["kind"].stringish ?? "undefined")/\(id["name"].stringish ?? "undefined")"
             }
-            return TeleportProfile(
+            var prof = TeleportProfile(
                 proxy: proxy, cluster: p["cluster"].stringish ?? "", username: p["username"].stringish ?? "",
-                logins: p["logins"].items.compactMap(\.stringish), roles: p["roles"].items.compactMap(\.stringish),
+                logins: p["logins"].items.compactMap(\.stringish), roles: roles,
                 activeRequests: p["active_requests"].items.map { $0.stringish ?? $0.text() },
                 allowedResources: allowed, validUntil: validUntil, active: active, expired: expired)
+            prof.kubeUsers = p["kubernetes_users"].items.compactMap(\.stringish)
+            prof.kubeGroups = p["kubernetes_groups"].items.compactMap(\.stringish)
+            return prof
         }
         var out: [TeleportProfile] = []
         if let a = toProfile(data["active"], true) { out.append(a) }
@@ -258,7 +272,10 @@ enum Teleport {
     static func listClusters(proxy: String?, home: String?) async -> TshList<TeleportCluster> {
         var args = ["clusters", "--format=json"]
         if let p = proxy?.nilIfEmpty { args.append("--proxy=" + p) }
-        let r = await run(args, home: home, timeout: 30)
+        // Short: once a cluster is logged in this is a local, near-instant
+        // answer, and the only way it is ever slow is one that is not — which
+        // is checked on the way into every Teleport host it opens.
+        let r = await run(args, home: home, timeout: 6)
         if let clusters = parseClusters(r.out) {
             TeleportSSH.recordClusters(proxy: proxy, home: home, clusters: clusters.map {
                 TeleportSSH.ClusterInfo(name: $0.name, leaf: $0.leaf, status: $0.status, selected: $0.selected,
@@ -403,8 +420,11 @@ enum Teleport {
     /// `login`: in the background (SSO opens a browser and waits, so 5 minutes).
     /// A login that names a user must go to a terminal instead — use
     /// `loginCommandArgs` and `TshCommand.open`, or `Inventory.runLoginInTerminal`.
+    /// See `loginChecked` for the same login with the version verdict.
     static func login(_ o: LoginOptions) async -> ProcResult {
-        await run(loginArgs(o), home: o.home, timeout: 300)
+        let r = await run(loginArgs(o), home: o.home, timeout: 300)
+        if r.ok { noteLoggedIn(proxy: o.proxy, home: o.home) }
+        return r
     }
 
     /// `teleport:loginArgs`: the login as an argv for a terminal tab.
@@ -434,7 +454,7 @@ enum Teleport {
     /// cluster in its trust web, with the whole saved login command.
     static func switchProfile(_ o: LoginOptions) async -> TshOutput {
         let r = await run(loginArgs(o), home: o.home, timeout: 180)
-        if r.ok { markCurrentProfile(proxy: o.proxy, home: o.home) }
+        if r.ok { markCurrentProfile(proxy: o.proxy, home: o.home); noteLoggedIn(proxy: o.proxy, home: o.home) }
         return TshOutput(ok: r.ok, output: TPText.plain("\(r.out)\n\(r.err)"))
     }
 
@@ -462,6 +482,7 @@ enum Teleport {
         if let p = proxy?.nilIfEmpty { args.append("--proxy=" + p) }
         if let u = user?.nilIfEmpty { args.append("--user=" + u) }
         let r = await run(args, home: home, timeout: 60)
+        if r.ok, proxy?.nilIfEmpty != nil { noteDeliberateLogout(proxy: proxy, home: home) }
         return TshOutput(ok: r.ok, output: TPText.plain(r.err.isEmpty ? r.out : r.err))
     }
 

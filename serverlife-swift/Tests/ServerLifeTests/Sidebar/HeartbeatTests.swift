@@ -107,7 +107,7 @@ extension SidebarStoreSuites { @MainActor @Suite struct SidebarHeartbeatTests {
     @Test func theTooltipSaysHowLongIsLeft() {
         let nodes = listFor("c-tip", [("fresh", 5000), ("nine", 9 * MIN)])
         Heartbeat.observe(key(nodes[0]), nodes)
-        #expect(Heartbeat.heartbeatLine(nodes[0]).range(of: #"^last heartbeat: \d+s ago$"#, options: .regularExpression) != nil)
+        #expect(Heartbeat.heartbeatLine(nodes[0]).range(of: #"^last heartbeat: \d+s ago, at .+$"#, options: .regularExpression) != nil)
         let line = Heartbeat.heartbeatLine(nodes[1])
         #expect(line.contains("9 minutes ago"))
         #expect(line.contains("may be gone"))

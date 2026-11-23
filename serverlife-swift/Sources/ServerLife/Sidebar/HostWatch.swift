@@ -53,14 +53,20 @@ enum HostWatch {
         let loose = all.values.filter { w in !drawn.contains { sameGroup(w["group"].string, $0) } }
             .sorted { ($0["key"].string ?? "") < ($1["key"].string ?? "") }
         return loose
-            .filter { w in w["missingSince"].truthy || w["requestableSince"].truthy || now - (w["lastSeen"].double ?? 0) > after }
+            .filter { w in w["missingSince"].truthy || w["requestableSince"].truthy || w["loggedOut"].truthy
+                || now - (w["lastSeen"].double ?? 0) > after }
             .map { w in
+                if w["requestableSince"].truthy {
+                    // Something positive was learned about this one, and it holds
+                    // while the cluster is away — as of the last check, which with
+                    // the cluster off screen is as stale as any other watch here.
+                    var g = requestableGhost(w)
+                    g.extra["requestUncheckedSince"] = .number(requestCheckedAt(w))
+                    return g
+                }
                 var g = ghostFrom(w)
                 g.extra["missing"] = false
-                if w["requestableSince"].truthy {
-                    g.extra["requestable"] = true
-                    g.extra["requestableSince"] = w["requestableSince"]
-                } else {
+                do {
                     g.extra["unconfirmed"] = true
                 }
                 return g
@@ -100,6 +106,7 @@ enum HostWatch {
             "home": JSON(host.home?.nilIfEmpty),
             "addr": .string(host.addr ?? ""),
             "tunnel": .bool(host.tunnel == true),
+            "kind": JSON(host.extra["kind"]?.string?.nilIfEmpty),
             "labels": .object(host.labels.mapValues { .string($0) }),
             "lastSeen": .number(nowMs()),
             "missingSince": .null,
@@ -129,6 +136,19 @@ enum HostWatch {
         var map = all
         map.removeValue(forKey: key)
         save(map)
+    }
+
+    /// The person logged out of a cluster (teleportpanel.js calls this before
+    /// the profile drops out of the list): its watches go straight to
+    /// unchecked, instead of waiting several minutes for orphanGhosts to agree.
+    static func noteLoggedOut(_ groupKey: String) {
+        var map = all
+        var changed = false
+        for (k, w) in map where sameGroup(w["group"].string, groupKey) && !w["loggedOut"].truthy {
+            map[k] = merged(w, ["loggedOut": .bool(true)])
+            changed = true
+        }
+        if changed { save(map) }
     }
 
     // MARK: Noticing
@@ -205,20 +225,21 @@ enum HostWatch {
                 if w["missingSince"].truthy || w["requestableSince"].truthy { back.append(w); changed = true }
                 var patch = snapshot(host, groupKey)
                 patch["requestableSince"] = .null
+                patch["loggedOut"] = .bool(false)
                 map[key] = merged(w, patch)
                 changed = true
             } else if partial {
                 continue
             } else if requestable[key] != nil {
                 if !w["requestableSince"].truthy {
-                    let rec = merged(w, ["missingSince": .null, "requestableSince": .number(now)])
+                    let rec = merged(w, ["missingSince": .null, "requestableSince": .number(now),
+                                         "requestCheckedAt": .number(now), "loggedOut": .bool(false)])
                     map[key] = rec
                     askable.append(rec)
-                    changed = true
-                } else if w["missingSince"].truthy {
-                    map[key] = merged(w, ["missingSince": .null])
-                    changed = true
+                } else {
+                    map[key] = merged(w, ["missingSince": .null, "requestCheckedAt": .number(now), "loggedOut": .bool(false)])
                 }
+                changed = true
             } else if !w["missingSince"].truthy && mayConclude {
                 let rec = merged(w, ["missingSince": .number(now), "requestableSince": .null])
                 map[key] = rec
@@ -251,17 +272,44 @@ enum HostWatch {
     }
 
     /// Watched hosts that are out of reach but askable for.
-    static func requestableIn(_ groupKey: String, _ present: [Host] = []) -> [Host] {
+    /// "Requestable" is a finding, and it ages like one: when the checks stop
+    /// landing the row keeps its req tag and also says how long ago that was.
+    static func requestableIn(_ groupKey: String, _ present: [Host] = [], now: Double = nowMs()) -> [Host] {
         let here = Set(present.map(FolderModel.hostKey))
+        let after = unconfirmedAfterMs()
         return watchedIn(groupKey)
             .filter { $0["requestableSince"].truthy && !here.contains($0["key"].string ?? "") }
             .map { w in
-                var g = ghostFrom(w)
-                g.extra["missing"] = false
-                g.extra["requestable"] = true
-                g.extra["requestableSince"] = w["requestableSince"]
+                var g = requestableGhost(w)
+                let at = requestCheckedAt(w)
+                if w["loggedOut"].truthy || now - at > after { g.extra["requestUncheckedSince"] = .number(at) }
                 return g
             }
+    }
+
+    private static func requestableGhost(_ w: JSON) -> Host {
+        var g = ghostFrom(w)
+        g.extra["missing"] = false
+        g.extra["requestable"] = true
+        g.extra["requestableSince"] = w["requestableSince"]
+        return g
+    }
+
+    /// When a requestable watch was last confirmed so. Older records only have `requestableSince`.
+    nonisolated static func requestCheckedAt(_ w: JSON) -> Double {
+        w["requestCheckedAt"].double ?? w["requestableSince"].double ?? w["lastSeen"].double ?? 0
+    }
+
+    /// The tooltip for a requestable watch whose cluster has not been checked lately.
+    static func requestUncheckedLine(_ host: Host) -> String {
+        let at = host.extra["requestUncheckedSince"]?.double ?? 0
+        return [
+            "Not rechecked. The cluster could not be read, so this is the last thing known",
+            "about the host, not what is true now.",
+            "Last confirmed requestable \(at > 0 ? localeString(at) : "never") (\(goneFor(at)) ago)",
+            host.uuid.map { "node id: \($0)" } ?? "",
+            host.cluster.map { "cluster: \($0)" } ?? "",
+        ].filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     /// A record, drawn as the host it used to be.
@@ -282,6 +330,7 @@ enum HostWatch {
         h.addr = w["addr"].string
         h.tunnel = w["tunnel"].bool
         h.labels = w["labels"].entries.compactMapValues(\.stringish)
+        if let k = w["kind"].string?.nilIfEmpty ?? ((w["key"].string ?? "").hasPrefix("kube:") ? "kube" : nil) { h.extra["kind"] = .string(k) }
         return h
     }
 
@@ -298,7 +347,7 @@ enum HostWatch {
         let after = unconfirmedAfterMs()
         return watchedIn(groupKey)
             .filter { w in !w["missingSince"].truthy && !w["requestableSince"].truthy
-                && !here.contains(w["key"].string ?? "") && now - (w["lastSeen"].double ?? 0) > after }
+                && !here.contains(w["key"].string ?? "") && (w["loggedOut"].truthy || now - (w["lastSeen"].double ?? 0) > after) }
             .map { w in
                 var g = ghostFrom(w)
                 g.extra["missing"] = false

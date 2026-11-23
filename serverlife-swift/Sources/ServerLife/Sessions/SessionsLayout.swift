@@ -12,6 +12,9 @@ struct SplitOptions {
     var shell: String?
     var blank = false
     var remoteStartPath: String?
+    /// Open another view of the inventory rather than a shell.
+    var hosts = false
+    var startupCommand: String?
 }
 
 /// tmux's description of a window, for `openTmuxWindow` / `applyTmuxLayout`:
@@ -31,13 +34,48 @@ extension SessionsWindow {
         let cur = activePane
         // On a tmux pane a plain split is tmux's: a new pane in the session.
         if let cur, cur.kind == .tmux, o.host == nil, !o.local, let split = SessionsTmux.split, split(cur, dir) { return nil }
+        if o.hosts {
+            // A hosts pane is the Hosts owner's view; it places itself.
+            Actions.shared.perform("hosts-pane", window: window, args: ["split": dir == .row ? "right" : "down"])
+            return nil
+        }
         guard let cur, let t = tab(cur.tabId) else {
+            // Nothing focused yet: a split with a host is just "open it".
             if let h = o.host {
                 var oo = OpenHostOptions(); oo.login = o.login; oo.filesOnly = o.filesOnly
                 return await openHost(h, oo)
             }
             if o.local { return openLocalShell(cwd: o.cwd, shell: o.shell, blank: o.blank) }
-            return nil
+            // A bare split with nothing focused has nothing to split beside.
+            // With nothing open at all, a fresh local shell — the same as an
+            // empty window's own "+". With something open, just not focused,
+            // guessing which pane was meant is worse than asking: wait for
+            // the next click on one, then run this same split from there.
+            if panes.isEmpty { return openLocalShell() }
+            StatusBus.shared.show("Click a pane, then split it from there")
+            return await withCheckedContinuation { (k: CheckedContinuation<SessionPane?, Never>) in
+                onNextActivePane = { [weak self] in
+                    StatusBus.shared.show("")
+                    guard let self, self.activePane != nil else { k.resume(returning: nil); return }
+                    Task { k.resume(returning: await self.splitActivePane(dir, o)) }
+                }
+            }
+        }
+        // A bare split on a hosts pane cannot be a pane with no connection:
+        // the host targeted is whatever is picked in it. One picked — split
+        // with it, as "Open beside current" does, with its preferred login;
+        // none or several — another view of the inventory.
+        if o.host == nil && !o.local && cur.isHosts {
+            var picked: [Host] = []
+            if Actions.shared.isRegistered("hosts-pane-picked") {
+                Actions.shared.perform("hosts-pane-picked", window: window, paneId: cur.id,
+                                       args: ["reply": { (h: [Host]) in picked = h } as ([Host]) -> Void])
+            }
+            var oo = o
+            if picked.count != 1 { oo.hosts = true } else {
+                oo.host = picked[0]; oo.login = o.login ?? HostPrefs.preferredLogin(picked[0])
+            }
+            return await splitActivePane(dir, oo)
         }
         var kind: PaneKind = cur.kind
         var connId = cur.connId
@@ -45,7 +83,11 @@ extension SessionsWindow {
             kind = .local; connId = nil
         }
         if let h = o.host {
-            do { connId = try await createConnection(h, login: o.login, transport: o.transport) }
+            // open() goes straight to tsh for a host known to need per-session
+            // MFA; a split dials its own connection here and must ask too.
+            var transport = o.transport
+            if transport == nil && h.type == "teleport" && HostPrefs.isMfaHost(h.id) { transport = "tsh" }
+            do { connId = try await createConnection(h, login: o.login, transport: transport) }
             catch { StatusBus.shared.toast(error.localizedDescription, kind: .error); return nil }
             kind = .remote
         }
@@ -71,6 +113,10 @@ extension SessionsWindow {
                 do {
                     try await startRemoteTerm(np)
                     if let rs = o.remoteStartPath { sendToPane(np, "cd \(SessionsWindow.jsonQuote(rs))\n") }
+                    // A profile opened as a split keeps its startup command.
+                    if let sc = o.startupCommand, !sc.isEmpty {
+                        sendToPane(np, sc.replacingOccurrences(of: "\n*$", with: "", options: .regularExpression) + "\n")
+                    }
                     np.status = "connected"
                 } catch {
                     np.status = "error"
@@ -80,7 +126,7 @@ extension SessionsWindow {
                 np.status = "connected"
             }
         } else {
-            Task { await connectPane(np, remoteStartPath: o.remoteStartPath, noTerminal: filesOnly) }
+            Task { await connectPane(np, startupCommand: o.startupCommand, remoteStartPath: o.remoteStartPath, noTerminal: filesOnly) }
         }
         changed()
         return np
@@ -334,6 +380,8 @@ extension SessionsWindow {
         let kept = Set(root?.paneIds ?? [])
         for id in panes.values.filter({ $0.tabId == tabId }).map(\.id) where !kept.contains(id) {
             guard let p = pane(id), p.kind == .tmux else { continue }
+            // Leaves the host's live stats too: the last pane off a host stops them.
+            PaneStats.shared.detach(p)
             SessionHooks.paneClosing.forEach { $0(p) }
             p.disposeTerm()
             PaneActivity.shared.forget(id)

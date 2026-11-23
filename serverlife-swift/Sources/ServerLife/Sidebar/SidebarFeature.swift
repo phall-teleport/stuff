@@ -26,6 +26,14 @@ enum SidebarFeature {
         // pane, folder browser). args: `menu` NSMenu, `groupKey`, `folderId`.
         a.register("host-menu") { ctx in
             guard let host = ctx.host, let menu = ctx.arg("menu", as: NSMenu.self) else { return }
+            // A kube row has its own menu (edit, remove, browse…).
+            if SBKube.isKubeHost(host) && !host.isRequestableRow && Actions.shared.isRegistered("kube-host-menu") {
+                Actions.shared.perform("kube-host-menu", window: ctx.window, host: host, args: [
+                    "menu": menu, "context": host.extra["context"]?.string ?? host.name,
+                    "groupKey": ctx.arg("groupKey", as: String.self) ?? "",
+                ])
+                return
+            }
             let folder = FolderModel.folder(id: ctx.arg("folderId", as: String.self))
             let built = CtxMenu.build(SBMenus.hostMenu(host, groupKey: ctx.arg("groupKey", as: String.self), folder: folder, window: ctx.window))
             for item in built.items {
@@ -45,7 +53,8 @@ enum SidebarFeature {
         // hostactions.js dialogs.
         a.register("run-command") { ctx in
             guard let host = ctx.host else { return }
-            SBHostActions.openRunCommand(host, login: ctx.arg("login") ?? HostPrefs.loginOptions(host).first, connId: ctx.connId,
+            SBHostActions.openRunCommand(host, login: ctx.arg("login") ?? HostPrefs.loginOptions(host).first,
+                                         logins: HostPrefs.loginOptions(host), connId: ctx.connId,
                                          command: ctx.arg("command"), title: ctx.arg("title"),
                                          autoRun: ctx.arg("autoRun", as: Bool.self) ?? true, window: ctx.window)
         }
@@ -82,6 +91,36 @@ enum SidebarFeature {
         a.register("request-access-for") { ctx in if let h = ctx.host { SBActions.requestAccessFor(h, window: ctx.window) } }
         // Stop watching everything (Settings' "Stop watching all").
         a.register("watch-forget-all") { _ in HostWatch.forgetAll() }
+        // teleportpanel.js after a deliberate logout: args `groupKey`, or `proxy` + `home`.
+        a.register("watch-note-logged-out") { ctx in
+            let key = ctx.arg("groupKey", as: String.self)
+                ?? FolderModel.groupKey(proxy: ctx.arg("proxy", as: String.self) ?? "", home: ctx.arg("home", as: String.self))
+            HostWatch.noteLoggedOut(key)
+        }
+        // ⚡ Add to Teleport: the install wizard for `host`, or for args
+        // `hostId` (+ `label`) from a pane header.
+        a.register("add-to-teleport") { ctx in
+            if let h = ctx.host { SBInstallTeleport.open(h, window: ctx.window); return }
+            guard let id = ctx.arg("hostId", as: String.self) else { return }
+            SBInstallTeleport.open(hostId: id, label: ctx.arg("label", as: String.self), window: ctx.window)
+        }
+        // state.teleportPresence for others (a pane header's ⚡): args `hostId`;
+        // `reply` gets the TeleportPresence known for it, or nil.
+        a.register("teleport-presence") { ctx in
+            guard let id = ctx.arg("hostId", as: String.self) else { return }
+            // A session's own (re-)check keeps the sidebar's tag in step.
+            if let j = ctx.arg("presence", as: JSON.self) {
+                SBPresence.shared.set(id, TeleportPresence(installed: j["installed"].truthy, running: j["running"].truthy,
+                                                           checkedAt: j["checkedAt"].double ?? nowMs()))
+            }
+            (ctx.arg("reply", as: ((Any?) -> Void).self))?(SBPresence.shared.known(id))
+        }
+        // The one-time "no Teleport agent" notice for a connection the session checked.
+        a.register("teleport-install-offer") { ctx in
+            guard let id = ctx.arg("hostId", as: String.self) else { return }
+            let host = SBInstallTeleport.hostForConnection(id, label: ctx.arg("label", as: String.self), window: ctx.window)
+            SBPresence.shared.offerInstallFor(host, again: ctx.arg("again", as: Bool.self) ?? false)
+        }
         // Only under --snapshot: step through the tabs and sub-tabs so each can be looked at.
         if CommandLine.arguments.contains("--snapshot") {
             a.register("sidebar-debug-next-tab") { ctx in

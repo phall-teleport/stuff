@@ -256,6 +256,8 @@ options:
   concurrency: 10
   timeoutSeconds: 120
   stopOnError: false
+  retries: 0
+  retryDelaySeconds: 10
 targets:
   - type: teleport
     name: node-1
@@ -290,6 +292,8 @@ options:
   concurrency: 5
   timeoutSeconds: 31
   stopOnError: true
+  retries: 0
+  retryDelaySeconds: 10
 selector:
   cluster: prod
   query: env=prod role:web

@@ -25,9 +25,10 @@ enum TeleportHomes {
     /// (teleport.js cleared `homeByProxy` at the start of every sweep).
     nonisolated(unsafe) private static var registered: Set<String> = []
 
-    /// `expandHome` (`TeleportSSH.expandHome`): `~` and `~/…` expanded,
-    /// anything else made absolute.
-    static func expand(_ p: String?) -> String { TeleportSSH.expandHome(p) }
+    /// `expandHome`: `$NAME` / `${NAME}` from the environment (an unset one
+    /// makes it ""), then `~` and `~/…` expanded, anything else made
+    /// absolute — see `TshEnv.expandHome`.
+    static func expand(_ p: String?) -> String { TshEnv.expandHome(p) }
 
     /// `setHomes`: replace the configured list (expanded, de-duplicated).
     /// An empty list means "just the default". Forgets the proxy → home map.
@@ -211,6 +212,11 @@ struct TeleportProfile: Codable, Hashable, Identifiable, Sendable {
     var homeDir: String
     /// `TeleportHomes.name(homeDir)`: "" for the default home.
     var homeName: String
+    /// What Kubernetes sees this login as, per the role — the identity the
+    /// kube browser's "My access" falls back to when the cluster itself will
+    /// not answer `kubectl auth whoami` through Teleport.
+    var kubeUsers: [String] = []
+    var kubeGroups: [String] = []
 
     init(proxy: String, cluster: String = "", username: String = "", logins: [String] = [], roles: [String] = [],
          activeRequests: [String] = [], allowedResources: [String] = [], validUntil: String? = nil,

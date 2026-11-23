@@ -11,6 +11,56 @@ import SwiftUI
 /// approved request re-issues the certificate with the extra roles.
 @MainActor
 enum TeleportPanel {
+    // MARK: - Version notes
+
+    /// `versionNote`: what to say about the client and cluster versions after
+    /// a login, if anything. tsh prints its warning to a terminal this login
+    /// does not have, so it is shown here instead of being lost behind
+    /// "Logged in".
+    static func versionNote(_ r: Teleport.LoginResult) -> (kind: String, text: String)? {
+        if let c = r.compat, c.level == "warn" || c.level == "error" {
+            return (c.level == "error" ? "error" : "info", c.message ?? "")
+        }
+        if let w = r.versionWarning, !w.text.isEmpty { return ("info", "tsh: " + w.text) }
+        return nil
+    }
+
+    /// `toastVersionNote`: a login's version note as a toast long enough to read.
+    @discardableResult
+    static func toastVersionNote(_ r: Teleport.LoginResult, prefix: String = "") -> (kind: String, text: String)? {
+        guard let n = versionNote(r) else { return nil }
+        TUIStatus.toast(prefix + n.text, n.kind, ms: 12000)
+        return n
+    }
+
+    // MARK: - Filter, expiry
+
+    /// `clusterMatchesFilter`: a live profile or a saved login against the
+    /// Hosts tab's shared filter, in its own query language. `addr` carries
+    /// the proxy a second time — the field plain-text search already reads.
+    static func clusterMatchesFilter(name: String, cluster: String, proxy: String, user: String, _ m: CompiledQuery) -> Bool {
+        var h = Host(type: Host.teleport, id: "", name: name.nilIfEmpty ?? cluster.nilIfEmpty ?? proxy)
+        h.cluster = cluster
+        h.proxy = proxy
+        h.addr = proxy
+        h.user = user
+        return m.match(h)
+    }
+
+    /// `expiringSoon`: under an hour of certificate left but not lapsed yet —
+    /// the window where logging in again is still one command.
+    static func expiringSoon(_ p: TeleportProfile, now: Double = nowMs()) -> Bool {
+        guard !p.expired, let v = p.validUntil, let t = TPText.parseDate(v) else { return false }
+        let mins = (t - now) / 60000
+        return mins >= 0 && mins < 60
+    }
+
+    /// The `home` a record made from a live profile carries: its tsh home
+    /// only when it is not the default (`p.homeDir && p.home ? p.homeDir : ''`).
+    static func recordHome(_ p: TeleportProfile) -> String {
+        !p.homeDir.isEmpty && !(p.home ?? "").isEmpty ? p.homeDir : ""
+    }
+
     // MARK: - Saved clusters
 
     /// `savedClusterFor`: the saved record behind a live profile — same
@@ -44,6 +94,8 @@ enum TeleportPanel {
         var id: String?
         var proxy = "", user = "", cluster = "", auth = "", home = "", ttl = "", mfaMode = ""
         var autoLogin = false
+        var showInHosts = false
+        var extraArgs: [String] = []
         var remember = true
 
         init(proxy: String = "", home: String = "", user: String = "", cluster: String = "") {
@@ -56,6 +108,7 @@ enum TeleportPanel {
             cluster = t["cluster"].stringish ?? ""; auth = t["authConnector"].stringish ?? ""
             home = t["home"].stringish ?? ""; ttl = t["ttl"].stringish ?? ""
             mfaMode = t["mfaMode"].stringish ?? ""; autoLogin = t["autoLogin"].truthy
+            showInHosts = t["showInHosts"].truthy
             remember = true
         }
     }
@@ -73,39 +126,154 @@ enum TeleportPanel {
             if m.remember { saveClusterLogin(m.record()) }
             // A named user means a prompt, and a prompt needs a terminal.
             if res.user != nil {
-                Inventory.shared.runLoginInTerminal(res, window: window)
+                await runLoginInShell(res, window: window)
                 return
             }
             TUIStatus.show("Running tsh login - check your browser if SSO is configured...", ms: 0)
-            let r = await Teleport.login(res)
+            let r = await Teleport.loginChecked(res)
             TUIStatus.clear()
             if !r.ok {
-                // The original read a field tsh's result never had, so the
-                // fixed sentence is what people saw; it still is.
-                TUIStatus.toast("Login failed. Check the proxy address, or run the command in a terminal.", "error")
+                TUIStatus.toast(versionNote(r)?.text ?? TUI.firstLine(r.result.err.nilIfEmpty ?? r.result.out)
+                                ?? "Login failed. Check the proxy address, or run the command in a terminal.", "error")
                 return
             }
             TUIStatus.toast("Logged in to " + (res.proxy ?? ""), "success")
+            toastVersionNote(r)
             await TUI.refreshInventory()
         }
     }
 
     // MARK: - Login, switch, logout
 
+    /// `runLoginInShell`: `tsh login` in a terminal tab instead of in the
+    /// background. A login that names a user is heading for a password, an
+    /// OTP or a hardware key, and a prompt in a spawned process with nowhere
+    /// to draw is a login that sits there and then fails.
+    ///
+    /// Returns once that command actually exits, not once the tab opens —
+    /// `true` for a clean exit — so a caller with something waiting on the
+    /// login can pick up where it left off, and "one at a time" is real.
+    @discardableResult
+    static func runLoginInShell(_ o: Teleport.LoginOptions, title: String? = nil, window: WindowModel? = nil) async -> Bool {
+        let label = o.cluster?.nilIfEmpty ?? o.proxy ?? ""
+        let cmd = Teleport.loginCommandArgs(o)
+        if !Actions.shared.isRegistered("open-command") {
+            TUIStatus.toast("No terminal is available to run tsh login in", "error")
+            return false
+        }
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            cmd.open(title: title ?? "tsh login \u{00b7} \(label)", window: window) { code in
+                Task { @MainActor in
+                    // Whatever it did, the inventory is the thing that knows.
+                    if code == 0 { Teleport.noteLoggedIn(proxy: o.proxy, home: o.home) }
+                    await TUI.refreshInventory()
+                    TUIStatus.show(code == 0 ? "Logged in to \(label)"
+                                   : "tsh login exited with \(code.map(String.init) ?? "?") — the tab has what it said", ms: 8000)
+                    cont.resume(returning: code == 0)
+                }
+            }
+            TUIStatus.show("Finish the login in this tab — it is asking as \(o.user ?? "")", ms: 9000)
+        }
+    }
+
     /// `doLogin`: an expired profile, logged in the way it is *saved* to be.
-    static func doLogin(_ p: TeleportProfile) async {
+    /// Returns whether it worked, which a caller with a session to retry
+    /// needs to know.
+    @discardableResult
+    static func doLogin(_ p: TeleportProfile, window: WindowModel? = nil) async -> Bool {
         let saved = savedClusterFor(p)
-        TUIStatus.show("Logging in to \(p.proxy)… (a browser window may open)", ms: 0)
-        defer { TUIStatus.clear() }
-        let r = await Teleport.login(Teleport.LoginOptions(
+        let o = Teleport.LoginOptions(
             proxy: p.proxy, cluster: p.cluster.nilIfEmpty ?? saved?["cluster"].stringish?.nilIfEmpty,
             // Only from the record: the profile's username passed as --user
             // sends tsh down the local-auth path instead of the connector's.
             user: saved?["user"].stringish?.nilIfEmpty, authConnector: saved?["authConnector"].stringish?.nilIfEmpty,
-            ttl: saved?["ttl"].stringish?.nilIfEmpty, mfaMode: saved?["mfaMode"].stringish?.nilIfEmpty, home: p.homeDir))
-        if !r.ok { TUIStatus.toast("tsh login failed — try running it in a terminal", "error"); return }
+            ttl: saved?["ttl"].stringish?.nilIfEmpty, mfaMode: saved?["mfaMode"].stringish?.nilIfEmpty,
+            extraArgs: saved?["extraArgs"].stringArray ?? [], home: p.homeDir)
+        /*
+         * A terminal wherever tsh asks for something that needs a real
+         * foreground process to answer — local auth (a password typed back)
+         * and passwordless (a Touch ID or security-key challenge, which a
+         * detached child is never in front for). Only a named external
+         * connector opens a browser and waits on a callback.
+         */
+        let auth = o.authConnector ?? ""
+        if o.user != nil && (auth.isEmpty || auth == "local" || auth == "passwordless") {
+            return await runLoginInShell(o, title: "tsh login \u{00b7} \(p.cluster.nilIfEmpty ?? p.proxy)", window: window)
+        }
+        TUIStatus.login("Logging in to \(p.proxy)… (a browser window may open)")
+        defer { TUIStatus.login("") }
+        let r = await Teleport.loginChecked(o)
+        if !r.ok {
+            TUIStatus.toast(versionNote(r)?.text ?? "tsh login failed — try running it in a terminal", "error")
+            return false
+        }
         TUIStatus.toast("Logged in", "success")
+        toastVersionNote(r)
         await TUI.refreshInventory()
+        return true
+    }
+
+    /// `doRelogin`: the ⏳ "expires soon" badge's own click — log out and
+    /// straight back in, one confirmation instead of Logout's dialog followed
+    /// by hunting for Login. Saves the cluster first if it is not already, so
+    /// `doLogin` logs back in the way this cluster actually authenticates.
+    static func doRelogin(_ p: TeleportProfile, window: WindowModel? = nil) async {
+        let whereName = TUI.name(p)
+        let ok = await MiscUI.confirm(
+            window, title: "Log back in to \(whereName)?",
+            message: "Its certificate expires in \(TUI.formatUntil(p.validUntil)).",
+            detail: "Logs out now and straight back in, the same way this cluster is logged into today — "
+                + "a fresh certificate before the old one lapses, rather than waiting for it to and having that "
+                + "interrupt whatever is running on it.",
+            confirmLabel: "Log out and back in")
+        guard ok else { return }
+        let alreadySaved = TUIData.listTshLogins().contains {
+            $0["proxy"].stringish == p.proxy && ($0["home"].stringish ?? "") == (p.home ?? "")
+        }
+        if !alreadySaved {
+            saveClusterLogin(["name": .string(whereName), "proxy": .string(p.proxy), "cluster": .string(p.cluster),
+                              "user": .string(p.username), "home": .string(p.home ?? "")])
+        }
+        TUIStatus.show("Logging out of \(whereName)…", ms: 0)
+        let r = await Teleport.logout(proxy: p.proxy, home: p.homeDir)
+        if !r.ok {
+            TUIStatus.toast(TUI.firstLine(r.output) ?? "tsh logout failed", "error")
+            TUIStatus.clear()
+            return
+        }
+        await doLogin(p, window: window)
+    }
+
+    // MARK: - Pin to the Hosts tab
+
+    /// `savedRecordsFor`: every saved record for a listed cluster.
+    static func savedRecordsFor(_ p: TeleportProfile) -> [JSON] {
+        let home = !p.homeDir.isEmpty && !(p.home ?? "").isEmpty ? p.homeDir : ""
+        func bare(_ v: String?) -> String {
+            Teleport.proxyAddress(v).lowercased().replacingOccurrences(of: ":443$", with: "", options: .regularExpression)
+        }
+        return TUIData.listTshLogins().filter { bare($0["proxy"].stringish) == bare(p.proxy) && ($0["home"].stringish ?? "") == home }
+    }
+
+    static func isPinned(_ p: TeleportProfile) -> Bool { savedRecordsFor(p).contains { $0["showInHosts"].truthy } }
+
+    /// `pinButton`'s click. The pin lives on the saved record, since that is
+    /// what outlives the profile, so pinning a cluster that was never saved
+    /// saves it, and unpinning keeps the record.
+    static func togglePin(_ p: TeleportProfile) {
+        let recs = savedRecordsFor(p)
+        if recs.contains(where: { $0["showInHosts"].truthy }) {
+            // Every record for the cluster, or another account's would keep it there.
+            for var s in recs where s["showInHosts"].truthy { s["showInHosts"] = false; saveClusterLogin(s) }
+        } else if var rec = recs.first(where: { ($0["user"].stringish ?? "") == p.username }) ?? recs.first {
+            rec["showInHosts"] = true
+            saveClusterLogin(rec)
+        } else {
+            saveClusterLogin(["name": .string(TUI.name(p)), "proxy": .string(p.proxy), "cluster": .string(p.cluster),
+                              "user": .string(p.username),
+                              "home": .string(!p.homeDir.isEmpty && !(p.home ?? "").isEmpty ? p.homeDir : ""),
+                              "showInHosts": true])
+        }
     }
 
     /// `switchCluster`: point a profile at another cluster in its trust web.
@@ -161,6 +329,7 @@ enum TeleportPanel {
         let r = await Teleport.logout(proxy: p.proxy, home: p.homeDir)
         if !r.ok { TUIStatus.toast(TUI.firstLine(r.output) ?? "tsh logout failed", "error"); return }
         TUIStatus.toast("Logged out of \(whereName)", "success")
+        // (Teleport.logout records the deliberate logout itself.)
         await TUI.refreshInventory()
     }
 
@@ -240,8 +409,11 @@ enum TeleportPanel {
         TUIStatus.show("Reading tsh status…", ms: 0)
         let info = await Teleport.statusText(proxy: p.proxy, home: p.homeDir)
         TUIStatus.clear()
-        TUIModal.show(window, title: "tsh status", width: 760, height: 560, autosave: "tshstatus") { handle in
-            StatusDialogView(p: p, info: info, handle: handle, window: window)
+        // The cluster's own version, from the same unauthenticated ping
+        // "Cluster info…" uses — read here too, without a second dialog.
+        let ping = try? await WebAPIPing.ping(proxy: p.proxy)
+        TUIModal.show(window, title: "tsh status and version", width: 760, height: 560, autosave: "tshstatus") { handle in
+            StatusDialogView(p: p, info: info, ping: ping?.ping, handle: handle, window: window)
         }
     }
 
@@ -369,12 +541,21 @@ final class LoginDialogModel: ObservableObject {
     @Published var user: String
     @Published var cluster: String
     @Published var auth: String
-    @Published var ttl = ""
+    @Published var ttl: String
     @Published var mfa: String
     @Published var home: String
-    @Published var extra = ""
-    @Published var remember: Bool { didSet { if !remember { autoLogin = false } } }
+    @Published var extra: String
+    @Published var remember: Bool { didSet { if !remember { autoLogin = false; showInHosts = false } } }
     @Published var autoLogin: Bool
+    /// Without it a logout takes the cluster off the Hosts tab with its profile.
+    @Published var showInHosts: Bool
+
+    /// "How to log in", as a list the proxy itself provides. Until the proxy
+    /// answers — and if it cannot be reached — the free-text connector box is
+    /// the way to say it ("__other").
+    @Published var method = "__other" { didSet { if method != "__other" && auth != method { auth = method } } }
+    @Published var methodOptions: [(value: String, label: String)] = [("__other", "Connector name\u{2026}")]
+    @Published var methodNote = ""
 
     /// Configured tsh homes; with none there is nothing to ask.
     let homes: [String] = Store.shared.setting("tshHomes", [String]())
@@ -382,7 +563,9 @@ final class LoginDialogModel: ObservableObject {
     init(_ p: TeleportPanel.LoginPrefill) {
         prefill = p
         proxy = p.proxy; user = p.user; cluster = p.cluster; auth = p.auth
-        mfa = p.mfaMode; remember = p.remember; autoLogin = p.autoLogin
+        mfa = p.mfaMode; remember = p.remember; autoLogin = p.remember && p.autoLogin
+        showInHosts = p.remember && p.showInHosts
+        ttl = p.ttl; extra = p.extraArgs.joined(separator: " ")
         home = LoginDialogModel.configuredHome(p.home, in: Store.shared.setting("tshHomes", [String]()))
     }
 
@@ -416,6 +599,7 @@ final class LoginDialogModel: ObservableObject {
             "cluster": .string(v.cluster ?? ""), "user": .string(v.user ?? ""),
             "authConnector": .string(v.authConnector ?? ""), "home": .string(v.home ?? ""),
             "ttl": .string(v.ttl ?? ""), "mfaMode": .string(v.mfaMode ?? ""), "autoLogin": .bool(autoLogin),
+            "showInHosts": .bool(showInHosts),
         ]
         if let id = prefill.id { r["id"] = .string(id) }
         return r
@@ -425,6 +609,42 @@ final class LoginDialogModel: ObservableObject {
     func tidyProxy() {
         let clean = Teleport.proxyAddress(proxy)
         if clean != proxy { proxy = clean }
+    }
+
+    /// `methodChoices`: the picker's entries for what the proxy said.
+    static func methodChoices(_ m: Teleport.LoginMethods) -> [(value: String, label: String)] {
+        let def = m.defaultConnector.nilIfEmpty ?? m.authType?.nilIfEmpty ?? "local"
+        var opts: [(value: String, label: String)] = [("", "The cluster's default (\(def))")]
+        for p in m.providers { opts.append((p.name, "\(p.display) — SSO (\(p.type))")) }
+        if m.local { opts.append(("local", "Username and password")) }
+        if m.passwordless { opts.append(("passwordless", "Passwordless (security key or Touch ID)")) }
+        opts.append(("headless", "Headless (approve from another device)"))
+        opts.append(("__other", "Other connector\u{2026}"))
+        return opts
+    }
+
+    private var methodsFor = ""
+
+    /// `fillMethods`: ask the proxy how it can be logged into.
+    func fillMethods() async {
+        let p = Teleport.proxyAddress(proxy)
+        if p.isEmpty || p == methodsFor { return }
+        methodsFor = p
+        methodNote = "Asking the proxy how it can be logged into…"
+        let m = await Teleport.loginMethods(proxy: p)
+        if Teleport.proxyAddress(proxy) != p { return }
+        if !m.ok {
+            methodNote = "Could not ask the proxy — type the connector name instead."
+            methodOptions = [("__other", "Connector name\u{2026}")]
+            method = "__other"
+            return
+        }
+        let opts = Self.methodChoices(m)
+        methodOptions = opts
+        let want = auth.trimmed
+        method = opts.contains { $0.value == want } ? want : (want.isEmpty ? "" : "__other")
+        let f = m.secondFactors.joined(separator: ", ")
+        methodNote = "Second factors this cluster allows: \(f.isEmpty ? "none listed" : f)."
     }
 }
 
@@ -448,11 +668,18 @@ private struct LoginDialogView: View {
                     TextField("teleport.example.com:443", text: $m.proxy)
                         .textFieldStyle(.roundedBorder).focused($proxyFocused)
                 }
+                TUIField(label: "How to log in", hint: "Read from the proxy") {
+                    Picker("", selection: $m.method) {
+                        ForEach(m.methodOptions, id: \.value) { Text($0.label).tag($0.value) }
+                    }.labelsHidden().frame(maxWidth: 420, alignment: .leading)
+                }
+                if !m.methodNote.isEmpty { MiscHint(text: m.methodNote, size: 11).padding(.bottom, 6) }
                 HStack(alignment: .top, spacing: 12) {
                     TUIField(label: "User (optional)") {
                         TextField("optional - defaults to your local user", text: $m.user).textFieldStyle(.roundedBorder)
                     }
-                    TUIField(label: "Auth connector (optional)") {
+                    if m.method == "__other" {
+                    TUIField(label: "Connector name") {
                         HStack(spacing: 4) {
                             TextField("optional - e.g. local, github, okta, saml", text: $m.auth).textFieldStyle(.roundedBorder)
                             Menu {
@@ -460,6 +687,7 @@ private struct LoginDialogView: View {
                             } label: { Image(systemName: "chevron.down") }
                                 .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 18)
                         }
+                    }
                     }
                 }
                 HStack(alignment: .top, spacing: 12) {
@@ -493,6 +721,8 @@ private struct LoginDialogView: View {
                 MiscCheck(label: "Keep this cluster for logging in again", isOn: $m.remember)
                 MiscCheck(label: "Log in automatically when the app starts", isOn: $m.autoLogin)
                     .disabled(!m.remember).opacity(m.remember ? 1 : 0.5)
+                MiscCheck(label: "Pin to the Hosts tab — keep it listed even when tsh status does not", isOn: $m.showInHosts)
+                    .disabled(!m.remember).opacity(m.remember ? 1 : 0.5)
                 Text("Command").font(.system(size: 11)).foregroundStyle(p.muted).padding(.top, 10).padding(.bottom, 4)
                 Text(m.command)
                     .font(.system(size: 11, design: .monospaced)).foregroundStyle(p.textDim)
@@ -522,8 +752,13 @@ private struct LoginDialogView: View {
             }.buttonStyle(.primary)
         }
         .frame(width: 620)
-        .onChange(of: proxyFocused) { _, focused in if !focused { m.tidyProxy() } }
-        .onAppear { after(0.05) { proxyFocused = true } }
+        .onChange(of: proxyFocused) { _, focused in
+            if !focused { m.tidyProxy(); Task { await m.fillMethods() } }
+        }
+        .onAppear {
+            after(0.05) { proxyFocused = true }
+            Task { await m.fillMethods() }
+        }
     }
 }
 
@@ -565,6 +800,7 @@ private struct LogoutView: View {
 private struct StatusDialogView: View {
     let p: TeleportProfile
     let info: Teleport.StatusText
+    let ping: JSON?
     let handle: ModalHandle
     let window: WindowModel?
 
@@ -573,12 +809,15 @@ private struct StatusDialogView: View {
             guard let v = p.validUntil, let ms = TPText.parseDate(v) else { return p.validUntil ?? "" }
             return TUI.localeString(ms: ms) + (p.expired ? "  (expired)" : "")
         }()
+        let version = ping?["server_version"].stringish?.nilIfEmpty
+        let versionText = version.map { v in "v\(v)" + (ping?["edition"].stringish?.nilIfEmpty.map { " (\($0))" } ?? "") }
+            ?? (ping != nil ? "unknown" : "unreachable")
         let rows: [(String, String)] = [
-            ("cluster", p.cluster), ("proxy", p.proxy), ("logged in as", p.username),
+            ("cluster", p.cluster), ("proxy", p.proxy), ("cluster version", versionText), ("logged in as", p.username),
             ("roles", p.roles.joined(separator: ", ")), ("logins", p.logins.joined(separator: ", ")),
             ("valid until", validUntil), ("tsh home", info.home), ("active", p.active ? "yes" : "no"),
         ].filter { !$0.1.isEmpty }
-        DialogScaffold(title: "tsh status", subtitle: TUI.name(p), scroll: false) {
+        DialogScaffold(title: "tsh status and version", subtitle: TUI.name(p), scroll: false) {
             VStack(alignment: .leading, spacing: 2) {
                 ForEach(rows, id: \.0) { TUIKeyValue(key: $0.0, value: $0.1) }
                 Text("as tsh prints it — \(info.home)").font(.system(size: 11, weight: .semibold))

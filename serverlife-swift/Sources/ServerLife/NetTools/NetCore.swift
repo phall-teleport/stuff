@@ -194,6 +194,9 @@ struct NetTool: Hashable {
     let label: String
     var remote = false
     var needs: [String] = []
+    /// Pasted, not typed into the target: a certificate is several lines,
+    /// and none of these is kept in the recent list — they are credentials.
+    var paste = false
 
     /// The original's TOOLS, in its order.
     static let all: [NetTool] = [
@@ -202,6 +205,7 @@ struct NetTool: Hashable {
         NetTool(id: "traceroute", label: "Traceroute", remote: true, needs: ["traceroute", "tracepath", "mtr"]),
         NetTool(id: "dns", label: "DNS"),
         NetTool(id: "ports", label: "Port check", remote: true),
+        NetTool(id: "sockets", label: "Listening & connections", remote: true, needs: ["ss", "netstat"]),
         NetTool(id: "telnet", label: "Telnet", remote: true),
         NetTool(id: "tls", label: "TLS certificate"),
         NetTool(id: "http", label: "HTTP"),
@@ -209,7 +213,22 @@ struct NetTool: Hashable {
         NetTool(id: "serial", label: "Serial console"),
         NetTool(id: "teleport", label: "Teleport cluster"),
         NetTool(id: "local", label: "This machine", remote: true),
+        NetTool(id: "cidr", label: "Subnet calculator (CIDR)"),
+        NetTool(id: "url", label: "URL encode / decode", paste: true),
+        // The three credentials a Teleport user meets, taken apart. Not
+        // network checks, but what gets pasted in while working out why a
+        // connection is refused, so they live where that work happens.
+        NetTool(id: "sshcert", label: "Decode: SSH certificate", paste: true),
+        NetTool(id: "jwt", label: "Decode: JWT", paste: true),
+        NetTool(id: "svid", label: "Decode: SPIFFE SVID", paste: true),
     ]
+
+    /// The decoders, by id, for the right-click menus that open them.
+    static let decodeTools: [(id: String, label: String)] = [
+        ("sshcert", "SSH certificate"), ("jwt", "JWT"), ("svid", "SPIFFE SVID (X.509)"),
+    ]
+
+    static func isPaste(_ id: String) -> Bool { find(id)?.paste ?? false }
 
     static func find(_ id: String) -> NetTool? { all.first { $0.id == id } }
     static func label(_ id: String) -> String { find(id)?.label ?? id }

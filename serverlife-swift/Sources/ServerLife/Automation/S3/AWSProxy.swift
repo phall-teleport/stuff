@@ -93,7 +93,10 @@ enum AWSProxy {
         }
         let st = State()
         // The app lives in whichever tsh home holds this proxy's profile.
-        let env = Tools.tshEnv(home: Tools.home(forProxy: proxy))
+        // …and with that cluster's own tsh variables (Settings → tsh environment).
+        let home = Tools.home(forProxy: proxy)
+        var env = Tools.tshEnv(home: home)
+        for (k, v) in TshEnv.vars(home: home, proxy: proxy) { env[k] = v }
 
         return try await withCheckedThrowingContinuation { (c: CheckedContinuation<Env, Error>) in
             st.cont = c

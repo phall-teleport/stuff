@@ -72,7 +72,7 @@ enum FolderModel {
     /// The key a host is filed under — the same key every per-host preference
     /// uses (`hostKey` / `hostPrefKey`): uuid, else `tsh:<cluster>:<name>`,
     /// else its id, else `ssh:<alias>`.
-    nonisolated static func hostKey(_ host: Host?) -> String { host?.prefKey ?? "" }
+    nonisolated static func hostKey(_ host: Host?) -> String { host?.sbPrefKey ?? "" }
 
     /// The key a group of hosts is known by (`groupKeyFor`): `tp:<proxy>`,
     /// plus `@<home>` for a profile from a non-default tsh home.

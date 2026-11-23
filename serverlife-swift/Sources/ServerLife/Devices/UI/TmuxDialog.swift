@@ -107,9 +107,8 @@ struct TmuxDialogView: View {
                                 .onSubmit(attach)
                         }
                     }
-                    MiscHint(text: "tmux \(model.probe?.version ?? "") on \(model.label). What runs in a tmux session keeps running when "
-                             + "this window goes away — a dropped connection, a closed laptop, a restarted app — "
-                             + "and reattaching brings back the scrollback with it.", size: 11.5)
+                    MiscHint(text: ConsolesText.tmuxDialogHint(version: model.probe?.version ?? "", label: model.label),
+                             size: 11.5)
                         .padding(.top, 10)
                 }
             }

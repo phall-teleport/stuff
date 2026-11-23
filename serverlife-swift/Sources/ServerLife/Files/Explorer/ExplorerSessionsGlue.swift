@@ -15,6 +15,12 @@ enum XPSessionsGlue {
                               onScreen: shown && p.tabId == s.activeTabId, cwd: p.cwd, hasTerm: p.hasTerm,
                               tmuxAttached: p.kind == .tmux && p.tmuxEnded == nil, window: s.window)
         }
+        // kube-ui leaves the browse spec on the pane it opens for a pod exec:
+        // `attachments["explorerKubeSpec"]` (or a KubeSpec as the kubeExec mark).
+        XPPanes.kubeSpec = { id in
+            guard let s = SessionsCore.owner(ofPane: id), let p = s.pane(id) else { return nil }
+            return XPKube.specFrom(p.attachments["explorerKubeSpec"]) ?? XPKube.specFrom(p.attachments["kubeExec"])
+        }
         XPPanes.activePaneId = { w in
             (w ?? WindowManager.shared.focused).map { $0.feature(SessionsWindow.self).activePaneId } ?? nil
         }

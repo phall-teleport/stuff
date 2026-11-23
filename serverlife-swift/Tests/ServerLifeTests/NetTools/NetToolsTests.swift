@@ -75,7 +75,7 @@ private func send(_ fd: Int32, _ s: String) { send(fd, Array(s.utf8)) }
     #expect(r.text == "SSH-2.0-OpenSSH_9.6")
     #expect(r.guess == "an SSH server")
     #expect(r.telnet == false)
-    #expect(r.command == "telnet 127.0.0.1 \(s.port)")
+    #expect(r.command == "nc -v 127.0.0.1 \(s.port)")
 }
 
 @Test func telnetNegotiationIsAnsweredSoTheDeviceShowsItsPrompt() async throws {

@@ -230,9 +230,6 @@ final class RFBClient: @unchecked Sendable {
         let w = try r.u16(), h = try r.u16()
         try r.skip(16)  // the server's pixel format: we set our own below
         let nameLen = Int(try r.u32())
-        if nameLen > RFBClient.maxNameLength {
-            throw Failure(message: "the server sent a desktop name of \(nameLen) bytes, which is not a VNC server behaving")
-        }
         let name = String(decoding: try r.bytes(nameLen), as: UTF8.self)
         framebuffer.resize(width: w, height: h)
 
@@ -277,9 +274,6 @@ final class RFBClient: @unchecked Sendable {
             case 3:
                 try r.skip(3)
                 let n = Int(try r.u32())
-                if n > RFBClient.maxClipboardLength {
-                    throw Failure(message: "the server sent \(n) bytes of clipboard text, more than this viewer accepts (\(RFBClient.maxClipboardLength / (1 << 20)) MB)")
-                }
                 let bytes = try r.bytes(n)
                 // ServerCutText is Latin-1.
                 post(.clipboard(String(bytes.map { Character(Unicode.Scalar($0)) })))
@@ -344,44 +338,15 @@ final class RFBClient: @unchecked Sendable {
 
     // MARK: - Client messages
 
-    /// Limits on lengths the server chooses, so a broken one cannot make the
-    /// app allocate gigabytes.
-    static let maxNameLength = 1 << 20
-    static let maxClipboardLength = 16 << 20
-
-    /// Client messages go out on one serial queue, in order, never on the
-    /// main thread: a server that stops reading must not freeze the app.
-    private let writeQueue = DispatchQueue(label: "vnc.write", qos: .userInitiated)
-    private var backlog = 0
-
-    /// Queue a message. `droppable` ones (pointer motion) are skipped while
-    /// more than 1 MB is already waiting; keys and clicks never are.
-    private func send(_ bytes: [UInt8], droppable: Bool = false) {
-        lock.lock()
-        let s = socket
-        let c = connected && !stopped
-        let busy = backlog > 1 << 20
-        if c && !(droppable && busy) { backlog += bytes.count }
-        lock.unlock()
-        guard c, let s, !(droppable && busy) else { return }
-        writeQueue.async { [weak self] in
-            try? s.write(bytes)
-            guard let self else { return }
-            self.lock.lock(); self.backlog -= bytes.count; self.lock.unlock()
-        }
+    private func send(_ bytes: [UInt8]) {
+        lock.lock(); let s = socket; let c = connected && !stopped; lock.unlock()
+        guard c, let s else { return }
+        try? s.write(bytes)
     }
-
-    /// Bytes queued and not yet written.
-    var pendingBytes: Int { lock.lock(); defer { lock.unlock() }; return backlog }
 
     func sendKey(_ keysym: UInt32, down: Bool) { send(RFBMessages.key(keysym, down: down)) }
 
-    private var lastMask: UInt8 = 0
-
-    func sendPointer(x: Int, y: Int, mask: UInt8) {
-        lock.lock(); let changed = mask != lastMask; lastMask = mask; lock.unlock()
-        send(RFBMessages.pointer(x: x, y: y, mask: mask), droppable: !changed)
-    }
+    func sendPointer(x: Int, y: Int, mask: UInt8) { send(RFBMessages.pointer(x: x, y: y, mask: mask)) }
 
     func sendClipboard(_ text: String) { send(RFBMessages.cutText(text)) }
 

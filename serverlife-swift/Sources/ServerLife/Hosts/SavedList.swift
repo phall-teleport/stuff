@@ -104,6 +104,7 @@ struct SavedProfileRow: View {
                 .fill(profile["color"].string.flatMap { $0.hasPrefix("#") ? Color(hex: $0) : HostColor.color($0) } ?? p.muted.opacity(0.5))
                 .frame(width: 7, height: 7)
             Text(profile["name"].stringish ?? "").font(.system(size: 12.5)).lineLimit(1)
+            if let icon = Profiles.icon(profile) { Text(icon).font(.system(size: 11)) }
             Spacer(minLength: 4)
             HTag(text: Profiles.kindLabel(profile))
         }
@@ -122,32 +123,86 @@ struct SavedProfileRow: View {
     }
 }
 
-/// The row's right-click menu: Open session · Edit… · Duplicate · Delete.
+/// sidebar.js `profileContextMenuItems(p)`: Open session (· Open with a
+/// terminal for sftp) · split right/down · Mark this profile · Edit… ·
+/// Duplicate · Delete. The Hosts pane's "Saved" group shows the same menu.
 struct SavedProfileMenu: View {
     let profile: JSON
     let window: WindowModel?
+
     var body: some View {
-        Button("Open session") {
-            let w = window, prof = profile
-            Task { @MainActor in await Profiles.launch(prof, window: w) }
+        let p = profile
+        let w = window
+        // Serial, telnet, VNC and RDP each open in their own always-new tab,
+        // so there is nothing honest to offer for them here; ssh, Teleport
+        // and sftp go through open-host, which can split.
+        let canSplit = (w?.feature(SessionsWindow.self).activePane != nil)
+            && !["serial", "telnet", "vnc", "rdp"].contains(p["type"].string ?? "")
+        Button("Open session") { Task { @MainActor in await Profiles.launch(p, window: w) } }
+        if p["type"].string == "sftp" {
+            Button("Open with a terminal") { Task { @MainActor in await Profiles.launch(p, window: w, forceTerminal: true) } }
+        }
+        if canSplit {
+            Button("Ⅾ  Open beside current (split right)") {
+                Task { @MainActor in await Profiles.launch(p, window: w, split: "right") }
+            }
+            Button("‗  Open below current (split down)") {
+                Task { @MainActor in await Profiles.launch(p, window: w, split: "down") }
+            }
         }
         Divider()
-        Button("Edit…") { Profiles.openEditor(window, initial: profile) }
+        Menu("\(Profiles.icon(p) ?? "◉")  Mark this profile") {
+            Button(p["icon"].truthy ? "Icon: \(p["icon"].stringish ?? "")" : "Give it an icon…") {
+                Task { @MainActor in await Profiles.setIcon(p, window: w) }
+            }
+            Divider()
+            Section("Colour") {
+                ForEach(HostColor.all) { c in
+                    let on = (p["color"].string ?? "") == c.value
+                    Button((on ? "✓ " : "") + c.label) { Profiles.setColor(p, c.value) }
+                }
+            }
+        }
+        .help("Give it an icon or a colour, same as a plain host")
+        Divider()
+        Button("Edit…") { Profiles.openEditor(w, initial: p) }
         Button("Duplicate") {
-            var copy = profile
+            var copy = p
             copy.removeKey("id")
-            copy["name"] = .string((profile["name"].stringish ?? "") + " copy")
+            copy["name"] = .string((p["name"].stringish ?? "") + " copy")
             HostsData.upsertProfile(copy)
         }
         Divider()
         Button("Delete") {
-            let w = window, prof = profile
             Task { @MainActor in
-                if await MiscUI.confirm(w, title: "Delete profile", message: "Delete “\(prof["name"].stringish ?? "")”?",
+                if await MiscUI.confirm(w, title: "Delete profile", message: "Delete “\(p["name"].stringish ?? "")”?",
                                         confirmLabel: "Delete", danger: true) {
-                    if let id = prof["id"].string { HostsData.deleteProfile(id) }
+                    if let id = p["id"].string { HostsData.deleteProfile(id) }
                 }
             }
         }
+    }
+}
+
+extension Profiles {
+    /// sidebar.js `profileIcon`.
+    static func icon(_ p: JSON) -> String? { p["icon"].string?.nilIfEmpty }
+
+    /// sidebar.js `setProfileColor`.
+    static func setColor(_ p: JSON, _ value: String) {
+        guard let id = p["id"].string else { return }
+        HostsData.upsertProfile(["id": .string(id), "color": value.isEmpty ? .null : .string(value)])
+        let name = p["name"].stringish ?? ""
+        StatusBus.shared.show(value.isEmpty ? "Colour cleared for \(name)" : "\(name) is \(value)")
+    }
+
+    /// sidebar.js `setProfileIcon`.
+    static func setIcon(_ p: JSON, window: WindowModel?) async {
+        guard let id = p["id"].string else { return }
+        let name = p["name"].stringish ?? ""
+        guard let icon = await MiscUI.pickIcon(window, title: "Icon for this profile", subtitle: name,
+                                               value: p["icon"].string ?? "") else { return }
+        HostsData.upsertProfile(["id": .string(id), "icon": icon.isEmpty ? .null : .string(icon)])
+        StatusBus.shared.show(icon.isEmpty ? "Icon cleared" : "\(name) is \(icon)")
     }
 }

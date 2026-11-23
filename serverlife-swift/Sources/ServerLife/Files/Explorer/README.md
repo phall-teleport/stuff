@@ -17,6 +17,8 @@ here. Built on Files/Service (`FileSource`, `FilesService`, `SyncPlanner`,
 | `ExplorerDialogs.swift` | Go to path, Permissions and owner (live command preview), Get info (+ recursive size, "What do these permissions mean?"), inline editor, Which list?, Copy to another server |
 | `ExplorerSearch.swift`, `ExplorerSyncDialog.swift`, `RsyncDialog.swift` | Search, Synchronize, rsync |
 | `ExplorerS3.swift` | buckets as sources, `explorer-show-source`, bucket menus/transfers/info through automation's `S3UI` |
+| `ExplorerKube.swift` | a pod's filesystem as a source (`XPKube`, `KubeFileSource` over `KubeFS`), `explorer-kube-source`, kubectl cp downloads/uploads (no queue) |
+| `ExplorerDisk.swift` | free-space footer (`XP.parseDf`, `diskBadge`, local statfs / remote `df -Pk`, 30 s cache), `explainConnectError`, `isMfaHost`, `Store.xpQuietRemote` / `xpMfaHosts` |
 | `ExplorerView.swift` | the pane: header, path bar, starred list, filter bar, sortable columns, tree list, notices (MFA gate, Reconnect files), status line, drag & drop |
 | `FilesController.swift` | `XPPaneExplorers` (each pane's explorer + local companion), `ExplorerPaneView`, `XPFiles` (files.js: tick, follow, catch-up, toggles) |
 | `ExplorerSessionsGlue.swift` | the only file that touches Sessions types |
@@ -34,6 +36,7 @@ here. Built on Files/Service (`FileSource`, `FilesService`, `SyncPlanner`,
 | `files-button-menu` | fills the title-bar file-browser button's right-click menu (this pane / all in this tab / every pane) | `menu` NSMenu |
 | `files-local-path` | setLocalPath (a profile's local start path) | `path` |
 | `explorer-show-source` | point the focused pane's explorer at a source, opening a local shell first if none | `source` ("s3:<id>", "local", "conn:<id>", "pane") |
+| `explorer-kube-source` | point a pane's explorer at a pod | `paneId` (or ctx.paneId), `spec` (KubeSpec or its JSON) |
 | `debug-explorer-panel`, `debug-explorer-dialog` | `--snapshot` aids: an explorer in a panel; env `XP_DIALOG` = goto/search/info/edit/rsync, or `max` (focused pane's explorer fills the window) | — |
 
 Performs: `city-open` (args `explorer`: the `ExplorerModel`), `new-local`, `send-text` fallback.
@@ -63,6 +66,10 @@ Performs: `city-open` (args `explorer`: the `ExplorerModel`), `new-local`, `send
   `fileSource(value)`); call `ExplorerSources.changed()` when they change. S3 is registered from here.
 - **Sessions**: uses `PaneAccessories.provider`, `SessionHooks.cwdChanged` (follow) and `paneClosing`.
   Explorer visibility changes go through `setExplorerVisible`.
+- **Kube (kube-ui)**: a pod exec pane's explorer starts on the pod when the pane carries
+  `attachments["explorerKubeSpec"] = KubeSpec` (the browse spec: namespace, podName, containerName —
+  kubepanel.js `explorerSource`), or a `KubeSpec` as `attachments["kubeExec"]`. Or perform
+  `explorer-kube-source` after opening the pane.
 - `MiscHooks.settingsSaved`: refresh interval, starred defaults, 3D setting, sort.
 
 ## Behaviour kept
@@ -80,6 +87,13 @@ on tsh sessions; follow the terminal's directory (moves, not position); compare 
 narrow-pane column/button shedding at the stylesheet's widths.
 
 ## Not done / differs
+
+- `connectWithRelogin`: the retry on a ` [mfa]` failure for teleport hosts not in `mfaHosts`
+  (1.2/2/3/4 s) is ported in `ExplorerModel.connectWithRelogin`; the `ensureLoggedIn` half is not
+  (no public Swift equivalent; the connection layer's own relogin applies).
+- Kube transfers bypass the transfer queue (as upstream): no pause/resume/speed cap.
+- Pod sources reuse `FileSourceKind.sftp` (no kube case in Files/Service).
+- The remote cwd probe honouring quietRemote (`trackPaneCwds`) is Sessions'.
 
 - Sessions probes the cwd on every typed `cd`; the original only did when follow was on and the explorer
   was on screen (audit #6, sessions-owned).

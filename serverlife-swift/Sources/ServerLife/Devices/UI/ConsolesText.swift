@@ -26,6 +26,74 @@ enum ConsolesText {
         "\(s.name) — \(plural(s.windows, "window"))\(s.attached ? ", attached elsewhere" : "")"
     }
 
+    /// The line under the tmux dialog's fields: what tmux is, that it has to
+    /// be on the host already (it is), and why it is worth it.
+    static func tmuxDialogHint(version: String, label: String) -> String {
+        "tmux is a terminal multiplexer: a program that has to be installed and running "
+            + "on \(label) itself, not something ServerLife brings with it, that holds a "
+            + "shell session open independently of whatever connects to it. tmux "
+            + "\(version) is already there, so this is covered. What runs inside it "
+            + "keeps running when this window goes away — a dropped connection, a closed "
+            + "laptop, a restarted app — and reattaching brings back the scrollback with it."
+    }
+
+    /// The question before closing a session's last pane by hand (`killTmuxPane`).
+    static func lastPaneMessage(session: String) -> String {
+        "It is the last pane in tmux session “\(session.isEmpty ? "tmux" : session)”, so closing it ends the session on the server."
+    }
+
+    /*
+     * What a saved layout needs to attach a tmux pane's session again
+     * (`tmuxRestoreOf`): the host, the login and the session's name. A tmux
+     * pane carries its connection, so it was being saved as a plain shell on
+     * the host, and a restart brought back a fresh shell instead of the
+     * session still running there.
+     */
+    static func tmuxRestore(host: Host, local: Bool, login: String?, session: String) -> JSON {
+        var o: [String: JSON] = [
+            "kind": "tmux",
+            "hostId": local ? .null : .string(host.id),
+            "local": .bool(local),
+            "label": (host.name.nilIfEmpty ?? host.alias?.nilIfEmpty).map { .string($0) } ?? .null,
+            "login": login?.nilIfEmpty.map { .string($0) } ?? .null,
+            "session": .string(session),
+        ]
+        // A beam is dialled through the tsh home it was opened with.
+        if host.isBeam { o["home"] = host.home.map { .string($0) } ?? .null }
+        return .object(o)
+    }
+
+    /// One attach per session when a layout is restored: attaching brings back
+    /// every one of its windows, so its other tabs and panes are already there.
+    static func tmuxRestoreKey(_ j: JSON) -> String {
+        "\(j["local"].bool == true ? "local" : (j["hostId"].string ?? ""))|\(j["login"].string ?? "")|\(j["session"].string ?? "")"
+    }
+
+    /// How a saved tmux entry reads in the layout list (workspace.js).
+    static func tmuxRestoreSummary(_ j: JSON) -> String {
+        let label = j["label"].string?.nilIfEmpty
+        let on = j["local"].bool == true ? "this machine"
+            : (j["login"].string?.nilIfEmpty.map { "\($0)@\(label ?? "host")" } ?? (label ?? "host"))
+        return "tmux “\(j["session"].string ?? "")” on \(on)"
+    }
+
+    /*
+     * A beam is in no list this early after a restart — beams are listed per
+     * cluster, and not read yet — so every beam pane was skipped. Its id says
+     * everything needed to dial it again: `beam:<proxy>:<name>`, the proxy
+     * carrying its port (workspace.js `resolveHost`).
+     */
+    static func beamHost(id: String, home: String?) -> Host? {
+        guard id.hasPrefix("beam:"), let colon = id.lastIndex(of: ":") else { return nil }
+        let proxy = String(id[id.index(id.startIndex, offsetBy: 5)..<colon])
+        let name = String(id[id.index(after: colon)...])
+        guard !proxy.isEmpty, !name.isEmpty else { return nil }
+        var h = Host(type: Host.beam, id: id, name: name)
+        h.proxy = proxy
+        h.home = home
+        return h
+    }
+
     /// What a session name may not be (tmux addresses windows and panes with
     /// `:` and `.`, so a name holding one is ambiguous).
     static func validateSessionName(_ v: String) -> String? {

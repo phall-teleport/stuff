@@ -37,10 +37,12 @@ import Testing
 
     @Test func theBuiltInsAreHostCommandsExceptTheOnesThatSayOtherwise() {
         let b = Macros.builtins
-        #expect(b.count == 20)
+        #expect(b.count == 59)
         #expect(b.allSatisfy { $0.builtin })
         #expect(Set(b.filter { $0.whereScope == "all" }.map(\.id)) == ["b:disk", "b:net", "b:os"])
-        #expect(Set(b.filter { $0.whereScope == "local" }.map(\.id)) == ["b:tsh-ls", "b:tsh-ssh", "b:tsh-scp"])
+        #expect(Set(b.filter { $0.whereScope == "local" }.map(\.id)) == ["b:tsh-ls", "b:tsh-ssh", "b:tsh-scp", "b:tsh-headless-ssh", "b:tsh-headless-kube"])
+        #expect(b.filter { $0.whereScope == "kube" }.count == 8)
+        #expect(b.filter { $0.whereScope == "beams" }.count == 25)
         #expect(b.first { $0.id == "b:tp-restart" }?.confirm == true)
         #expect(b.first { $0.id == "b:tp-journal" }?.interactive == true)
     }
@@ -116,7 +118,7 @@ import Testing
         FleetStore.setMacroCategoryOrder([])
         let cats = Macros.shared.categories(Macros.builtins + [Macro(id: "x", category: "Custom", name: "x", description: "", command: "x"),
                                                                 Macro(id: "y", category: "Alpha", name: "y", description: "", command: "y")])
-        #expect(cats.map(\.0) == ["Teleport", "Alpha", "System", "Custom"])
+        #expect(cats.map(\.0) == ["Teleport", "Alpha", "Beams", "Kubernetes", "System", "Custom"])
         FleetStore.setMacroCategoryOrder(["System", "System", ""])
         #expect(FleetStore.macroCategoryOrder() == ["System"])
     }

@@ -51,6 +51,34 @@ enum HostsHooks {
 
     static var showWatchMark: Bool { Store.shared.settingJSON("showWatchMark") != .bool(false) }
 
+    // MARK: All / SSH / K8s (sidebar.js hostKindFilter, shared with every hosts pane)
+
+    /// sidebar.js `hostKindShown()`: "all", "ssh" or "kube" — always "ssh"
+    /// while KubeLife is off. The default keeps the filter in `HostKindState`;
+    /// the sidebar can adopt that state or replace both hooks.
+    static var hostKindShown: () -> String = {
+        Store.shared.settingJSON("kubeEnabled") == .bool(false) ? "ssh" : HostKindState.shared.kind
+    }
+    /// sidebar.js `setHostKind(kind)`.
+    static var setHostKind: (String) -> Void = { k in
+        HostKindState.shared.kind = ["all", "ssh", "kube"].contains(k) ? k : "all"
+    }
+
+    // MARK: Kubernetes clusters, host-shaped (kubepanel.js — kube-ui replaces these)
+
+    /// kubepanel.js `kubeHostsForProfile(p)`: a Teleport cluster's kube
+    /// clusters as host-shaped rows (`kind: "kube"`, `requestable`,
+    /// `availableCluster`, `kubeContext` in `extra`).
+    static var kubeHostsForProfile: (TeleportProfile) -> [Host] = { _ in [] }
+    /// kubepanel.js `kubeMarks(host)`: the ☸, the cloud badge, an "mfa" tag.
+    static var kubeMarks: (Host) -> AnyView = { _ in
+        AnyView(Text("\u{2638}").font(.system(size: 11)).foregroundStyle(Theme.shared.p.muted))
+    }
+    /// kubepanel.js `kubeBeatFor(host)`: the heartbeat tag, or nil.
+    static var kubeBeat: (Host) -> AnyView? = { _ in nil }
+    /// kubepanel.js `kubeBeatTimeFor(host)`: for sorting by heartbeat.
+    static var kubeBeatTime: (Host) -> (at: Double?, quiet: Bool) = { _ in (nil, false) }
+
     /// clustermarks.js `clusterIcon(groupKey)`.
     static func clusterIcon(_ groupKey: String) -> String {
         Store.shared.settingJSON("clusterIcons")[groupKey].string ?? ""
@@ -59,6 +87,18 @@ enum HostsHooks {
     /// sidebar.js `hostIcon(host)`.
     static func hostIcon(_ host: Host) -> String {
         Store.shared.settingJSON("hostIcons")[host.prefKey].string ?? ""
+    }
+
+    /// hostspane.js `inPaneKind(h, kind)`.
+    static func isKube(_ h: Host) -> Bool {
+        let kind = h.extra["kind"]?.string ?? ""
+        return kind == "kube" || kind == "kube_cluster" || h.id.hasPrefix("kube:")
+            || (h.extra["resourceId"]?.string ?? "").contains("/kube_cluster/")
+    }
+
+    static func inKind(_ h: Host, _ kind: String) -> Bool {
+        if kind == "all" { return true }
+        return kind == "kube" ? isKube(h) : !isKube(h)
     }
 
     // MARK: Defaults
@@ -186,5 +226,45 @@ enum HostsHooks {
             ? CtxMenu.build([CtxItem("Open session") { HostsOpen.openFromList(host, window: window) }])
             : menu
         shown.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+}
+
+/// The All / SSH / K8s filter (sidebar.js `hostKindFilter`): not a setting —
+/// it starts at All each run, as the original's module variable does.
+@MainActor @Observable
+final class HostKindState {
+    static let shared = HostKindState()
+    var kind = "all"
+}
+
+extension HostsHooks {
+    /// sidebar.js `requestAccessForMany(hosts)`: only the requestable hosts,
+    /// one request per cluster they resolve to, each with every node from
+    /// that cluster prefilled.
+    static func requestAccessForMany(_ hosts: [Host], window: WindowModel?) {
+        let requestable = hosts.filter { $0.extra["requestable"]?.truthy == true }
+        if requestable.isEmpty { return HToast.error("None of the selected hosts are requestable") }
+        let ps = Inventory.shared.profiles
+        var order: [String] = []
+        var groups: [String: (profile: TeleportProfile, cluster: String, ids: [String])] = [:]
+        var unmatched = 0
+        for host in requestable {
+            guard let p = ps.first(where: { $0.proxy == (host.proxy ?? "") && $0.homeDir == (host.home ?? TeleportHomes.defaultHome) })
+                ?? ps.first(where: { $0.cluster == (host.cluster ?? "") })
+            else { unmatched += 1; continue }
+            let cluster = host.cluster?.nilIfEmpty ?? p.cluster
+            if groups[p.key] == nil { order.append(p.key); groups[p.key] = (p, cluster, []) }
+            groups[p.key]!.ids.append("/\(cluster)/node/\(host.uuid ?? "")")
+        }
+        if groups.isEmpty { return HToast.error("Log in to that cluster first") }
+        for k in order {
+            guard let g = groups[k] else { continue }
+            Actions.shared.perform("access-request-new", window: window, args: [
+                "cluster": g.cluster, "proxy": g.profile.proxy, "home": g.profile.homeDir, "resourceIds": g.ids,
+            ])
+        }
+        if unmatched > 0 {
+            HToast.error("\(unmatched) host\(unmatched == 1 ? "" : "s") skipped — log in to \(unmatched == 1 ? "its" : "their") cluster first")
+        }
     }
 }

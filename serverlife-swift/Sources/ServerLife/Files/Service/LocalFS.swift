@@ -411,4 +411,17 @@ enum LocalFS {
     static func writeText(_ p: String, _ text: String) throws {
         do { try Data(text.utf8).write(to: URL(fileURLWithPath: p)) } catch { throw nodeError(error, "open", p) }
     }
+
+    // MARK: - Free space
+
+    /// Free and total space on the volume holding `p`, in bytes — what the
+    /// file browser's footer shows beside the item count (`local:diskSpace`).
+    /// `f_bavail`, not `f_bfree`: the blocks reserved for root are not space
+    /// this account can write into.
+    static func diskSpace(_ p: String) async throws -> DiskSpace {
+        var st = statfs()
+        if statfs(p, &st) != 0 { throw nodeError("statfs", p) }
+        let bsize = Int64(st.f_bsize)
+        return DiskSpace(total: Int64(st.f_blocks) * bsize, free: Int64(st.f_bavail) * bsize)
+    }
 }

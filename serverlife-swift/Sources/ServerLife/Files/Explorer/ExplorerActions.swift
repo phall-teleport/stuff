@@ -106,6 +106,7 @@ extension ExplorerModel {
     }
 
     func download(_ entries: [FileEntry], to localDir: String? = nil) async {
+        if isKube { await XPKube.download(self, entries, localDir); return }
         await XPTransfer.downloadTo(connId, entries, localDir, window: window)
     }
 
@@ -116,7 +117,7 @@ extension ExplorerModel {
     func otherPane(needLocal: Bool = false) async -> ExplorerModel? {
         let companion = paneId.flatMap { XPPaneExplorers.shared.companion(of: $0) }.flatMap { $0 === self ? nil : $0 }
         let candidates = Explorers.shared.inWindow(window).filter { e in
-            e !== self && (!needLocal || e.isLocal) && !e.isS3
+            e !== self && (!needLocal || e.isLocal) && !e.isS3 && !e.isKube
         }
         if let companion, !needLocal || companion.isLocal { return companion }
         if candidates.count == 1 { return candidates[0] }
@@ -158,7 +159,7 @@ extension ExplorerModel {
 
     /// Synchronise this directory with the other pane's, after showing the work.
     func syncWith() async {
-        if isS3 { xpToast("Sync works between a server and this machine", "error"); return }
+        if isS3 || isKube { xpToast("Sync works between a server and this machine", "error"); return }
         guard let other = await otherPane() else { return }
         let localSide = isLocal ? self : (other.isLocal ? other : nil)
         let remoteSide = isRemote ? self : (other.isRemote ? other : nil)
@@ -247,6 +248,7 @@ extension ExplorerModel {
         guard !paths.isEmpty else { return }
         if isRemote { await XPTransfer.uploadTo(connId, paths, destDir, window: window) }
         else if isS3 { await XPS3.dropFiles(self, paths, destDir) }
+        else if isKube { await XPKube.upload(self, paths, destDir) }
         else { xpToast("Those files are already on this machine", "info") }
     }
 
@@ -254,6 +256,15 @@ extension ExplorerModel {
     func dropEntries(_ entries: [FileEntry], from srcId: String, destDir: String) async {
         if srcId == id { await moveInto(entries, destDir); return }
         guard let src = Explorers.shared.get(srcId) else { return }
+        // A pod has no scp/rsync-like primitive to relay through, the way
+        // crossCopy does for two remote sessions — kube-to-kube is out of
+        // scope for the same reason. Local-to-kube and kube-to-local are not:
+        // that is exactly what kubectl cp is for.
+        if src.isKube && isKube {
+            xpToast("Copying straight between two pods isn’t supported yet — download, then upload", "error"); return
+        }
+        if src.isLocal && isKube { await XPKube.upload(self, entries.map(\.path), destDir); return }
+        if src.isKube && isLocal { await XPKube.download(src, entries, destDir); return }
         // A bucket at either end is routed separately: S3 is not a filesystem.
         if src.isS3 || isS3 { await XPS3.transfer(src, self, entries, destDir); return }
         if src.isLocal && isRemote {

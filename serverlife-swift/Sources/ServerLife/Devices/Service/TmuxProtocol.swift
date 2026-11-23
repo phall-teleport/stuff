@@ -355,13 +355,7 @@ final class TmuxParser {
             let (id, n) = headTail(rest)
             events.append(.session(id: id, name: n))
         case "session-renamed":
-            // `%session-renamed $0 newname` (current tmux); older ones sent the name alone.
-            let r = rest.trimmed
-            if r.hasPrefix("$"), let sp = r.firstIndex(of: " ") {
-                events.append(.sessionRenamed(String(r[r.index(after: sp)...])))
-            } else {
-                events.append(.sessionRenamed(r))
-            }
+            events.append(.sessionRenamed(rest.trimmed))
         case "sessions-changed":
             events.append(.sessionsChanged)
         case "pause":

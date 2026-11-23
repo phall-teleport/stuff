@@ -108,7 +108,10 @@ extension Store {
         rec["name"] = dOr(p["name"], dOr(p["alias"], dOr(p["node"], "Untitled")))
         rec["folderId"] = orNull("folderId")
         rec["type"] = dOr(p["type"], "ssh")
-        for k in ["alias", "hostname", "user", "port", "identityFile", "proxyJump", "direct",
+        // sshExtraOptions: `-o Name=value` lines, layered on the host's own
+        // options when it opens. kube: a Kubernetes profile —
+        // { spec: {contextName, kubeconfigPaths, teleport…}, namespace, view }.
+        for k in ["alias", "hostname", "user", "port", "identityFile", "proxyJump", "sshExtraOptions", "kube", "direct",
                   "proxy", "cluster", "home", "node", "login",
                   "path", "baudRate", "dataBits", "parity", "stopBits"] { rec[k] = orNull(k) }
         rec["rtscts"] = .bool(p["rtscts"].truthy)
@@ -130,6 +133,10 @@ extension Store {
         rec["drives"] = .bool(p["drives"].truthy)
         rec["gateway"] = orNull("gateway")
         rec["color"] = orNull("color")
+        // Same meaning as a real host's — set from the profile's own "Mark
+        // this profile" menu, not the per-host settings map a plain host
+        // uses, since a profile is already its own record.
+        rec["icon"] = orNull("icon")
         rec["tags"] = dOr(p["tags"], .array([]))
         rec["startupCommand"] = dOr(p["startupCommand"], "")
         rec["remoteStartPath"] = dOr(p["remoteStartPath"], "")
@@ -382,10 +389,11 @@ extension Store {
 
     // MARK: - Macros
 
-    /// `{ macros, hidden, categoryOrder, pins }`.
+    /// `{ macros, hidden, categoryOrder, order, pins }`.
     func listMacros() -> JSON {
         ["macros": .array(recs("macros")), "hidden": .array(recs("hiddenMacros")),
-         "categoryOrder": .array(recs("macroCategoryOrder")), "pins": .array(recs("macroPins"))]
+         "categoryOrder": .array(recs("macroCategoryOrder")), "order": .array(recs("macroOrder")),
+         "pins": .array(recs("macroPins"))]
     }
 
     /// Pin a macro as a session-header button, or unpin it. A new pin is
@@ -395,7 +403,7 @@ extension Store {
     func setMacroPin(_ id: String, pinned: Bool = true, icon: String = "", where scopeIn: String? = nil) -> [JSON] {
         var pins = recs("macroPins")
         guard !id.isEmpty else { return pins }
-        let scope = ["all", "hosts", "local"].contains(scopeIn ?? "") ? scopeIn : nil
+        let scope = ["all", "hosts", "beams", "local"].contains(scopeIn ?? "") ? scopeIn : nil
         let at = pins.firstIndex { $0["id"].string == id }
         let iconCut = dSlice(icon, 8)
         if !pinned {
@@ -418,6 +426,17 @@ extension Store {
         return out
     }
 
+    /// Macro ids in the order they were dragged into, built-ins included (the
+    /// `macros:arrange` handler). A macro not named here keeps its place
+    /// behind the ones that are. Empty ids and repeats are dropped.
+    @discardableResult
+    func setMacroOrder(_ ids: [String]) -> [String] {
+        var out: [String] = []
+        for id in ids where !id.isEmpty && !out.contains(id) { out.append(id) }
+        setRecs("macroOrder", out.map { .string($0) })
+        return out
+    }
+
     @discardableResult
     func upsertMacro(_ m: JSON) -> JSON {
         let now = nowMs()
@@ -433,7 +452,8 @@ extension Store {
             "confirm": .bool(m["confirm"].truthy),
             "interactive": .bool(m["interactive"].truthy),
             "noEnter": .bool(m["noEnter"].truthy),
-            "where": .string(["all", "hosts", "local"].contains(whereV) ? whereV : "all"),
+            // Where it can run: 'hosts', 'beams', 'local' or 'all'.
+            "where": .string(["all", "hosts", "beams", "local"].contains(whereV) ? whereV : "all"),
             "variables": m["variables"].array.map { .array($0) } ?? .array([]),
             "variableSpec": dOr(m["variableSpec"], ""),
             "repeatSeconds": .number(max(0, (dNum(m["repeatSeconds"]) + 0.5).rounded(.down))),
@@ -619,15 +639,15 @@ extension Store {
 
     func deleteNetRequest(_ id: String) { remove("netRequests", id) }
 
-    /// Remember a run of any tool. Newest first, at most 25.
-    ///
-    /// store.js builds a three-part key (tool, target, host) but compares it
-    /// with a two-part one (tool, target), so in practice nothing is ever
-    /// replaced and "Recent" is every run — which is what GUIDE.md says it
-    /// is. Ported as written so both apps keep the same list.
+    /// Remember a run of any tool. Newest first, at most 25. The same tool on
+    /// the same target from the same host replaces the earlier run (key:
+    /// tool, target, host id or label).
     @discardableResult
     func addNetRun(_ rec: JSON) -> JSON {
-        let key = "\(dStr(rec["tool"]))\u{0}\(dStr(rec["target"]))\u{0}\(dStr(dOr(rec["on"]["hostId"], rec["on"]["label"])))"
+        func runKey(_ r: JSON) -> String {
+            "\(dStr(r["tool"]))\u{0}\(dStr(r["target"]))\u{0}\(dStr(dOr(r["on"]["hostId"], r["on"]["label"])))"
+        }
+        let key = runKey(rec)
         let row: JSON = [
             "id": .string(newId("run")),
             "tool": dOr(rec["tool"], ""),
@@ -638,7 +658,7 @@ extension Store {
             "on": netHostRef(rec["on"]),
             "at": .number(nowMs()),
         ]
-        var runs = recs("netRuns").filter { "\($0["tool"].stringish ?? "undefined")\u{0}\($0["target"].stringish ?? "undefined")" != key }
+        var runs = recs("netRuns").filter { runKey($0) != key }
         runs.insert(row, at: 0)
         if runs.count > 25 { runs = Array(runs.prefix(25)) }
         setRecs("netRuns", runs)
@@ -776,6 +796,10 @@ extension Store {
             "ttl": dOr(t["ttl"], ""),
             "mfaMode": dOr(t["mfaMode"], ""),
             "autoLogin": .bool(t["autoLogin"].truthy),
+            // Keep a group for it on the Hosts tab when `tsh status` no longer
+            // lists it — after a logout, or before the first login — so its
+            // watched hosts and its login buttons stay where they are looked for.
+            "showInHosts": .bool(t["showInHosts"].truthy),
             "createdAt": .number(now),
             "updatedAt": .number(now),
             "lastUsed": 0,

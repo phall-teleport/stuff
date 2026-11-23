@@ -313,7 +313,8 @@ struct MiscField<Content: View>: View {
     var body: some View {
         let p = Theme.shared.p
         VStack(alignment: .leading, spacing: 4) {
-            if let label { Text(label).font(.system(size: 11.5, weight: .medium)).foregroundStyle(p.textDim) }
+            // Bold, in the text colour: not the grey of its hint (0.28).
+            if let label { Text(label).font(.system(size: 12, weight: .semibold)).foregroundStyle(p.text).padding(.bottom, 1) }
             content()
             if let hint { MiscHint(text: hint) }
         }

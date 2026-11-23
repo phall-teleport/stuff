@@ -21,6 +21,13 @@ No UI actions are registered: sessions and the sidebar own the interface.
 | `TeleportSSH.swift` | `writeClusterSshConfig`, `sshTarget` (teleportSshTarget), `isLeafCluster`, `listClusters`, `homeName` |
 | `LocalShells.swift` | local shells: list, login shell, blank starts, commands (`tsh play` …) |
 | `AuthProbe.swift` | `ssh -vv` auth probe + summary; `X11Status`; `ToolsStatus` |
+| `SSHOptions.swift` | sshoptions.js: `normalize`, `needsTsh`, `opensshArgs`, `tshArgs`, `summary`, `commandLine`, `record`/`save` (Hosts' stand-in `HostsSSHOpts` should go) |
+| `ConnFailure.swift` | `ConnFailFlags` (mfa / hostkey / authfail), `looksLikeHostKeyChanged`, `explainVersion`, `optionForwards` |
+| `ConnMonitor.swift` | `MONITOR_SCRIPT`, `parseMonitorLine` (`ConnMonitorText`), `MonitorEvent`/`MonitorSample`, `Connection.startMonitor/stopMonitor` |
+| `ConnExecInteractive.swift` | `execInteractive` (pty, `.execData`/`.execPrompt`), `writeExec`, `killExec`, `teleportPresence`, `hostSockets` (raw text) |
+| `LocalMonitor.swift` | localmonitor.js: this Mac's stats, reported as connection `"local"` |
+| `LiveStats.swift` | `LiveStats.shared` — the feed for the stats bar (`attach`/`detach`/`restart`, `entries[key]`); manager `startMonitor` (refused when `quietRemote`), `stopMonitor`, `teleportPresence` |
+| `SSHVersion.swift` | sshbin.js `parseSshVersion`, `sshVersion` (`SSHVersion.current()`), `supportsFeature` (`SSHVersion.supports`) |
 
 ## ConnectionManager (`@MainActor @Observable`, `.shared`)
 
@@ -123,3 +130,13 @@ N, signal SIG…)" (PTYProcess reports 128+N for signal N).
 - `tsh beams` publish etc. are teleport-service's.
 - Windows (no-mux) branches are omitted.
 - `sshPath` changes are applied on settings change here; `tshPath`/`tshHomes` are teleport-service's.
+- 0.39: a failed `ConnectionManager.connect` appends ` [mfa]`, ` [hostkey]`,
+  ` [authfail]` to the message as main.js does, and `AppError.code` carries
+  the first of them. `Connection.lastErrorHostKeyChanged/AuthFailedLikely`.
+- `DirectSpec` has no `identitiesOnly`; it is read by reflection
+  (`ConnSpec.identitiesOnly`) until Core adds it.
+- `hostSockets` returns the raw `ss`/`netstat` text and tool; parsing
+  (sockets.js) is nettools'.
+- The extra ssh search paths (MacPorts, Nix, Linuxbrew) belong in Core
+  `Tools` (lead).
+- `diskSpace` is done by the explorer itself (`ExplorerDisk`).

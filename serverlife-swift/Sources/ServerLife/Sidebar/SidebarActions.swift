@@ -24,11 +24,29 @@ enum SBActions {
             Actions.shared.perform("open-host", window: window, host: host, args: args)
             return
         }
-        if HostPrefs.isMfaHost(host.id) && host.type == Host.teleport { openMfa(host, login: who, window: window); return }
+        // A ghost, unconfirmed or requestable row's own id is synthesised, not
+        // the live inventory's `tsh:<cluster>:<uuid>` the MFA mark was set
+        // against — resolve it first, or a marked node loses its MFA routing
+        // the moment it goes missing or turns requestable.
+        if HostPrefs.isMfaHost(mfaId(host)) && host.type == Host.teleport { openMfa(host, login: who, window: window); return }
         statusUntilSettled("Connecting to \(label(host))\(who.map { " as \($0)" } ?? "")…", hostId: host.id)
         var args: [String: Any] = ["noTmux": true]
         if let who { args["login"] = who }
+        if let sc = HostPrefs.startupCommand(host).nilIfEmpty { args["startupCommand"] = sc }
         Actions.shared.perform("open-host", window: window, host: host, args: args)
+    }
+
+    /// The id an MFA mark for this host is filed under (sidebar.js `open`):
+    /// a requestable row's precomputed `mfaId`, a ghost's worked out from its
+    /// cluster and uuid, else its own id.
+    static func mfaId(_ host: Host) -> String {
+        if let m = host.extra["mfaId"]?.string?.nilIfEmpty { return m }
+        if (host.watchMissing || host.watchUnconfirmed), host.type == Host.teleport, let uuid = host.uuid?.nilIfEmpty {
+            let rid = host.extra["resourceId"]?.string?.nilIfEmpty ?? "/\(host.cluster ?? "")/node/\(uuid)"
+            let ids = Teleport.inventoryNodeIds([(id: rid, cluster: host.cluster ?? "", uuid: uuid)], home: host.home)
+            return ids[rid] ?? host.id
+        }
+        return host.id
     }
 
     /// Show "Connecting…" until the host's connection settles (connected,
@@ -62,7 +80,11 @@ enum SBActions {
     static func openMfa(_ host: Host, login: String?, window: WindowModel?) {
         let who = login ?? HostPrefs.preferredLogin(host)
         let mode = SB.store.settingJSON("mfaMode").string?.nilIfEmpty ?? "platform"
-        if !HostPrefs.isMfaHost(host.id) { HostPrefs.setMfaHost(host, true) }
+        // Only worth recording under a live id: a ghost's or a requestable
+        // row's is synthesised and nothing would ever look it up.
+        if !host.watchMissing && !host.watchUnconfirmed && !host.isRequestableRow && !HostPrefs.isMfaHost(host.id) {
+            HostPrefs.setMfaHost(host, true)
+        }
         statusUntilSettled("Connecting to \(host.name) with tsh (\(mfaLabel(mode)))…", hostId: host.id)
         // The host is now an MFA host, so open-host routes it to tsh with the
         // MFA mode and shows "Approve with Touch ID…" once the session is up.
@@ -77,6 +99,7 @@ enum SBActions {
         statusUntilSettled("Opening \(label(host))…", hostId: host.id)
         var args: [String: Any] = ["split": dir, "noTmux": true]
         if let who { args["login"] = who }
+        if let sc = HostPrefs.startupCommand(host).nilIfEmpty { args["startupCommand"] = sc }
         Actions.shared.perform("open-host", window: window, host: host, args: args)
     }
 
@@ -124,7 +147,7 @@ enum SBActions {
     /// Ask for access to a host that has become requestable.
     static func requestAccessFor(_ host: Host, window: WindowModel?) {
         let ps = Inventory.shared.profiles
-        guard let p = ps.first(where: { $0.proxy == (host.proxy ?? "") && ($0.homeDir.nilIfEmpty) == (host.home?.nilIfEmpty) })
+        guard let p = ps.first(where: { $0.proxy == (host.proxy ?? "") && ($0.home?.nilIfEmpty) == (host.home?.nilIfEmpty) })
             ?? ps.first(where: { $0.cluster == host.cluster })
             ?? ps.first(where: { $0.proxy == (host.proxy ?? "") }) else {
             toast("Log in to that cluster first", .error)
@@ -162,6 +185,8 @@ enum SBActions {
     // MARK: Refreshing
 
     static func refreshAll(notify: Bool) {
+        // Kubernetes contexts are read again alongside (kubepanel.js refreshKubeFor).
+        if SBKube.enabled { Actions.shared.perform("kube-refresh") }
         Task { @MainActor in
             await Inventory.shared.refresh()
             let moved = FolderModel.repairFolderGroups(SB2.folderGroups().map(\.key))
@@ -174,6 +199,7 @@ enum SBActions {
     }
 
     static func refreshProfile(_ p: TeleportProfile) {
+        if SBKube.enabled { Actions.shared.perform("kube-refresh", args: ["proxy": p.proxy, "home": p.home ?? ""]) }
         Task { await Inventory.shared.refreshProfile(p) }
     }
 
@@ -192,7 +218,10 @@ enum SBActions {
                                       authConnector: saved?["authConnector"].stringish?.nilIfEmpty,
                                       ttl: saved?["ttl"].stringish?.nilIfEmpty, mfaMode: saved?["mfaMode"].stringish?.nilIfEmpty,
                                       home: p.homeDir)
-        if o.user != nil && (o.authConnector == nil || o.authConnector == "local") {
+        // A terminal wherever tsh asks for something only a foreground
+        // process can answer: local auth (a typed password) and passwordless
+        // (a Touch ID or security-key challenge). Only SSO is fine headless.
+        if o.user != nil && (o.authConnector == nil || o.authConnector == "local" || o.authConnector == "passwordless") {
             Inventory.shared.runLoginInTerminal(o, window: window)
             return
         }

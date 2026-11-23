@@ -17,11 +17,56 @@ enum CrossTransfer {
         var reason: String
     }
 
-    /// Can these two connections hand off directly?
-    static func planRoute(_ src: FilesConn, _ dest: FilesConn) -> Route {
-        let s = src.host, d = dest.host
+    /// The oldest tsh that copies remote-to-remote.
+    ///
+    /// tsh 17 does not refuse `tsh scp user@a:/src user@b:/dest`: it reads the
+    /// destination as a *local* path, downloads the files into a folder named
+    /// `user@b:` in its working directory, and exits 0. The copy looks
+    /// finished, the destination never gets the files, and they land on this
+    /// machine. Found by tests/integration on tsh 17.7.30; tsh 18 copies as asked.
+    static let directMinTshMajor = 18
+
+    /// The tsh version (`teleport.version()`); tests replace it.
+    nonisolated(unsafe) static var tshVersion: @Sendable () async -> String? = { await Teleport.version() }
+
+    /// The version the last route check saw — what the synchronous
+    /// `FilesService.crossPlan` answers from. nil until one has run.
+    private static let versionLock = NSLock()
+    nonisolated(unsafe) private static var lastVersion: String??
+
+    static var knownTshVersion: String?? { versionLock.withLock { lastVersion } }
+
+    /// Ask tsh for its version again and remember it.
+    @discardableResult
+    static func refreshTshVersion() async -> String? {
+        let v = await tshVersion()
+        versionLock.withLock { lastVersion = .some(v) }
+        return v
+    }
+
+    /// Can these two connections hand off directly? Asks tsh for its version
+    /// when the route would be direct.
+    static func planRoute(_ src: FilesConn, _ dest: FilesConn) async -> Route {
+        if sameCluster(src, dest) { return planRoute(src, dest, tshVersion: await refreshTshVersion()) }
+        return planRoute(src, dest, tshVersion: nil)
+    }
+
+    static func sameCluster(_ src: FilesConn, _ dest: FilesConn) -> Bool {
+        src.type == "teleport" && dest.type == "teleport" && src.host.proxy == dest.host.proxy && src.host.cluster == dest.host.cluster
+    }
+
+    /// The route, given the tsh version (`planRoute` in crosstransfer.js, minus the asking).
+    static func planRoute(_ src: FilesConn, _ dest: FilesConn, tshVersion v: String?) -> Route {
+        let s = src.host
         let bothTeleport = src.type == "teleport" && dest.type == "teleport"
-        if bothTeleport && s.proxy == d.proxy && s.cluster == d.cluster {
+        if sameCluster(src, dest) {
+            let major = Int(String((v ?? "").split(separator: ".", omittingEmptySubsequences: false).first ?? ""))
+            if major == nil || major! == 0 || major! < directMinTshMajor {
+                return Route(
+                    mode: "relay",
+                    reason: "Both nodes are on \(s.cluster ?? ""), but tsh \(v?.nilIfEmpty ?? "(version unknown)") cannot copy server-to-server "
+                        + "(that needs tsh \(directMinTshMajor) or newer). Files will be downloaded to this machine and uploaded to the destination.")
+            }
             return Route(mode: "direct", reason: "Both nodes are on \(s.cluster ?? ""); tsh will copy them server-to-server.")
         }
         let why = !bothTeleport ? "At least one endpoint is a plain SSH host." : "The nodes are on different Teleport clusters."
@@ -77,7 +122,8 @@ enum CrossTransfer {
         args.append(scpTarget(dest, destDir.hasSuffix("/") ? destDir : destDir + "/"))
         // Both ends are in the same cluster for a direct hand-off, so the
         // source node's tsh home is the one that holds the certificate.
-        let env = Tools.tshEnv(home: node.home ?? Tools.home(forProxy: node.proxy))
+        // The tsh variables from Settings for that cluster ride along (tshEnv(home, proxy)).
+        let env = TshEnv.overrides(home: node.home ?? Tools.home(forProxy: node.proxy), proxy: node.proxy)
 
         final class State: @unchecked Sendable {
             let lock = NSLock()
@@ -188,8 +234,11 @@ enum CrossTransfer {
     @MainActor
     static func transfer(src: FilesConn, dest: FilesConn, entries: [FileEntry], destDir: String,
                          mode: String? = nil) async throws -> Started {
-        let route = planRoute(src, dest)
-        let chosen = mode ?? route.mode
+        let route = await planRoute(src, dest)
+        // Relay can always be asked for; direct only where the route allows it
+        // — a caller asking for direct with a tsh that cannot do it would get
+        // the silent misdelivery described at directMinTshMajor.
+        let chosen = route.mode == "direct" ? (mode ?? "direct") : "relay"
         let srcSftp = try await FilesService.shared.sftp(src.id)
         let files = try await planCross(srcSftp, entries)
         let totalBytes = files.reduce(Int64(0)) { $0 + $1.size }

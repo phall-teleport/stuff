@@ -14,13 +14,39 @@ enum HostsPane {
     /// Leaf clusters read on demand: pane key → (when, nodes, error).
     static var leafNodes: [String: (at: Double, nodes: [Host], error: String?)] = [:]
     static let leafTTL: Double = 30000
+    /// A render past this many rows is a visible stall; "Show all" is one click away.
+    static let rowCap = 500
 
     static var boxView: Bool { Store.shared.setting("hostsPaneView", "list") == "box" }
+    static var tableView: Bool { Store.shared.setting("hostsPaneView", "list") == "table" }
+    /// Only meaningful in Table view — a stale `true` must not change List or Boxes.
+    static var labelColumnsOn: Bool { tableView && Store.shared.settingJSON("hostsPaneLabelColumns") == .bool(true) }
     static var foldersOn: Bool { Store.shared.settingJSON("hostsPaneFolders") != .bool(false) }
     /// Off by default: a cluster can offer far more than you hold.
     static var requestableOn: Bool { Store.shared.settingJSON("hostsPaneRequestable") == .bool(true) }
+    /// Also off by default — a "Saved" group of every saved profile is extra.
+    static var profilesOn: Bool { Store.shared.settingJSON("hostsPaneProfiles") == .bool(true) }
+    static var kubeOff: Bool { Store.shared.settingJSON("kubeEnabled") == .bool(false) }
 
     static func setPref(_ key: String, _ value: JSON) { Store.shared.updateSettings([key: value]) }
+
+    // MARK: Live panes
+
+    private final class WeakModel { weak var model: HostsPaneModel?; init(_ m: HostsPaneModel) { model = m } }
+    private static var live: [WeakModel] = []
+
+    static func remember(_ m: HostsPaneModel) {
+        live.removeAll { $0.model == nil || $0.model?.closed == true }
+        live.append(WeakModel(m))
+    }
+
+    /// `pickedHostsOf(paneId)`: whichever hosts are picked in this pane, so a
+    /// bare split (⌘⇧D/⌘⇧E, no host named) on a hosts pane targets the host
+    /// selected there instead of a disconnected local shell.
+    static func pickedHostsOf(_ paneId: String) -> [Host] {
+        guard let m = live.lazy.compactMap(\.model).first(where: { !$0.closed && $0.pane?.id == paneId }) else { return [] }
+        return m.shownHosts().filter { m.picked.contains(FolderModel.hostKey($0)) }
+    }
 
     /// `openHostsPane({ groupKey, dir })`: a new tab, or beside the focused pane.
     static func open(_ window: WindowModel?, groupKey: String? = nil, split: String? = nil) {
@@ -39,10 +65,12 @@ enum HostsPane {
         Actions.shared.perform("open-view-pane", window: w, args: args)
         // The pane just made is the focused one: keep it, so its title can follow the cluster.
         if let pane = w.feature(SessionsWindow.self).activePane, pane.isHosts { model.pane = pane }
+        remember(model)
     }
 
     /// Everything the pane can be pointed at: the folder groups, plus every
-    /// leaf cluster behind each Teleport one, as `root › leaf`.
+    /// leaf cluster behind each Teleport one, as `root › leaf`, plus "Saved"
+    /// when that toggle is on and there are profiles.
     static func paneGroups() -> [FolderGroup] {
         var out: [FolderGroup] = []
         for g in HostsHooks.folderGroups() {
@@ -53,6 +81,10 @@ enum HostsPane {
                 out.append(FolderGroup(key: "\(g.key)::\(leaf.name)", label: "\(g.label) \u{203A} \(leaf.name)", kind: "leaf",
                                        proxy: p.proxy, home: p.homeDir, cluster: leaf.name))
             }
+        }
+        // Every saved profile, as one more group to point the pane at.
+        if profilesOn && !HostsData.profiles.isEmpty {
+            out.append(FolderGroup(key: "profiles", label: "Saved", kind: "profiles"))
         }
         return out
     }
@@ -68,6 +100,121 @@ enum HostsPane {
         if let g = groups.first(where: { $0.key == groupKey }), g.proxy != nil { return g }
         guard let p = Inventory.shared.profiles.first(where: { FolderModel.groupKey(for: $0) == groupKey }) else { return nil }
         return FolderGroup(key: groupKey, label: p.cluster, kind: "teleport", proxy: p.proxy, home: p.homeDir, cluster: p.cluster)
+    }
+
+    /// Kubernetes clusters, host-shaped, for a root Teleport group — filtered
+    /// by this pane's own Requestable toggle, so one setting governs
+    /// everything the pane shows.
+    static func kubeHostsFor(_ groupKey: String) -> [Host] {
+        guard let p = Inventory.shared.profiles.first(where: { FolderModel.groupKey(for: $0) == groupKey }) else { return [] }
+        return HostsHooks.kubeHostsForProfile(p).filter { requestableOn || $0.extra["requestable"]?.truthy != true }
+    }
+
+    // MARK: Sorting
+
+    struct SortPref: Equatable {
+        var mode: String
+        var labelKey: String?
+        var desc = false
+        var value: String { mode == "label" && labelKey != nil ? "label:" + labelKey! : mode }
+    }
+
+    static var sortPref: SortPref {
+        let j = Store.shared.settingJSON("hostsPaneSort")
+        return SortPref(mode: j["mode"].string ?? "name", labelKey: j["labelKey"].string, desc: j["desc"].truthy)
+    }
+
+    static func setSort(_ s: SortPref) {
+        var o: JSON = ["mode": .string(s.mode)]
+        if let k = s.labelKey { o["labelKey"] = .string(k) }
+        if s.desc { o["desc"] = true }
+        setPref("hostsPaneSort", o)
+    }
+
+    nonisolated static func nameOf(_ h: Host) -> String { h.name.nilIfEmpty ?? h.alias ?? "" }
+
+    private static func before(_ a: String, _ b: String) -> Bool? {
+        let r = a.localizedCompare(b)
+        return r == .orderedSame ? nil : r == .orderedAscending
+    }
+
+    /// Lower sorts first: connected, the normal ones, stale, gone, requestable.
+    static func statusRank(_ h: Host) -> Int {
+        if FolderBits.connected(h) { return 0 }
+        if h.extra["missing"]?.truthy == true { return 3 }
+        if HostsHooks.heartbeat(h)?.stale == true { return 2 }
+        if h.extra["requestable"]?.truthy == true { return 4 }
+        return 1
+    }
+
+    /// Every label key across the list, most common first.
+    static func labelKeysIn(_ hosts: [Host]) -> [String] {
+        var counts: [String: Int] = [:]
+        var first: [String] = []
+        for h in hosts {
+            for e in Tags.labelEntries(h) {
+                if counts[e.key] == nil { first.append(e.key) }
+                counts[e.key, default: 0] += 1
+            }
+        }
+        // Stable on ties: first seen first, as the JS Map's sort keeps them.
+        return first.enumerated().sorted { a, b in
+            let x = counts[a.element]!, y = counts[b.element]!
+            return x != y ? x > y : a.offset < b.offset
+        }.map(\.element)
+    }
+
+    /// Hosts in the chosen order — Name, Status, Heartbeat (the longest quiet
+    /// first) or a label's value; a host missing that label sorts last.
+    static func sortHosts(_ hosts: [Host], _ pref: SortPref? = nil) -> [Host] {
+        let pref = pref ?? sortPref
+        var list = hosts.enumerated().map { $0 }
+        func byName(_ a: Host, _ b: Host, _ ia: Int, _ ib: Int) -> Bool { before(nameOf(a), nameOf(b)) ?? (ia < ib) }
+        switch pref.mode {
+        case "heartbeat":
+            let info = list.map { e -> (at: Double?, quiet: Bool) in
+                let h = e.element
+                if h.extra["kind"]?.string == "kube" { return HostsHooks.kubeBeatTime(h) }
+                return (Heartbeat.heartbeatAt(h), HostsHooks.heartbeat(h)?.stale == true)
+            }
+            list.sort { a, b in
+                let x = info[a.offset], y = info[b.offset]
+                if x.quiet != y.quiet { return x.quiet }
+                if (x.at == nil) != (y.at == nil) { return x.at != nil }
+                let xa = x.at ?? 0, ya = y.at ?? 0
+                if xa != ya { return xa < ya }
+                return byName(a.element, b.element, a.offset, b.offset)
+            }
+        case "status":
+            list.sort { a, b in
+                let x = statusRank(a.element), y = statusRank(b.element)
+                return x != y ? x < y : byName(a.element, b.element, a.offset, b.offset)
+            }
+        case "label" where pref.labelKey != nil:
+            let key = pref.labelKey!
+            func value(_ h: Host) -> String? { Tags.labelEntries(h).first { $0.key == key }?.value }
+            list.sort { a, b in
+                let va = value(a.element), vb = value(b.element)
+                switch (va, vb) {
+                case (nil, nil): return byName(a.element, b.element, a.offset, b.offset)
+                case (nil, _): return false
+                case (_, nil): return true
+                default: return before(va!, vb!) ?? byName(a.element, b.element, a.offset, b.offset)
+                }
+            }
+        default:
+            list.sort { a, b in byName(a.element, b.element, a.offset, b.offset) }
+        }
+        let out = list.map(\.element)
+        // Turned round from the table's header (a second click on its column).
+        return pref.desc ? out.reversed() : out
+    }
+
+    static func profileKey(_ p: JSON) -> String { "profile:" + (p["id"].stringish ?? "") }
+
+    /// sidebar.js `profileKindLabel`, as the pane's profile card shows it.
+    static func profileKind(_ p: JSON) -> String {
+        ["sftp": "sftp", "teleport": "tsh", "serial": "serial", "telnet": "telnet", "vnc": "vnc", "rdp": "rdp"][p["type"].string ?? ""] ?? "ssh"
     }
 }
 
@@ -92,6 +239,9 @@ final class HostsPaneModel: ObservableObject {
     var reqHosts: [Host] = []
     var reqError: String?
     var dragging: [String]?
+    /// Opting into the full, uncapped render; reset when the group changes.
+    @Published var showAllRows = false
+    @Published var refreshing = false
 
     init(window: WindowModel?, groupKey: String) {
         self.window = window
@@ -101,6 +251,8 @@ final class HostsPaneModel: ObservableObject {
     func setGroup(_ key: String, groups: [FolderGroup]) {
         groupKey = key
         picked = []
+        // A different group can be a wildly different scale.
+        showAllRows = false
         let label = groups.first { $0.key == key }?.label ?? "Hosts"
         pane?.title = "Hosts · \(label)"
         pane?.hostsGroup = key
@@ -108,6 +260,7 @@ final class HostsPaneModel: ObservableObject {
 
     /// Start whatever background reads the current selection needs.
     func ensureFetched(_ groups: [FolderGroup]) {
+        if groupKey == "profiles" { return }
         if HostsPane.requestableOn, let g = HostsPane.clusterOf(groupKey, groups), let proxy = g.proxy {
             let key = "\(proxy)\u{0}\(g.home ?? "")"
             if (reqKey != key || reqAt == nil) && !reqFetching {
@@ -142,6 +295,8 @@ final class HostsPaneModel: ObservableObject {
     /// draws, the cached `tsh ls` for a leaf, plus anything askable.
     func hostsFor() -> (hosts: [Host], loading: Bool, error: String?) {
         _ = landed
+        // Saved profiles are drawn from the store; none of the rest applies.
+        if groupKey == "profiles" { return ([], false, nil) }
         let askable = HostsPane.requestableOn ? reqHosts : []
         func withAskable(_ list: [Host]) -> [Host] {
             if askable.isEmpty { return list }
@@ -150,7 +305,7 @@ final class HostsPaneModel: ObservableObject {
             return list + askable.filter { !have.contains($0.uuid ?? "") }
         }
         guard HostsPane.leafOf(groupKey) != nil else {
-            return (withAskable(HostsHooks.hostsInGroup(groupKey)), false, nil)
+            return (withAskable(HostsHooks.hostsInGroup(groupKey)) + HostsPane.kubeHostsFor(groupKey), false, nil)
         }
         let cached = HostsPane.leafNodes[groupKey]
         return (withAskable(cached?.nodes ?? []), cached == nil, cached?.error)
@@ -183,7 +338,77 @@ final class HostsPaneModel: ObservableObject {
         }
     }
 
+    /// What "Refresh" means for the group: a leaf drops its cached `tsh ls`;
+    /// a root cluster or an ssh config file gets the sidebar heading's ⟳.
+    func refreshCurrent(_ groups: [FolderGroup]) {
+        if refreshing { return }
+        refreshing = true
+        let key = groupKey
+        Task { @MainActor in
+            if key == "profiles" {
+                // The store is the profile list; a redraw is the re-read.
+            } else if HostsPane.leafOf(key) != nil {
+                HostsPane.leafNodes[key] = nil
+            } else if let g = groups.first(where: { $0.key == key }), g.kind == "ssh" {
+                await Inventory.shared.refreshSshConfigs(key: g.key)
+            } else if let p = Inventory.shared.profiles.first(where: { FolderModel.groupKey(for: $0) == key }) {
+                await Inventory.shared.refreshProfile(p)
+            } else {
+                await Inventory.shared.refresh()
+            }
+            refreshing = false
+            landed += 1
+        }
+    }
+
+    /// Right-click a row in any layout. A multi-selection gets its own small
+    /// menu (a bulk "Request access…"); a kube cluster gets its own.
+    func rowMenu(_ host: Host, folder: HostFolder?) {
+        let k = FolderModel.hostKey(host)
+        if !picked.contains(k) { picked = [k]; lastKey = k }
+        let w = window
+        if picked.count > 1 {
+            let chosen = shownHosts().filter { picked.contains(FolderModel.hostKey($0)) }
+            // Bulk requesting stays SSH-node-only.
+            let reqable = chosen.filter { $0.extra["requestable"]?.truthy == true && $0.extra["kind"]?.string != "kube" }
+            CtxMenu.build([CtxItem("Request access to \(reqable.count) node\(reqable.count == 1 ? "" : "s")…", disabled: reqable.isEmpty) {
+                HostsHooks.requestAccessForMany(reqable, window: w)
+            }]).popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+            return
+        }
+        if host.extra["kind"]?.string == "kube" {
+            let g = groupKey
+            if host.extra["requestable"]?.truthy == true {
+                CtxMenu.build([
+                    .heading(host.name),
+                    CtxItem("Request access to it…") { Actions.shared.perform("kube-request-access", window: w, host: host) },
+                    CtxItem("Request a namespace or pod…") { Actions.shared.perform("kube-request-resource", window: w, host: host) },
+                    .sep,
+                    CtxItem(HostsHooks.isWatched(host) ? "Stop watching this cluster" : "Watch this cluster") {
+                        HostWatch.toggleWatch(host, g)
+                    },
+                ]).popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+                return
+            }
+            let menu = NSMenu()
+            menu.autoenablesItems = false
+            Actions.shared.perform("kube-host-menu", window: w, host: host, args: ["menu": menu, "groupKey": g])
+            if !menu.items.isEmpty { menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil) }
+            return
+        }
+        HostsHooks.showHostMenu(host, folder: folder, groupKey: groupKey, window: w)
+    }
+
     func open(_ host: Host) {
+        // A kube cluster is host-shaped only for folders, filter and drag: its
+        // own open (browse a context, log in to an available one) and its
+        // request are kube-ui's.
+        if host.extra["kind"]?.string == "kube" {
+            if host.extra["requestable"]?.truthy == true {
+                return Actions.shared.perform("kube-request-access", window: window, host: host)
+            }
+            return Actions.shared.perform("kube-host-open", window: window, host: host)
+        }
         // A requestable node cannot be opened, so the double-click asks for it.
         if host.extra["requestable"]?.truthy == true { return HostsOpen.requestAccess(host, window: window) }
         if host.extra["missing"]?.truthy == true {
@@ -195,284 +420,3 @@ final class HostsPaneModel: ObservableObject {
     }
 }
 
-struct HostsPaneView: View {
-    @ObservedObject var model: HostsPaneModel
-
-    var body: some View {
-        let p = Theme.shared.p
-        let groups = HostsPane.paneGroups()
-        let here = model.hostsFor()
-        let all = here.hosts + HostsHooks.missingIn(model.groupKey, here.hosts)
-        let q = model.filter.trimmed.isEmpty ? nil : Tags.compileQuery(model.filter)
-        let hosts = q.map { q in all.filter { q.match($0) } } ?? all
-        VStack(spacing: 0) {
-            toolbar(groups, all: all, shown: hosts, loading: here.loading)
-            p.borderSoft.frame(height: 1)
-            ScrollView {
-                Group {
-                    if here.loading {
-                        empty("Reading that cluster…")
-                    } else if let e = here.error {
-                        VStack(spacing: 8) {
-                            Text(e).foregroundStyle(p.amber)
-                            MiscHint(text: "A leaf is read with its own tsh ls; the certificate for the root has to be good.")
-                        }
-                        .font(.system(size: 12.5)).frame(maxWidth: .infinity).padding(.vertical, 30).padding(.horizontal, 12)
-                    } else {
-                        content(hosts)
-                    }
-                }
-                .padding(.horizontal, 9).padding(.top, 8).padding(.bottom, 14)
-            }
-        }
-        .background(p.bg)
-        // The original re-read a stale leaf (30 s) on any redraw: a filter
-        // keystroke, a folder write, an inventory event, a preference.
-        .task(id: renderKey) { model.ensureFetched(groups) }
-    }
-
-    private var renderKey: String {
-        let st = Store.shared
-        return [model.groupKey, model.filter, String(Inventory.shared.generation), String(HostsPane.requestableOn),
-                String(HostsPane.foldersOn), String(HostsPane.boxView), String(model.landed),
-                String(st.settingJSON("hostFolders").hashValue), String(st.settingJSON("folderMembers").hashValue)]
-            .joined(separator: "|")
-    }
-
-    private func empty(_ text: String) -> some View {
-        Text(text).font(.system(size: 12.5)).foregroundStyle(Theme.shared.p.muted)
-            .frame(maxWidth: .infinity).padding(.vertical, 30).padding(.horizontal, 12)
-    }
-
-    // MARK: Toolbar
-
-    private func toolbar(_ groups: [FolderGroup], all: [Host], shown: [Host], loading: Bool) -> some View {
-        let p = Theme.shared.p
-        let req = HostsPane.requestableOn, folders = HostsPane.foldersOn, box = HostsPane.boxView
-        func toggle(_ label: String, _ on: Bool, _ help: String, _ action: @escaping () -> Void) -> some View {
-            Button(label, action: action)
-                .buttonStyle(GhostButtonStyle(small: true))
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(on ? p.accent : Color.clear))
-                .background(RoundedRectangle(cornerRadius: 5).fill(on ? p.accentDim : Color.clear))
-                .help(help)
-        }
-        return HFlow(spacing: 7) {
-            HSelect(options: groups.map { g in
-                let icon = HostsHooks.clusterIcon(g.key)
-                return (g.key, (icon.isEmpty ? "" : icon + " ") + g.label)
-            }, selection: Binding(get: { model.groupKey }, set: { model.setGroup($0, groups: groups) }))
-            .frame(width: 220)
-            toggle("Requestable", req, req ? "Also listing what this cluster would let you ask for — click to show only what you hold"
-                   : "Also list what this cluster would let you ask for, tagged req") {
-                HostsPane.setPref("hostsPaneRequestable", .bool(!req))
-            }
-            toggle("Folders", folders, folders ? "Showing the folder arrangement — click for the plain list"
-                   : "Showing every host in one list — click for the folders") {
-                HostsPane.setPref("hostsPaneFolders", .bool(!folders))
-            }
-            HStack(spacing: 2) {
-                toggle("List", !box, "One row per host") { HostsPane.setPref("hostsPaneView", "list") }
-                toggle("Boxes", box, "Tiles, for scanning a lot of them") { HostsPane.setPref("hostsPaneView", "box") }
-            }
-            HField(placeholder: "Filter — env=prod, name~^web, tag:gpu", text: $model.filter).frame(width: 260)
-            Text(loading ? "reading…" : FolderBits.countText(shown.count, all.count))
-                .font(.system(size: 11).monospacedDigit()).foregroundStyle(p.muted)
-                .frame(height: 22)
-            Button("New folder…") {
-                FolderDialogs.openFolderDialog(model.window, group: model.groupKey, hosts: all)
-            }.buttonStyle(.ghostSmall)
-        }
-        .padding(.horizontal, 9).padding(.vertical, 7)
-        .background(p.panel)
-    }
-
-    // MARK: Content
-
-    @ViewBuilder private func content(_ hosts: [Host]) -> some View {
-        if hosts.isEmpty {
-            empty(model.filter.isEmpty ? "No hosts in this group." : "Nothing matches that filter.")
-        } else if !HostsPane.foldersOn {
-            grid(hosts, depth: 0, folder: nil, order: hosts.map(FolderModel.hostKey))
-        } else {
-            let sections = arranged(hosts)
-            let order = sections.flatMap { $0.hosts.map(FolderModel.hostKey) }
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(sections.enumerated()), id: \.offset) { _, s in
-                    if let f = s.folder, s.isHead {
-                        folderHead(f, depth: s.depth, count: s.count)
-                    } else if s.isHead {
-                        unfiledHead(s.count)
-                    } else {
-                        grid(s.hosts, depth: s.depth, folder: s.folder, order: order)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Folder heads and their grids, then Unfiled — in the order drawn.
-    private struct Section { var isHead: Bool; var folder: HostFolder?; var depth: Int; var count: Int; var hosts: [Host] }
-
-    private func arranged(_ hosts: [Host]) -> [Section] {
-        var out: [Section] = []
-        func walk(_ parent: String?, _ depth: Int) {
-            for f in FolderModel.folders(in: model.groupKey, parent: parent) {
-                let deep = FolderModel.hostsInTree(f, hosts)
-                if !model.filter.isEmpty && deep.isEmpty { continue }
-                out.append(Section(isHead: true, folder: f, depth: depth, count: deep.count, hosts: []))
-                if model.shut.contains(f.id) { continue }
-                let mine = FolderModel.hostsInFolder(f, hosts)
-                if !mine.isEmpty { out.append(Section(isHead: false, folder: f, depth: depth + 1, count: 0, hosts: mine)) }
-                walk(f.id, depth + 1)
-            }
-        }
-        walk(nil, 0)
-        let loose = hosts.filter { !FolderModel.isFiled($0, model.groupKey) }
-        if !loose.isEmpty {
-            out.append(Section(isHead: true, folder: nil, depth: 0, count: loose.count, hosts: []))
-            out.append(Section(isHead: false, folder: nil, depth: 0, count: 0, hosts: loose))
-        }
-        return out
-    }
-
-    private func folderHead(_ folder: HostFolder, depth: Int, count: Int) -> some View {
-        let p = Theme.shared.p
-        let shut = model.shut.contains(folder.id)
-        let colour = FolderBits.color(folder)
-        let target = model.dropTarget == folder.id
-        return HStack(spacing: 7) {
-            Text(shut ? "▶" : "▼").font(.system(size: 8)).foregroundStyle(p.muted)
-            Text(FolderModel.folderIcon(folder, open: !shut)).font(.system(size: 12))
-            Text(folder.name).font(.system(size: 12, weight: .semibold)).foregroundStyle(target ? Color.white : (colour ?? p.textDim))
-            if !folder.rule.isEmpty { SmallTag(kind: .rule, text: "rule") }
-            Text(String(count)).font(.system(size: 10.5).monospacedDigit()).foregroundStyle(p.muted)
-            Spacer()
-        }
-        .padding(.vertical, 4).padding(.trailing, 8).padding(.leading, 4 + CGFloat(depth) * 18)
-        .background(RoundedRectangle(cornerRadius: 6).fill(target ? p.accentDim : Color.clear))
-        .overlay(alignment: .leading) { (colour ?? .clear).frame(width: 2) }
-        .padding(.top, 10).padding(.bottom, 5)
-        .contentShape(Rectangle())
-        .onTapGesture { if shut { model.shut.remove(folder.id) } else { model.shut.insert(folder.id) } }
-        .help(folder.rule.isEmpty ? "Drop hosts here to file them" : "Fills itself with: \(folder.rule)")
-        // A folder heading is a drop target: this pane is a place to do the filing.
-        .folderDrop(canDrop: { model.dragging != nil && HostsDrag.isFrom(model) },
-                    onTarget: { model.dropTarget = $0 ? folder.id : (model.dropTarget == folder.id ? nil : model.dropTarget) },
-                    onDrop: { model.drop(on: folder) })
-    }
-
-    private func unfiledHead(_ count: Int) -> some View {
-        let p = Theme.shared.p
-        return HStack(spacing: 7) {
-            Text("—").font(.system(size: 12))
-            Text("Unfiled").font(.system(size: 12)).foregroundStyle(p.muted)
-            Text(String(count)).font(.system(size: 10.5).monospacedDigit()).foregroundStyle(p.muted)
-            Spacer()
-        }
-        .foregroundStyle(p.textDim)
-        .padding(.vertical, 4).padding(.horizontal, 6)
-        .padding(.top, 10).padding(.bottom, 5)
-    }
-
-    @ViewBuilder private func grid(_ hosts: [Host], depth: Int, folder: HostFolder?, order: [String]) -> some View {
-        if HostsPane.boxView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 7)], alignment: .leading, spacing: 7) {
-                ForEach(hosts, id: \.id) { h in card(h, folder: folder, order: order) }
-            }
-            .padding(.leading, CGFloat(depth) * 18)
-        } else {
-            LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(hosts, id: \.id) { h in card(h, folder: folder, order: order) }
-            }
-            .padding(.leading, CGFloat(depth) * 18)
-        }
-    }
-
-    private func card(_ host: Host, folder: HostFolder?, order: [String]) -> some View {
-        HostsPaneCard(model: model, host: host, folder: folder, order: order)
-    }
-}
-
-/// One host in the pane (`.hp-card`), as a row or a tile.
-private struct HostsPaneCard: View {
-    @ObservedObject var model: HostsPaneModel
-    let host: Host
-    let folder: HostFolder?
-    let order: [String]
-    @StateObject private var hover = LocalFlag()
-
-    var body: some View {
-        let p = Theme.shared.p
-        let box = HostsPane.boxView
-        let k = FolderModel.hostKey(host)
-        let on = model.picked.contains(k)
-        let live = FolderBits.connected(host)
-        let missing = host.extra["missing"]?.truthy == true
-        let requestable = host.extra["requestable"]?.truthy == true
-        let beat = HostsHooks.heartbeat(host)
-        let quiet = beat?.stale == true
-        let tags = Tags.labelEntries(host).prefix(box ? 3 : 5)
-        let icon = Store.shared.settingJSON("hostIcons")[k].string ?? ""
-        let name = host.name.nilIfEmpty ?? host.alias ?? ""
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 7) {
-                HostDot(on: live, color: missing ? p.amber : nil)
-                if HostsHooks.showWatchMark && HostsHooks.isWatched(host) && !missing {
-                    Text("\u{1F514}").font(.system(size: 10)).help("Watched for disappearance")
-                }
-                Text(name).font(.system(size: 12.5, weight: .medium)).lineLimit(1).truncationMode(.tail)
-                    .strikethrough(missing)
-                if !icon.isEmpty { Text(icon).font(.system(size: 12)) }
-                if host.ambiguous == true, let uuid = host.uuid {
-                    Text("\u{1F4CB}").font(.system(size: 10))
-                        .help("Duplicate named node — another node here answers to “\(host.name)”.\nThis one is dialled by its id, \(uuid).")
-                }
-                if requestable {
-                    SmallTag(kind: .req, text: "req",
-                             help: "Not yours to open yet \u{2014} \(host.cluster ?? "this cluster") will let you ask for it.\nDouble-click to start a request.")
-                } else if missing {
-                    SmallTag(kind: .gone, text: "\u{2298} gone " + HostsHooks.goneFor(host.extra["missingSince"]?.double),
-                             help: HostsHooks.missingLine(host))
-                } else {
-                    HeartbeatTag(host: host)
-                }
-                Spacer(minLength: 4)
-                Text(host.addr?.nilIfEmpty ?? (host.tunnel == true ? "tunnel" : (host.user ?? "")))
-                    .font(.system(size: 11)).foregroundStyle(on ? Color.white.opacity(0.75) : p.muted).lineLimit(1).fixedSize()
-            }
-            if !tags.isEmpty {
-                HFlow(spacing: 3, lineSpacing: 3) {
-                    ForEach(Array(tags.enumerated()), id: \.offset) { _, t in LabelChip(key: t.key, value: t.value, onAccent: on) }
-                }
-            }
-        }
-        .foregroundStyle(on ? Color.white : (hover.on ? p.text : p.textDim))
-        .padding(.horizontal, box ? 10 : 9).padding(.vertical, box ? 8 : 5)
-        .frame(minHeight: box ? 52 : nil, alignment: .topLeading)
-        .background(RoundedRectangle(cornerRadius: 6).fill(on ? p.accentDim : (box ? (hover.on ? p.panel3 : p.panel2) : (hover.on ? p.panel2 : Color.clear))))
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(on ? p.accent : (box ? p.borderSoft : Color.clear)))
-        .overlay(alignment: .leading) { if quiet { p.amber.frame(width: 2) } }
-        .opacity(missing ? 0.72 : 1)
-        .contentShape(Rectangle())
-        .onHover { hover.on = $0 }
-        .help([name, host.addr?.nilIfEmpty ?? (host.tunnel == true ? "tunnel" : ""), beat?.line ?? ""].filter { !$0.isEmpty }.joined(separator: "\n"))
-        .gesture(TapGesture(count: 2).onEnded { model.open(host) }
-            .exclusively(before: TapGesture(count: 1).onEnded { model.pick(k, order: order) }))
-        .hostsRightClick {
-            if !model.picked.contains(k) { model.picked = [k]; model.lastKey = k }
-            HostsHooks.showHostMenu(host, folder: folder, groupKey: model.groupKey, window: model.window)
-        }
-        .onDrag {
-            model.startDrag(k)
-            return HostsDrag.provider(name, from: model)
-        }
-        // In a folder, the fastest way out of it is the one you already tried.
-        .focusable(folder != nil)
-        .focusEffectDisabled()
-        .onKeyPress(keys: [.delete, .deleteForward]) { _ in
-            guard let folder else { return .ignored }
-            FolderModel.unfileHost(host, folder.id)
-            return .handled
-        }
-    }
-}

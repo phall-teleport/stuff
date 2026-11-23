@@ -91,6 +91,9 @@ enum XPPanes {
     }
     /// Every pane id in a window (nil: the focused one).
     static var allPaneIds: (WindowModel?) -> [String] = { _ in [] }
+    /// The pod a kube exec pane is exec'd into, when it is one: its explorer
+    /// shows that pod's filesystem from the start (kubepanel.js `explorerSource`).
+    static var kubeSpec: (String) -> KubeSpec? = { _ in nil }
 }
 
 // MARK: - Connections
@@ -108,11 +111,13 @@ struct XPConn {
     let type: String
     let target: String
     let host: Host
+    let hostId: String?
 
     static func get(_ id: String?) -> XPConn? {
         guard let id, let c = ConnectionManager.shared.connection(id) else { return nil }
         return XPConn(id: c.id, state: c.state.rawValue, transport: c.transportKind, transportForced: c.transportForced,
-                      homeDir: c.homeDir, label: c.label, error: c.error, type: c.type, target: c.target, host: c.host)
+                      homeDir: c.homeDir, label: c.label, error: c.error, type: c.type, target: c.target, host: c.host,
+                      hostId: c.hostId)
     }
 
     static var all: [XPConn] { ConnectionManager.shared.connections.compactMap { get($0.id) } }

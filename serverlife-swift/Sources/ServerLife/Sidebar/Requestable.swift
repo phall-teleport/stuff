@@ -104,6 +104,20 @@ enum Requestable {
             h.tunnel = false
             out.append(h)
         }
+        // A node marked "needs MFA" ahead of its grant is still marked — the
+        // row carries `req:…` as its own id, not the id the mark was filed
+        // under; worked out once per list so the mfa tag draws without a
+        // round trip per row.
+        let items = out.compactMap { h -> (id: String, cluster: String, uuid: String)? in
+            guard h.extra["kind"]?.string == "node", let u = h.uuid?.nilIfEmpty else { return nil }
+            return (h.extra["resourceId"]?.string ?? "", h.cluster ?? "", u)
+        }
+        if !items.isEmpty {
+            let ids = Teleport.inventoryNodeIds(items, home: home)
+            for i in out.indices where out[i].extra["kind"]?.string == "node" && out[i].uuid?.isEmpty == false {
+                out[i].extra["mfaId"] = .string(ids[out[i].extra["resourceId"]?.string ?? ""] ?? "")
+            }
+        }
         out.sort { namesAscending($0.name, $1.name) }
         return (out, idx.error)
     }

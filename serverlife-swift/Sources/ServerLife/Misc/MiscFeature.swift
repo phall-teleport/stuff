@@ -33,6 +33,9 @@ enum MiscFeature {
         }
 
         Tour.install()
+        MiscSearchUI.install()
+        // Once the settings are loaded: say so when this is not the usual Teleport set-up.
+        MiscTeleportReminder.run()
         MiscAppInfo.shared.refreshTshVersion()
     }
 }

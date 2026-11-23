@@ -12,6 +12,9 @@ struct ConnSpec: Sendable {
     var label: String
     /// `ssh -F`: the generated Teleport config, or the extra file an alias came from.
     var configFile: String?
+    /// An ssh_config alias's own IdentityFile (`host.identityFile`): offered
+    /// alone, so a full agent does not exhaust MaxAuthTries first.
+    var identityFile: String?
     var login: String?
     /// The Teleport node (or beam) descriptor.
     var node: Host?
@@ -34,6 +37,12 @@ struct ConnSpec: Sendable {
     var beamProxy: String?
     var x11Timeout: String?
     var timeout: TimeInterval?
+    /// The host's SSH options for this opening (sshoptions.js), normalised;
+    /// nil for a plain session.
+    var sshOptions: JSON?
+
+    /// Forwarding only (-N): the session holds the forwards and runs nothing.
+    var noShell: Bool { sshOptions?["noShell"].truthy ?? false }
 
     init(type: String, target: String, label: String? = nil) {
         self.type = type
@@ -66,6 +75,12 @@ struct ConnSpec: Sendable {
             // Offer only the Teleport certificate: an agent full of keys
             // exhausts MaxAuthTries before the cert is ever tried.
             a += ["-o", "IdentitiesOnly=yes"]
+        } else if let i = identityFile, !i.isEmpty {
+            // The same "too many authentication failures" risk, for a plain
+            // ssh_config alias whose Host block names an IdentityFile: ssh
+            // still tries every key the agent offers first unless told
+            // otherwise. A command-line -o wins over the config file's.
+            a += ["-o", "IdentitiesOnly=yes"]
         }
         if let controlPath { a += ["-o", "ControlPath=" + controlPath] }
         // -J overrides an alias's own ProxyJump; app-defined hosts get it via directArgs.
@@ -80,6 +95,10 @@ struct ConnSpec: Sendable {
         var a: [String] = []
         if let p = d.port, p != 0, p != 22 { a += ["-p", String(p)] }
         if let i = d.identityFile, !i.isEmpty { a += ["-i", i, "-o", "IdentitiesOnly=yes"] }
+        // No key at all, but meant to be reached by password (a saved SFTP
+        // profile with an empty "Private key"): skip every agent key, which a
+        // low MaxAuthTries would otherwise run out on before the password.
+        else if ConnSpec.identitiesOnly(d) { a += ["-o", "IdentitiesOnly=yes"] }
         if let j = d.proxyJump, !j.isEmpty { a += ["-J", j] }
         for raw in d.options ?? [] {
             for line in raw.components(separatedBy: "\n") {
@@ -91,6 +110,25 @@ struct ConnSpec: Sendable {
         // A host typed in by hand has no known key yet: accept on first use, pin thereafter.
         a += ["-o", "StrictHostKeyChecking=accept-new"]
         return a
+    }
+
+    /// `direct.identitiesOnly`. Read by reflection until Core's DirectSpec
+    /// carries the key (requested from the lead); `host.extra` cannot hold
+    /// it, being top-level only.
+    static func identitiesOnly(_ d: DirectSpec) -> Bool {
+        for c in Mirror(reflecting: d).children where c.label == "identitiesOnly" {
+            if let b = c.value as? Bool { return b }
+            if let b = c.value as? Bool?, let v = b { return v }
+        }
+        return false
+    }
+
+    /// The host's SSH options as OpenSSH flags (`optionArgs`). They go on the
+    /// master, where forwards are negotiated; sessions over a mux inherit
+    /// them, so `session` adds nothing on macOS (SUPPORTS_MUX).
+    func optionArgs(session: Bool = false) -> [String] {
+        guard let o = sshOptions, !session else { return [] }
+        return SSHOptions.opensshArgs(o)
     }
 
     static let leadingDashO = ConnText.re(#"^-o\s*"#)
@@ -122,19 +160,21 @@ struct ConnSpec: Sendable {
 
     /// The ControlMaster itself, held in the foreground on our pty.
     func masterArgs(controlPath: String) -> [String] {
-        sshArgs(controlPath: controlPath, ConnSpec.baseOpts + x11Args() + featureArgs() + ["-N", target])
+        sshArgs(controlPath: controlPath, ConnSpec.baseOpts + x11Args() + featureArgs() + optionArgs() + ["-N", target])
     }
 
     /// An interactive shell (or a command) over the master.
     func terminalSshArgs(controlPath: String, command: String?) -> [String] {
-        var a = sshArgs(controlPath: controlPath, x11Args() + featureArgs() + ["-tt", target])
+        let ns = command == nil && noShell ? ["-N"] : []
+        var a = sshArgs(controlPath: controlPath,
+                        x11Args() + featureArgs() + optionArgs(session: true) + ns + ["-tt", target])
         if let command { a.append(command) }
         return a
     }
 
     /// A command on a pty that the caller owns (tmux control mode): no X11.
     func commandPtySshArgs(controlPath: String, command: String) -> [String] {
-        sshArgs(controlPath: controlPath, featureArgs() + ["-tt", target, command])
+        sshArgs(controlPath: controlPath, featureArgs() + optionArgs(session: true) + ["-tt", target, command])
     }
 
     // MARK: - tsh
@@ -163,7 +203,9 @@ struct ConnSpec: Sendable {
         a.append("ssh")
         if let c = node?.cluster, !c.isEmpty { a.append("--cluster=" + c) }
         if agentForward { a.append("-A") }
-        if x11 == "trusted" || x11 == "untrusted" { a.append("-X") }
+        // tsh spells trusted forwarding -Y, as OpenSSH does.
+        if x11 == "trusted" { a.append("-Y") } else if x11 == "untrusted" { a.append("-X") }
+        if let o = sshOptions { a += SSHOptions.tshArgs(o) }
         a += extra
         a.append(tshTarget())
         if let command { a.append(command) }
@@ -219,7 +261,7 @@ struct ConnSpec: Sendable {
     func terminalInvocation(controlPath: String, command: String?) -> (exe: String, args: [String]) {
         switch transport {
         case .beam: return (Tools.tsh, beamArgs(command: command))
-        case .tsh: return (Tools.tsh, tshArgs([], command: command))
+        case .tsh: return (Tools.tsh, tshArgs(command == nil && noShell ? ["-N"] : [], command: command))
         case .mux: return (Tools.ssh, terminalSshArgs(controlPath: controlPath, command: command))
         }
     }

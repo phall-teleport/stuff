@@ -9,7 +9,7 @@ enum Backup {
 
     /// What "everything" means. History is left out: it is a log, not a setting.
     static let fullKeys = ["profiles", "folders", "snippets", "macros", "hiddenMacros", "macroCategoryOrder",
-                           "requestTemplates", "layouts", "defaultLayoutId", "settings"]
+                           "macroOrder", "requestTemplates", "layouts", "defaultLayoutId", "settings"]
     /// Keys that are lists of records, and so can be merged rather than replaced.
     static let listKeys = ["profiles", "folders", "snippets", "macros", "requestTemplates", "layouts"]
 
@@ -40,15 +40,16 @@ enum Backup {
     }
 
     /// `exportMacros`: the user's own macros (built-ins exist on the other
-    /// machine already), plus hidden built-in ids and the category order
-    /// unless only some ids were asked for.
+    /// machine already), plus hidden built-in ids, the category order and the
+    /// dragged macro order unless only some ids were asked for.
     static func exportMacros(_ store: Store, _ ids: [String]?) -> JSON {
         let all = store["macros"].items
         let some = ids?.isEmpty == false
         let macros = some ? all.filter { ids!.contains($0["id"].string ?? "") } : all
         return envelope("macros", ["macros": .array(macros),
                                    "hiddenMacros": some ? [] : .array(store["hiddenMacros"].items),
-                                   "macroCategoryOrder": some ? [] : .array(store["macroCategoryOrder"].items)],
+                                   "macroCategoryOrder": some ? [] : .array(store["macroCategoryOrder"].items),
+                                   "macroOrder": some ? [] : .array(store["macroOrder"].items)],
                         ["counts": ["macros": JSON(macros.count)]])
     }
 
@@ -94,7 +95,7 @@ enum Backup {
             store[k] = .array(existing + fresh)
             added[k] = JSON(fresh.count)
         }
-        for k in ["hiddenMacros", "macroCategoryOrder"] {
+        for k in ["hiddenMacros", "macroCategoryOrder", "macroOrder"] {
             guard let incoming = d[k].array else { continue }
             if mode == "replace" { store[k] = .array(incoming); continue }
             // `[...new Set([...existing, ...incoming])]`

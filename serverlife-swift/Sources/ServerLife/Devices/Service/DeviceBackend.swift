@@ -54,10 +54,6 @@ final class DeviceBackend: TerminalBackend {
     private var exitDelivered = false
     private var decoder = UTF8Carry()
 
-    /// Every write to the line goes through this one serial queue, so
-    /// keystrokes, negotiation replies and window sizes leave in the order
-    /// they were made and never interleave — and never block the main thread.
-    private let writeQueue = DispatchQueue(label: "device.write", qos: .userInitiated)
     // serial
     private var serial: SerialPortHandle?
     // telnet
@@ -183,9 +179,9 @@ final class DeviceBackend: TerminalBackend {
     private func telnetReceived(_ chunk: [UInt8]) {
         let r = Telnet.parse(telnet, chunk)
         telnet = r.state
-        if !r.replies.isEmpty { send(r.replies) }
+        if !r.replies.isEmpty { try? socket?.write(r.replies) }
         // The size is only worth sending once they have agreed to hear it.
-        if r.sawNaws { send(Telnet.nawsFrame(cols: cols, rows: rows)) }
+        if r.sawNaws { try? socket?.write(Telnet.nawsFrame(cols: cols, rows: rows)) }
         if !r.data.isEmpty { received(r.data) }
     }
 
@@ -241,22 +237,13 @@ final class DeviceBackend: TerminalBackend {
         // Local echo, for the consoles that do none (off unless asked for: a
         // far end that echoes too shows everything twice).
         if localEcho { say(Data(text)) }
-        if serial != nil {
-            send(text)
-        } else if socket != nil {
-            // 0xFF in user input has to be doubled.
-            send(text.contains(Telnet.IAC) ? Telnet.escapeIAC(text) : text)
-        }
-    }
-
-    /// Queue bytes for the line, in order.
-    private func send(_ bytes: [UInt8]) {
-        guard !bytes.isEmpty else { return }
-        let d = Data(bytes)
         if let serial {
-            writeQueue.async { serial.write(d) }
+            let d = Data(text)
+            DispatchQueue.global(qos: .userInitiated).async { serial.write(d) }
         } else if let socket {
-            writeQueue.async { try? socket.write(d) }
+            // 0xFF in user input has to be doubled.
+            let out = text.contains(Telnet.IAC) ? Telnet.escapeIAC(text) : text
+            DispatchQueue.global(qos: .userInitiated).async { try? socket.write(out) }
         }
     }
 
@@ -265,14 +252,14 @@ final class DeviceBackend: TerminalBackend {
         self.rows = rows
         // A serial line has no idea how big your window is and no way to be
         // told; `stty rows/cols` on the far side is the user's to give.
-        if kind == "telnet", socket != nil, telnet?.agreed.contains(Telnet.OPT_NAWS) == true {
-            send(Telnet.nawsFrame(cols: cols, rows: rows))
+        if kind == "telnet", let socket, telnet?.agreed.contains(Telnet.OPT_NAWS) == true {
+            try? socket.write(Telnet.nawsFrame(cols: cols, rows: rows))
         }
     }
 
     func close() {
         guard ended == nil else { return }
-        if let serial { writeQueue.async { serial.close() } }
+        serial?.close()
         socket?.close()
         end("closed from this end")
     }

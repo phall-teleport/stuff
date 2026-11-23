@@ -8,6 +8,7 @@ import Observation
 @Observable
 final class SessionsWindow: WindowFeature {
     @ObservationIgnored weak var window: WindowModel?
+    @ObservationIgnored var onNextActivePane: (() -> Void)?
     var tabs: [SessionTab] = []
     var panes: [String: SessionPane] = [:]
     var activeTabId: String?
@@ -96,6 +97,8 @@ final class SessionsWindow: WindowFeature {
     func setActivePane(_ id: String?) {
         guard activePaneId != id else { return }
         activePaneId = id
+        // A bare split waiting for a pane to be clicked (splitActivePane).
+        if let k = onNextActivePane { onNextActivePane = nil; k() }
         guard let p = pane(id) else { return }
         if p.tabId != activeTabId { activeTabId = p.tabId }
         tab(p.tabId)?.lastPaneId = p.id
@@ -155,6 +158,8 @@ final class SessionsWindow: WindowFeature {
         wireTerm(p)
         addPane(p)
         p.applyHighlightSettings()
+        // The look remembered for this host, if any (panestyle.js).
+        PaneStyle.apply(p)
         // A console and a screen open without the file browser; a tmux pane
         // keeps it — there is a real host under it.
         let explorers = Store.shared.settingJSON("explorersVisible").bool != false
@@ -189,6 +194,7 @@ final class SessionsWindow: WindowFeature {
     func attach(_ p: SessionPane, _ backend: TerminalBackend) {
         p.backend = backend
         p.hasTerm = true
+        p.showReconnect = false
         p.status = "connected"
         backend.onData = { [weak p] d in
             guard let p, let owner = p.owner else { return }
@@ -335,8 +341,13 @@ final class SessionsWindow: WindowFeature {
         p.hasTerm = false
         p.status = "closed"
         let why = reason.map { " — \($0)" } ?? ((code ?? 0) != 0 ? " — exit \(code!)" : "")
-        p.term?.writeln("\r\n\u{1b}[90m[session ended\(why)]\u{1b}[0m")
+        // 12-hour with the timezone named: this line is the one most likely
+        // to get pasted to someone in a different zone.
+        p.term?.writeln("\r\n\u{1b}[90m[session ended\(why) — \(Fmt.dateTimeTz(ms: nowMs()))]\u{1b}[0m")
         if p.kind == .device { offerReconnect(p) }
+        // A local shell has nothing to reconnect to; every other kind gets
+        // the button, device included.
+        if p.kind != .local { p.showReconnect = true }
         offerMfaAlternatives(p)
         changed()
     }
@@ -365,21 +376,77 @@ final class SessionsWindow: WindowFeature {
 
     /// Stop whatever this pane was running.
     func endPaneSession(_ p: SessionPane) {
+        // Every way a pane ends comes through here — a pane closed, a tab
+        // closed — so this is where it leaves its host's live stats; the
+        // last one stops them.
+        PaneStats.shared.detach(p)
         stopLog(p)
         if let b = p.backend {
             p.backend = nil
             b.onData = nil
             b.onExit = nil
-            b.close()
+            if p.kind == .local {
+                // Read before the close, and waited out before it: the cwd is
+                // a real read of the shell process, the close is close to
+                // instant, and fired both at once the kill routinely won.
+                Task { @MainActor in
+                    if let cwd = await b.cwd() { SessionsCore.lastLocalCwd = cwd }
+                    b.close()
+                }
+            } else {
+                b.close()
+            }
         }
         p.hasTerm = false
     }
 
+    /// Close a pane because a person asked to — its ✕, ⌘W, *Close pane*. For
+    /// a tmux pane that means closing it in tmux as well, and tmux's next
+    /// layout removes it here; anything else, or a tmux pane no longer
+    /// attached, closes as before.
+    func closePaneByHand(_ paneId: String) async {
+        if let p = pane(paneId), p.kind == .tmux, Actions.shared.isRegistered("tmux-kill-pane") {
+            let handled: Bool = await withCheckedContinuation { cont in
+                var done = false
+                Actions.shared.perform("tmux-kill-pane", window: window, paneId: paneId, args: ["reply": { (v: Any?) in
+                    guard !done else { return }
+                    done = true
+                    cont.resume(returning: (v as? Bool) ?? false)
+                } as (Any?) -> Void])
+            }
+            if handled { return }
+        }
+        closePane(paneId)
+    }
+
+    /// Fix muddled text (sessions.js `redrawPane`): the view repaints, and a
+    /// program that draws its own screen is told one column narrower and
+    /// then the real width — two resizes, nothing on screen moves.
+    func redrawPane(_ p: SessionPane) {
+        guard let v = p.term else { return }
+        v.redraw()
+        let t = v.getTerminal()
+        let cols = t.cols, rows = t.rows
+        // tmux sizes its own windows; redrawing the view is all that is ours to do.
+        guard let b = p.backend, p.kind != .tmux, cols >= 3 else { return }
+        b.resize(cols: cols - 1, rows: rows)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard self?.pane(p.id) != nil, let b = p.backend, let t = p.term?.getTerminal() else { return }
+            b.resize(cols: t.cols, rows: t.rows)
+        }
+    }
+
     /// Close a pane and what runs in it. Unconditional: `requestClosePane`
     /// is the one that asks.
-    func closePane(_ paneId: String) {
+    func closePane(_ paneId: String, animate: Bool = true) {
         guard let p = pane(paneId) else { return }
         let tabId = p.tabId
+        // The session ends for real below; the show, when there is one, is
+        // only a picture of the pane taken first. `animate: false` is for a
+        // close that is not really anyone closing anything (a reopen under
+        // another transport, a failed tmux attach).
+        let shot = animate && PaneClose.shouldAnimate && p.tabId == activeTabId ? PaneClose.capture(p, in: window?.nsWindow) : nil
+        defer { if let shot { PaneClose.play(shot) } }
         SessionHooks.paneClosing.forEach { $0(p) }
         endPaneSession(p)
         let connId = p.connId
@@ -396,13 +463,18 @@ final class SessionsWindow: WindowFeature {
     }
 
     /// Close a tab. Its connection goes once nothing else uses it.
-    func closeTab(_ tabId: String, skipPanes: Bool = false, extraConns: [String] = []) {
+    func closeTab(_ tabId: String, skipPanes: Bool = false, extraConns: [String] = [], animate: Bool = false) {
         guard let t = tab(tabId) else { return }
         var conns = extraConns
         if let c = t.connId { conns.append(c) }
         if !skipPanes {
+            // Every pane the tab carries down plays its close at once.
+            let play = animate && PaneClose.shouldAnimate && tabId == activeTabId
             for pid in t.paneIds {
                 guard let p = pane(pid) else { continue }
+                if play, let shot = PaneClose.capture(p, in: window?.nsWindow) {
+                    DispatchQueue.main.async { PaneClose.play(shot) }
+                }
                 SessionHooks.paneClosing.forEach { $0(p) }
                 endPaneSession(p)
                 if let c = p.connId { conns.append(c) }

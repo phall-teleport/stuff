@@ -4,7 +4,7 @@ import Foundation
 /// remembered logins, MFA hosts, agent forwarding / tmux / file browser at
 /// three levels, colour, icon, careful, stars, hidden hosts, the manual host
 /// order and group order. Same settings keys as the original; per-host prefs
-/// are keyed by `host.prefKey`, per-cluster by `host.clusterPrefKey`.
+/// are keyed by `host.sbPrefKey`, per-cluster by `host.clusterPrefKey`.
 @MainActor
 enum HostPrefs {
     private static var s: JSON { SB.store.settings }
@@ -31,11 +31,11 @@ enum HostPrefs {
     // MARK: Logins
 
     /// The username set deliberately for this host, if any.
-    static func preferredUser(_ host: Host) -> String { s["hostUsers"][host.prefKey].string ?? "" }
+    static func preferredUser(_ host: Host) -> String { s["hostUsers"][host.sbPrefKey].string ?? "" }
 
     static func setPreferredUser(_ host: Host, _ value: String) {
         var map = s["hostUsers"].entries
-        if value.isEmpty { map.removeValue(forKey: host.prefKey) } else { map[host.prefKey] = .string(value) }
+        if value.isEmpty { map.removeValue(forKey: host.sbPrefKey) } else { map[host.sbPrefKey] = .string(value) }
         set("hostUsers", .object(map))
         say(value.isEmpty ? "Preferred username cleared" : "\(label(host)) will connect as \(value)")
     }
@@ -75,7 +75,7 @@ enum HostPrefs {
     // MARK: Three-level switches
 
     private static func level(_ host: Host, hostKey: String, clusterKey: String, defaultOn: Bool) -> Level {
-        let hk = host.prefKey
+        let hk = host.sbPrefKey
         if !hk.isEmpty, let v = s[hostKey].object?[hk] { return Level(on: v.truthy, from: "host") }
         let ck = host.clusterPrefKey
         if !ck.isEmpty, let v = s[clusterKey].object?[ck] { return Level(on: v.truthy, from: "cluster") }
@@ -99,7 +99,7 @@ enum HostPrefs {
     }
 
     static func setAgentForward(_ host: Host, _ value: Bool?) {
-        setLevel("agentForwardHosts", host.prefKey, value)
+        setLevel("agentForwardHosts", host.sbPrefKey, value)
         let st = agentForward(host)
         say(value == nil
             ? "\(label(host)): agent forwarding follows the \(st.from) setting (\(st.on ? "on" : "off"))"
@@ -127,13 +127,13 @@ enum HostPrefs {
 
     /// The tmux session to attach to: per host if said, else the global name.
     static func tmuxName(_ host: Host) -> String {
-        let hk = host.prefKey
+        let hk = host.sbPrefKey
         if !hk.isEmpty, let n = s["tmuxSessionNames"][hk].string, !n.isEmpty { return n }
         return s["tmuxSessionName"].string?.nilIfEmpty ?? "serverlife"
     }
 
     static func setTmux(_ host: Host, _ value: Bool?) {
-        setLevel("tmuxHosts", host.prefKey, value)
+        setLevel("tmuxHosts", host.sbPrefKey, value)
         let st = tmux(host)
         say(value == nil
             ? "\(label(host)): follows the \(st.from == "cluster" ? "cluster" : "global") setting (\(st.on ? "tmux" : "plain session"))"
@@ -155,7 +155,7 @@ enum HostPrefs {
     static func setTmuxName(_ host: Host, _ name: String) {
         var names = s["tmuxSessionNames"].entries
         let n = name.trimmed
-        if n.isEmpty { names.removeValue(forKey: host.prefKey) } else { names[host.prefKey] = .string(n) }
+        if n.isEmpty { names.removeValue(forKey: host.sbPrefKey) } else { names[host.sbPrefKey] = .string(n) }
         set("tmuxSessionNames", .object(names))
         say("tmux session: \(tmuxName(host))")
     }
@@ -171,7 +171,7 @@ enum HostPrefs {
     static func opensWithFiles(_ host: Host) -> Bool { openFiles(host).on }
 
     static func setOpenFiles(_ host: Host, _ value: Bool?) {
-        setLevel("openFilesHosts", host.prefKey, value)
+        setLevel("openFilesHosts", host.sbPrefKey, value)
         let st = openFiles(host)
         say(value == nil
             ? "\(label(host)): the file browser follows the \(st.from) setting (\(st.on ? "on" : "off"))"
@@ -188,7 +188,7 @@ enum HostPrefs {
 
     // MARK: Colour, icon, careful
 
-    static func hostColorValue(_ host: Host) -> String { s["hostColors"][host.prefKey].string ?? "" }
+    static func hostColorValue(_ host: Host) -> String { s["hostColors"][host.sbPrefKey].string ?? "" }
     static func hostColorHex(_ host: Host) -> String {
         let v = hostColorValue(host)
         return HostColor.all.first { $0.value == v && !v.isEmpty }?.hex ?? ""
@@ -196,25 +196,25 @@ enum HostPrefs {
 
     static func setHostColor(_ host: Host, _ value: String) {
         var map = s["hostColors"].entries
-        if value.isEmpty { map.removeValue(forKey: host.prefKey) } else { map[host.prefKey] = .string(value) }
+        if value.isEmpty { map.removeValue(forKey: host.sbPrefKey) } else { map[host.sbPrefKey] = .string(value) }
         set("hostColors", .object(map))
         say(value.isEmpty ? "Colour cleared for \(label(host))" : "\(label(host)) is \(value)")
     }
 
-    static func hostIcon(_ host: Host) -> String { s["hostIcons"][host.prefKey].string ?? "" }
+    static func hostIcon(_ host: Host) -> String { s["hostIcons"][host.sbPrefKey].string ?? "" }
 
     static func setHostIcon(_ host: Host, _ icon: String) {
         var map = s["hostIcons"].entries
-        if icon.isEmpty { map.removeValue(forKey: host.prefKey) } else { map[host.prefKey] = .string(icon) }
+        if icon.isEmpty { map.removeValue(forKey: host.sbPrefKey) } else { map[host.sbPrefKey] = .string(icon) }
         set("hostIcons", .object(map))
         say(icon.isEmpty ? "Icon cleared" : "\(label(host)) is \(icon)")
     }
 
-    static func isCareful(_ host: Host) -> Bool { s["carefulHosts"].stringArray.contains(host.prefKey) }
+    static func isCareful(_ host: Host) -> Bool { s["carefulHosts"].stringArray.contains(host.sbPrefKey) }
 
     static func setCareful(_ host: Host, _ on: Bool) {
-        var list = s["carefulHosts"].stringArray.filter { $0 != host.prefKey }
-        if on { list.append(host.prefKey) }
+        var list = s["carefulHosts"].stringArray.filter { $0 != host.sbPrefKey }
+        if on { list.append(host.sbPrefKey) }
         set("carefulHosts", JSON(list))
         say(on ? "\(label(host)) is marked careful — multi-exec will ask first"
                : "\(label(host)) is no longer marked careful")

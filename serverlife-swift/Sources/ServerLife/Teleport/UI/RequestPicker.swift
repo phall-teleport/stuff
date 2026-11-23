@@ -63,7 +63,7 @@ struct TUILabelChip: View {
 enum RequestPicker {
     static let kindLabels: [String: String] = [
         "node": "Servers", "app": "Applications", "db": "Databases", "kube_cluster": "Kubernetes clusters",
-        "windows_desktop": "Windows desktops", "linux_desktop": "Linux desktops", "user_group": "User groups",
+        "kube_resource": "Kubernetes namespaces/pods", "windows_desktop": "Windows desktops", "linux_desktop": "Linux desktops", "user_group": "User groups",
         "saml_idp_service_provider": "SAML applications", "git_server": "Git servers",
         "aws_ic_account": "AWS accounts", "aws_ic_account_assignment": "AWS account assignments",
     ]
@@ -74,13 +74,19 @@ enum RequestPicker {
         var title: String?
         var subtitle: String?
         var confirmLabel: String?
+        /// A caller that already knows which kind and cluster it means — the
+        /// kube browser's "Request namespace/pod access…", a requestable kube
+        /// cluster's "Request a namespace or pod…" — skips both dropdowns.
+        var initialKind: String?
+        var initialKubeCluster: String?
     }
 
     /// `pickRequestResources`: nil when cancelled.
     static func pickResources(_ profile: TeleportProfile, preselected: [ReqResource] = [], opts: Options = Options(),
                               window: WindowModel? = nil) async -> [ReqResource]? {
-        let m = ResourcePickerModel(profile: profile, preselected: preselected)
-        m.load()
+        let m = ResourcePickerModel(profile: profile, preselected: preselected,
+                                    initialKind: opts.initialKind, initialKubeCluster: opts.initialKubeCluster)
+        m.onKindChanged()
         return await TUIModal.ask(window, title: opts.title ?? "Request access to…", width: 820, height: 600,
                                   autosave: "requestpicker") { finish, _ in
             ResourcePickerView(m: m, opts: opts, finish: finish)
@@ -100,29 +106,132 @@ enum RequestPicker {
 @MainActor
 final class ResourcePickerModel: ObservableObject {
     let profile: TeleportProfile
-    let kinds = Teleport.requestKinds
-    @Published var kind = "node" { didSet { if kind != oldValue { load() } } }
+    let kinds: [String]
+    @Published var kind = "node" { didSet { if kind != oldValue { onKindChanged() } } }
     @Published var search = ""
     @Published var loading = false
     @Published var result: TshList<RequestableResource>?
     /// Insertion-ordered selection (a JS Map).
     @Published var chosen: [ReqResource]
+    /// Search result id → the inventory id the resource will carry once
+    /// granted, for the MFA mark (nodes and kube clusters only).
+    @Published var hostIds: [String: String] = [:]
+    /// Bumped when an MFA mark changes, so the rows redraw.
+    @Published var mfaTick = 0
 
-    init(profile: TeleportProfile, preselected: [ReqResource]) {
+    // kind kube_resource scoping — meaningless without a kube cluster to
+    // search inside, unlike every other kind here.
+    let initialKubeCluster: String?
+    @Published var kubeCluster = "" { didSet { if kubeCluster != oldValue && kind == "kube_resource" { load() } } }
+    @Published var kubeClusterOptions: [String] = []
+    @Published var kubeClustersLoading = false
+    private var kubeClustersLoaded = false
+    /// --kube-kind: "namespaces" | "pods".
+    @Published var subKind = "namespaces" { didSet { if subKind != oldValue { load() } } }
+    @Published var namespace = "default"
+    @Published var allNamespaces = false { didSet { if allNamespaces != oldValue { load() } } }
+    private var gen = 0
+
+    init(profile: TeleportProfile, preselected: [ReqResource], initialKind: String? = nil, initialKubeCluster: String? = nil,
+         kubeEnabled: Bool? = nil) {
+        let kubeEnabled = kubeEnabled ?? Store.shared.setting("kubeEnabled", true)
         self.profile = profile
         var seen = Set<String>()
         chosen = preselected.filter { seen.insert($0.id).inserted }
+        // A pure-SSH setup with KubeLife off never sees the Kubernetes kinds.
+        var ks = Teleport.requestKinds
+        if !kubeEnabled { ks = ks.filter { $0 != "kube_cluster" && $0 != "kube_resource" } }
+        kinds = ks
+        self.initialKubeCluster = initialKubeCluster
+        var k = "node"
+        if let i = initialKind, ks.contains(i) { k = i }
+        if (k == "kube_cluster" || k == "kube_resource") && !ks.contains(k) { k = ks.first ?? "node" }
+        kind = k
+    }
+
+    func onKindChanged() {
+        if kind != "kube_resource" { load(); return }
+        Task { @MainActor in
+            await ensureKubeClusters()
+            load()
+        }
+    }
+
+    func ensureKubeClusters() async {
+        if kubeClustersLoaded { return }
+        kubeClustersLoaded = true
+        kubeClustersLoading = true
+        let r = await Teleport.searchRequestable(proxy: profile.proxy, kind: "kube_cluster", home: profile.homeDir)
+        var names = r.ok ? r.items.map(\.name) : []
+        // A caller's own cluster is routinely not among the "could additionally
+        // request" results (standing access already covers it); it still needs
+        // to be searchable for namespaces/pods, so it is added.
+        if let c = initialKubeCluster?.nilIfEmpty, !names.contains(c) { names.insert(c, at: 0) }
+        kubeClustersLoading = false
+        kubeClusterOptions = names
+        let pick = initialKubeCluster.flatMap { names.contains($0) ? $0 : nil } ?? names.first ?? ""
+        // Set without the didSet's load: the caller loads next.
+        suppressKubeLoad = true
+        kubeCluster = pick
+        suppressKubeLoad = false
+    }
+
+    private var suppressKubeLoad = false
+
+    func setNamespace(_ v: String) {
+        let n = v.trimmed.nilIfEmpty ?? "default"
+        if n != namespace { namespace = n; load() }
     }
 
     func load() {
+        if suppressKubeLoad { return }
+        gen += 1
+        let g = gen
+        if kind == "kube_resource" && kubeCluster.isEmpty {
+            if kubeClustersLoading { loading = true; return }
+            result = .failed("No Kubernetes cluster to search within.")
+            loading = false
+            return
+        }
         loading = true
-        let p = profile, k = kind
+        let p = profile, k = kind, kc = kubeCluster, sk = subKind, ns = namespace, allNs = allNamespaces
         Task { @MainActor in
-            let r = await Teleport.searchRequestable(proxy: p.proxy, kind: k, home: p.homeDir)
-            guard k == self.kind else { return }
+            let r: TshList<RequestableResource>
+            if k == "kube_resource" {
+                r = await Teleport.searchRequestable(proxy: p.proxy, kind: k, kubeCluster: kc, kubeKind: sk,
+                                                     namespace: sk == "pods" && !allNs ? ns : nil,
+                                                     allNamespaces: sk == "pods" && allNs, home: p.homeDir)
+            } else {
+                r = await Teleport.searchRequestable(proxy: p.proxy, kind: k, home: p.homeDir)
+            }
+            guard g == self.gen else { return }
+            // Servers and kube clusters only: the MFA list is a thing
+            // per-session SSH and per-session kube both ask for.
+            var ids: [String: String] = [:]
+            if r.ok && k == "node" {
+                ids = Teleport.inventoryNodeIds(r.items.map { ($0.id, $0.cluster, $0.uuid) }, home: p.homeDir)
+            } else if r.ok && k == "kube_cluster" {
+                ids = Teleport.inventoryKubeIds(r.items.map { ($0.id, $0.cluster, $0.name) }, home: p.homeDir)
+            }
+            self.hostIds = ids
             self.result = r
             self.loading = false
         }
+    }
+
+    /// `mfaToggle`: a server not yet granted can still be told it needs MFA —
+    /// the flag waits in the same `mfaHosts` list, keyed by the id the node
+    /// will carry once the grant lands.
+    func isMfa(_ r: RequestableResource) -> Bool? {
+        guard let id = hostIds[r.id], !id.isEmpty else { return nil }
+        return HostPrefs.isMfaHost(id)
+    }
+
+    func toggleMfa(_ r: RequestableResource) {
+        guard let id = hostIds[r.id], !id.isEmpty else { return }
+        let h = Host(type: Host.teleport, id: id, name: r.name.nilIfEmpty ?? r.uuid)
+        HostPrefs.setMfaHost(h, !HostPrefs.isMfaHost(id))
+        mfaTick += 1
     }
 
     var visible: [RequestableResource] {
@@ -159,6 +268,7 @@ private struct ResourcePickerView: View {
                     Spacer()
                     if !m.chosen.isEmpty { Badge(text: "\(m.chosen.count) selected") }
                 }
+                if m.kind == "kube_resource" { kubeRow }
                 SearchField(placeholder: "Filter by name or label…", text: $m.search).focused($focused)
                 ScrollView { list.frame(maxWidth: .infinity, alignment: .leading) }
                     .frame(maxHeight: .infinity)
@@ -172,6 +282,36 @@ private struct ResourcePickerView: View {
             }.buttonStyle(.primary)
         }
         .onAppear { after(0.05) { focused = true } }
+    }
+
+    @StateObject private var nsText = Local("default")
+
+    private var kubeRow: some View {
+        let p = Theme.shared.p
+        return HStack(spacing: 8) {
+            Text("Cluster").font(.system(size: 11.5)).foregroundStyle(p.muted)
+            Picker("", selection: $m.kubeCluster) {
+                if m.kubeClustersLoading { Text("Loading…").tag("") }
+                else if m.kubeClusterOptions.isEmpty { Text("No Kubernetes clusters found").tag("") }
+                ForEach(m.kubeClusterOptions, id: \.self) { Text($0).tag($0) }
+            }.labelsHidden().frame(width: 200)
+            Text("Kind").font(.system(size: 11.5)).foregroundStyle(p.muted)
+            Picker("", selection: $m.subKind) {
+                Text("Namespaces").tag("namespaces")
+                Text("Pods").tag("pods")
+            }.labelsHidden().frame(width: 120)
+            if m.subKind == "pods" {
+                Text("Namespace").font(.system(size: 11.5)).foregroundStyle(p.muted)
+                TextField("default", text: $nsText.value)
+                    .textFieldStyle(.roundedBorder).frame(width: 120)
+                    .disabled(m.allNamespaces).opacity(m.allNamespaces ? 0.5 : 1)
+                    .onSubmit { m.setNamespace(nsText.value) }
+                Toggle("every namespace", isOn: $m.allNamespaces).toggleStyle(.checkbox)
+                    .font(.system(size: 11.5)).foregroundStyle(p.muted)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.top, 2)
     }
 
     @ViewBuilder private var list: some View {
@@ -208,6 +348,18 @@ private struct ResourcePickerView: View {
                                     }
                                 }
                                 Spacer(minLength: 0)
+                                if let mfa = m.isMfa(r) {
+                                    let _ = m.mfaTick
+                                    Button { m.toggleMfa(r) } label: {
+                                        Text("mfa").font(.system(size: 10, design: .monospaced))
+                                            .foregroundStyle(mfa ? p.amber : p.muted)
+                                            .padding(.horizontal, 5).padding(.vertical, 1)
+                                            .background(RoundedRectangle(cornerRadius: 3).fill(mfa ? p.amber.opacity(0.15) : p.panel3))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(mfa ? "Marked to need MFA once granted — click to forget"
+                                          : "Mark as needing MFA once granted, so it connects straight away")
+                                }
                             }
                             .padding(.horizontal, 8).padding(.vertical, 6)
                             .background(RoundedRectangle(cornerRadius: 4).fill(on ? p.accent.opacity(0.1) : p.panel2))

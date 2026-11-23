@@ -80,12 +80,37 @@ enum Heartbeat {
         return v == "hide" || v == "only" ? v! : "all"
     }
 
-    /// "<1m", "7m", "1h 10m"; "" when there is no age.
-    static func ageLabel(_ node: Host?) -> String {
-        guard let age = heartbeatAge(node) else { return "" }
-        let mins = Int((age / 60000).rounded(.down))
+    /// Settings → Heartbeat times: "relative" (the default: <1m, 2m, 1h 5m) or
+    /// "exact" (the clock time it was heard, 14:32:05). The tooltip always
+    /// gives the exact time. SSH and Kubernetes rows alike.
+    static var exactHeartbeats: Bool { settings["heartbeatStyle"].string == "exact" }
+
+    nonisolated static func beatClock(_ at: Double) -> String {
+        let f = DateFormatter()
+        f.setLocalizedDateFormatFromTemplate("jjmmss")
+        return f.string(from: Date(timeIntervalSince1970: at / 1000))
+    }
+
+    /// How a heartbeat's time reads on a row; `at` is when it happened, in ms.
+    static func beatText(_ at: Double, now: Double? = nil) -> String {
+        if exactHeartbeats { return beatClock(at) }
+        let mins = Int((max(0, (now ?? clock()) - at) / 60000).rounded(.down))
         if mins < 1 { return "<1m" }
         return mins < 60 ? "\(mins)m" : "\(mins / 60)h \(mins % 60)m"
+    }
+
+    /// When a node's last heartbeat happened (ms), or nil — its age is as of
+    /// the moment its list was read.
+    static func heartbeatAt(_ node: Host?) -> Double? {
+        guard let node, let age = heartbeatAge(node) else { return nil }
+        return (seenAt[keyFor(node)] ?? clock()) - age
+    }
+
+    /// "<1m", "7m", "1h 10m" (or the clock time); "" when there is no age.
+    static func ageLabel(_ node: Host?) -> String {
+        guard let node, let at = heartbeatAt(node) else { return "" }
+        // Relative to the read, as the age always has been.
+        return beatText(at, now: seenAt[keyFor(node)] ?? clock())
     }
 
     /// Is this node overdue, by the user's own definition?
@@ -98,7 +123,9 @@ enum Heartbeat {
 
     /// The age as a badge, or "" for a node that is not stale.
     static func staleLabel(_ node: Host?) -> String {
-        guard isStale(node), let age = heartbeatAge(node) else { return "" }
+        guard isStale(node), let at = heartbeatAt(node) else { return "" }
+        if exactHeartbeats { return beatClock(at) }
+        let age = heartbeatAge(node) ?? 0
         let mins = Int((age / 60000).rounded(.down))
         return mins < 60 ? "\(mins)m" : "\(mins / 60)h \(mins % 60)m"
     }
@@ -107,7 +134,8 @@ enum Heartbeat {
     static func heartbeatLine(_ node: Host?) -> String {
         guard let node, let age = heartbeatAge(node) else { return "" }
         let mins = Int((age / 60000).rounded(.down))
-        let when = mins < 1 ? "\(Int((age / 1000).rounded(.down)))s ago" : staleAgeText(mins)
+        let when = (mins < 1 ? "\(Int((age / 1000).rounded(.down)))s ago" : staleAgeText(mins))
+            + ", at \(beatClock(heartbeatAt(node) ?? clock()))"
         if !isStale(node) { return "last heartbeat: \(when)" }
         let key = keyFor(node)
         let ttl = ttls[key] ?? 0

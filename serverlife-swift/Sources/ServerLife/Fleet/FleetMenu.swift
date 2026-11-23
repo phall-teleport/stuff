@@ -67,6 +67,18 @@ final class FleetMenu {
 
     static func closeAll() { current?.close() }
 
+    /// The height of the screen under the pointer, for a menu deciding what to fold.
+    static func screenRoom() -> CGFloat {
+        let p = NSEvent.mouseLocation
+        return ((NSScreen.screens.first { $0.frame.contains(p) } ?? NSScreen.main)?.visibleFrame.height) ?? 900
+    }
+
+    /// How tall these items draw, unscrolled (the menu's `scrollHeight`).
+    static func contentHeight(_ items: [FleetMenuItem]) -> CGFloat {
+        NSHostingView(rootView: AnyView(FleetMenuView(items: items, menu: FleetMenu(), level: 0, scroll: false).themed()))
+            .fittingSize.height
+    }
+
     private func screenFrame(near p: NSPoint) -> NSRect {
         (NSScreen.screens.first { $0.frame.contains(p) } ?? NSScreen.main)?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1400, height: 900)

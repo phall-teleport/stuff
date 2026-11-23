@@ -54,6 +54,18 @@ final class FleetWindow: WindowFeature {
     var expanded: [String: Bool] = [:]
     /// Bumped to make the history list re-read the store.
     var historyRevision = 0
+    /**
+     * Targets left out of the next run by hand, from the list under the
+     * command: a host matched by a tag query, or an open session, that should
+     * sit this one out. (A ticked host is simply unticked instead.) Cleared by
+     * "put back", and when the way targets are chosen changes.
+     */
+    var mxExcluded: Set<String> = []
+    /// Staging and retries from a loaded file, used here until changed by hand.
+    var stagingOverride: MXStaging?
+    var retryOverride: MXRetry?
+    /// Whether the Advanced part of the form is open.
+    var advOpen = false
 
     init(window: WindowModel) { self.window = window }
 
@@ -113,9 +125,49 @@ final class FleetWindow: WindowFeature {
         ConnectionManager.shared.connections.first { $0.hostId == hostId }
     }
 
+    /// Nothing is ticked in the sidebar (the run goes to the open sessions).
+    var nothingTicked: Bool { FleetHooks.checked(w).isEmpty }
+
+    func targetKey(_ t: MXTarget) -> String { t.hostId.map { "h:" + $0 } ?? "c:" + (t.connId ?? "") }
+
+    /// The targets, less the ones left out by hand.
+    func resolveTargets() -> [MXTarget] {
+        resolveAllTargets().filter { !mxExcluded.contains(targetKey($0)) }
+    }
+
+    /// Leave one target out of this run: a ticked host is unticked, anything
+    /// else set aside until put back.
+    func leaveOut(_ t: MXTarget) {
+        if !tagSelector.on, let id = t.hostId, FleetHooks.checked(w).contains(id) {
+            FleetHooks.setChecked(w, FleetHooks.checked(w).filter { $0 != id })
+        } else {
+            mxExcluded.insert(targetKey(t))
+        }
+    }
+
+    // MARK: Staging and retries
+
+    func staging() -> MXStaging {
+        stagingOverride ?? Store.shared.mxStaging
+    }
+
+    func retrySetting() -> MXRetry {
+        retryOverride ?? Store.shared.mxRetry
+    }
+
+    func saveStaging(_ st: MXStaging) {
+        stagingOverride = nil
+        Store.shared.mxStaging = st
+    }
+
+    func saveRetry(_ rt: MXRetry) {
+        retryOverride = nil
+        Store.shared.mxRetry = rt
+    }
+
     /// Selected sidebar hosts take priority; otherwise every open session. A
     /// tag selector, when on, replaces the ticked list.
-    func resolveTargets() -> [MXTarget] {
+    func resolveAllTargets() -> [MXTarget] {
         if tagSelector.on {
             return hostsForSelector().map { h in
                 MXTarget(hostId: h.id, host: h, connId: connFor(hostId: h.id)?.id, label: h.name.nilIfEmpty ?? h.alias ?? h.id)
@@ -162,13 +214,24 @@ final class FleetWindow: WindowFeature {
 
     // MARK: Running
 
-    func runMulti(_ command: String, runAs: String?, label: String? = nil, only: [MXTarget]? = nil) async {
+    /// What starting a run came to: its id, or why there is none.
+    struct RunStart { var runId: String?; var unreachable: Int; var error: String? }
+
+    /**
+     * Run a command on the targets. `scheduled` is a run nobody is watching:
+     * no confirm, the form left alone, and staging that never pauses.
+     * `selector`, when given, is what the run is remembered by.
+     */
+    @discardableResult
+    func runMulti(_ command: String, runAs: String?, label: String? = nil, only: [MXTarget]? = nil,
+                  scheduled: Bool = false, staging fixedStaging: MXStaging? = nil, retry fixedRetry: MXRetry? = nil,
+                  selector fixedSelector: MXSelector?? = nil) async -> RunStart? {
         let cmd = command.trimmed
-        guard !cmd.isEmpty else { StatusBus.shared.toast("Enter a command", kind: .error); return }
+        guard !cmd.isEmpty else { StatusBus.shared.toast("Enter a command", kind: .error); return nil }
         // `only` is a retry over the hosts that failed last time, which must not
         // be re-derived from the selection: ticks and tag queries move on.
         var targets = (only?.isEmpty == false) ? only! : resolveTargets()
-        guard !targets.isEmpty else { StatusBus.shared.toast("Select hosts in the sidebar first", kind: .error); return }
+        guard !targets.isEmpty else { StatusBus.shared.toast("Select hosts in the sidebar first", kind: .error); return nil }
         let runAs = runAs?.nilIfEmpty
         var failed: [MXFailed.Host] = []
 
@@ -178,20 +241,26 @@ final class FleetWindow: WindowFeature {
          * this everywhere" is how an outage starts.
          */
         let careful = targets.compactMap { $0.host ?? $0.hostId.flatMap(FleetHooks.hostById) }.filter(FleetHooks.careful)
-        if !careful.isEmpty {
+        // A scheduled run was confirmed when it was scheduled; nobody is here now.
+        if !careful.isEmpty && !scheduled {
             let names = careful.map { $0.name.nilIfEmpty ?? $0.alias ?? $0.id }.joined(separator: ", ")
             let n = targets.count
             let ok = await MiscUI.confirm(w, title: "Run on a host marked careful?",
                                           message: "\(names) \(careful.count == 1 ? "is" : "are") marked careful.",
                                           detail: "The command is:\n\n\(cmd)\n\nIt would run on \(n) host\(n == 1 ? "" : "s").",
                                           confirmLabel: "Run it", danger: true)
-            if !ok { return }
+            if !ok { return nil }
         }
 
-        lastCommand = cmd
-        lastRunAs = runAs ?? ""
-        w.showDock("multiexec")
-        StatusBus.shared.show("\(label.map { $0 + " \u{2014} running" } ?? "Running") on \(targets.count) host(s)\(runAs.map { " as " + $0 } ?? "")\u{2026}", seconds: 0)
+        // A scheduled run leaves the form, and whatever is on screen, alone.
+        if !scheduled {
+            lastCommand = cmd
+            lastRunAs = runAs ?? ""
+            mxView = "command"
+            w.showDock("multiexec")
+        }
+        StatusBus.shared.show("\(label.map { $0 + " \u{2014} running" } ?? "Running") on \(targets.count) host(s)\(runAs.map { " as " + $0 } ?? "")\u{2026}",
+                              seconds: scheduled ? 6 : 0)
 
         // Hosts without a live connection need one created first.
         var connIds: [String] = []
@@ -229,16 +298,24 @@ final class FleetWindow: WindowFeature {
 
         guard !connIds.isEmpty else {
             StatusBus.shared.clear()
+            if scheduled { return RunStart(runId: nil, unreachable: failed.count, error: failed.first?.error ?? "Nothing to run on") }
             StatusBus.shared.toast(failed.isEmpty ? "Nothing to run on" : "None of the \(failed.count) host(s) could be connected", kind: .error)
-            return
+            return nil
         }
-        let view = await MultiExecService.shared.run(connIds, command: cmd,
-                                                     options: .init(concurrency: 10, timeout: 120_000))
+        // A scheduled run has its own staging, which never pauses: nobody is there to go on.
+        let stages: MultiExecService.Stages?
+        if var st = fixedStaging { st.pause = false; stages = st.stagesFor(connIds.count) } else { stages = staging().stagesFor(connIds.count) }
+        let rt = fixedRetry ?? retrySetting()
+        var opts = MultiExecService.Options()
+        opts.concurrency = 10; opts.timeout = 120_000
+        opts.retries = rt.count; opts.retryDelay = rt.delay; opts.stages = stages
+        let view = await MultiExecService.shared.run(connIds, command: cmd, options: opts)
         /*
          * Keep the question, not the answers. "Run that again" is the common
          * follow-up — after a fix, after a deploy, an hour later — and rebuilding
          * the host selection by hand is the tedious part.
          */
+        let sel: MXSelector? = fixedSelector ?? (tagSelector.on ? tagSelector : nil)
         var rec: JSON = [
             "command": .string(cmd),
             "label": .string(label ?? ""),
@@ -247,12 +324,15 @@ final class FleetWindow: WindowFeature {
             "hostIds": JSON(targets.compactMap(\.hostId)),
             // A tag run is remembered as its query: running it again should ask
             // the same question, not repeat the answer it got last time.
-            "selector": tagSelector.on ? ["proxy": .string(tagSelector.proxy), "query": .string(tagSelector.query)] : .null,
+            "selector": sel.map { ["proxy": .string($0.proxy), "query": .string($0.query)] } ?? .null,
         ]
         // Hosts that never connected are not in the run's results, but count.
         rec["unreachable"] = .number(Double(failed.count))
+        rec["retries"] = .number(Double(rt.count))
+        if scheduled { rec["scheduled"] = .bool(true) }
         FleetHistory.shared.remember(view, rec, window: self)
-        StatusBus.shared.clear()
+        if !scheduled { StatusBus.shared.clear() }
+        return RunStart(runId: view.id, unreachable: failed.count, error: nil)
     }
 
     /// Dial the hosts that failed last time, and run the same command on them.
@@ -387,7 +467,10 @@ final class FleetWindow: WindowFeature {
          * when someone reads it in six months — but the query is what runs.
          */
         let text = MultiExecFile.toYaml(name: name, command: cmd, targets: targets,
-                                        options: .init(concurrency: 10, timeout: 120_000),
+                                        // Staged in the file when this run would be staged now.
+                                        options: .init(concurrency: 10, timeout: 120_000,
+                                                       stages: staging().stagesFor(sel != nil ? resolveTargets().count : targets.count),
+                                                       retries: retrySetting().count, retryDelay: retrySetting().delay),
                                         selector: sel.map { .init(cluster: $0.proxy.nilIfEmpty, query: $0.query) })
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path
         guard let url = await Modal.saveFile(w, defaultName: MultiExecFile.safeFileName(name) + ".yaml", directory: docs,
@@ -415,6 +498,14 @@ final class FleetWindow: WindowFeature {
             return
         }
         lastCommand = def.command
+        // A file that says how to stage itself is run that way, here, until the
+        // stages are changed by hand.
+        if let st = def.options.stages {
+            var o = Store.shared.mxStaging
+            o.mode = "on"; o.first = st.first; o.batch = st.batch; o.pause = st.pause; o.stopOnFail = st.stopOnFail
+            stagingOverride = o
+        } else { stagingOverride = nil }
+        retryOverride = def.options.retries > 0 ? MXRetry(count: def.options.retries, delay: def.options.retryDelay) : nil
         /*
          * A saved tag run restores the query rather than the host list: what it
          * meant was "whatever matches", and resolving it now is the point.

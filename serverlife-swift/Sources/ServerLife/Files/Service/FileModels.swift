@@ -50,6 +50,13 @@ struct FileEntry: Codable, Hashable, Sendable, Identifiable {
 
 /// A listing: the absolute path actually listed (the UI shows it and
 /// navigates from it) and its entries.
+/// Free and total space on a volume, in bytes (`{ total, free }` of
+/// `local:diskSpace` / `conn:diskSpace`).
+struct DiskSpace: Codable, Sendable, Equatable {
+    var total: Int64
+    var free: Int64
+}
+
 struct FileListing: Sendable {
     var path: String
     var entries: [FileEntry]

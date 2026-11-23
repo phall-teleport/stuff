@@ -24,6 +24,11 @@ and the matching parts of `index.html` / `styles.css`.
 | `ConnectAnim.swift` | the 30 connect scenes |
 | `Activity.swift`, `Highlight.swift`, `Links.swift`, `QuitGuard.swift`, `Workspace.swift` | as named |
 | `SessConn.swift` | the only file that talks to `ConnectionManager` / `LocalShells` |
+| `PaneStyle.swift`, `PaneStyleMenu.swift` | panestyle.js: a pane's own theme/font, remembered per host (`paneStyles`), header/explorer chrome (`pane.chrome`) |
+| `PaneClose.swift`, `PaneCloseEffects.swift`, `PaneCloseDebris.swift` | paneclose.js: the close animations (snapshot on a click-through overlay) |
+| `PaneStats.swift`, `PaneStatsText.swift`, `PaneStatsBar.swift` | monitor.js: the live stats bar, on Connections' `LiveStats` feed |
+| `SessRelogin.swift` | `connectWithRelogin` / `ensureLoggedIn`: log in to an expired Teleport profile, settle and retry, before a connection is dialled |
+| `SessPresence.swift` | `checkTeleportPresence` / `watchTeleportInstall`: the ⚡ header button |
 
 ## Using it
 
@@ -78,6 +83,32 @@ called with `["kind": "local"]` or `["kind": "host", "host": Host, "login": Stri
 (args `text`), `run-macro` (fleet, paneId), `nettools` (args `connId`, `tool`),
 `tmux-open` (consoles), `hosts-pane` (hosts), `serial-open` / `telnet-open` /
 `vnc-open` / `rdp-open` (consoles, restoring layouts: host = saved descriptor).
+
+### Added for 0.39
+
+- `live-stats-toggle`, `live-stats-attach`, `live-stats-detach` (paneId).
+- `pane-style-menu` — args `menu` NSMenu (append the Style submenu for `paneId`), `key`.
+- `app-resume` listener: redraws every terminal (repaintAllTerminals).
+- `open-backend` / `open-view-pane` take `kubeKind` ("browser"/"exec"/"logs":
+  the fallback pane titles "Kubernetes"/"kube exec"/"kube logs");
+  `open-backend` also takes `explorerSource` (any value; stored as
+  `pane.attachments["explorerSource"]` for the explorer to read — the pod a
+  kube exec pane browses) and `explorer: false` (no file browser). A
+  `command` backend's pane reads as its own title.
+- Uses when registered: `decode-menu` (args `menu`, `input`), `ai-pane-ask`,
+  `ai-menu` (the + button's right-click), `kube-restore-open` (layouts: kube-ui
+  sets `pane.attachments["layoutSpec"]` JSON on its panes, gets it back in
+  args `spec`), `tmux-restore-open`, `hosts-pane-picked`, `teleport-presence`
+  (args `hostId`, `presence` JSON), `teleport-install-offer` (host; args
+  `hostId`, `label`, `again` — the sidebar's notice), `add-to-teleport` (the ⚡ button).
+- `SessRelogin.connect(connId, background:, window:)` — the relogin path;
+  tmux and the explorer can call it instead of their own retry loops.
+- `SessPresence.shared.watchInstall(connId)` — re-check every 15 s for 3 min
+  after an install is typed into a session.
+- `PaneOverlay.peek = true` adds "Show terminal" (fold the notice into a bar);
+  consoles' ended-tmux overlay should set it (tmux.js passes `peek: true`).
+- `closePane(id, animate: false)` for panes closed by the program, not a person
+  (consoles: TmuxUI's `s.closePane(paneId)` should pass `animate: false`).
 
 ## Extension points
 

@@ -14,7 +14,7 @@ import SwiftUI
 enum Tour {
     /// Bumped when the tour gains steps worth showing to someone who has
     /// already seen it: "seen" means "seen this much".
-    static let version = 3
+    static let version = 6
 
     struct Step {
         let title: String
@@ -25,10 +25,18 @@ enum Tour {
 
     static let steps: [Step] = [
         Step(title: "ServerLife in one minute", target: nil,
-             body: "Teleport nodes and plain SSH hosts, treated as the same thing: tabbed "
-                + "terminals, a real file browser, fleet-wide commands and port forwarding in "
-                + "one window.\n\nThis tour points at each part and says what it is for. "
-                + "Nothing you see here changes anything — leave whenever you like."),
+             body: "Teleport nodes, plain SSH hosts and Kubernetes clusters, treated as the "
+                + "same thing: tabbed terminals, a real file browser, fleet-wide commands, "
+                + "port forwarding, and a full Kubernetes browser with Helm and a 3D cluster "
+                + "view, in one window.\n\nThis tour points at each part and says what it is "
+                + "for. Nothing you see here changes anything — leave whenever you like."),
+        Step(title: "Search everything", target: "global-search",
+             body: "The box at the top right finds anything in ServerLife by name: hosts (by "
+                + "name, address, label or uuid), saved profiles, clusters, beams, open tabs, macros, "
+                + "snippets, layouts, past multi-exec runs, saved AI prompts and responses, every "
+                + "menu action — and settings, which opens Settings at the one you meant.\n\n"
+                + "⌘P puts you in it from anywhere. Type, Enter for the first result, the arrows "
+                + "for the rest, Escape to go back to your session."),
         Step(title: "Every host in one list", target: "sidebar",
              body: "Teleport nodes from every cluster you are logged in to, grouped by cluster "
                 + "with their labels, and every Host in ~/.ssh/config below them. Nothing has to "
@@ -117,7 +125,21 @@ enum Tour {
              body: "Tick hosts in the sidebar, then ⌘⇧M and type a command. It runs on all of "
                 + "them in parallel, with each result in its own collapsible card — exit code, "
                 + "duration, stdout and stderr.\n\nUseful for the questions that are not worth a "
-                + "session each: which of these is out of disk, which kernel is everyone on."),
+                + "session each: which of these is out of disk, which kernel is everyone on.\n\n"
+                + "Advanced has a staged rollout and retries for a host that fails. Schedule… "
+                + "runs it later, or every so often — the Scheduled tab keeps the list."),
+        Step(title: "An AI assistant beside your sessions", target: "toggle-ai",
+             body: "✦ opens Claude Code, Codex, GitHub Copilot CLI, Gemini CLI, OpenCode or Pi "
+                + "in a panel on the right — the vendor’s own tool, signed in the way it "
+                + "always is, and given ServerLife’s tools so it can list your hosts, open "
+                + "sessions and read what a terminal shows.\n\nRight-click selected output, or a "
+                + "host, and \"Ask the AI about this\" puts it into the assistant with where it came "
+                + "from, for you to add the question. Prompts keeps the questions you ask often; "
+                + "Save keeps an answer worth having, as a file you can find again here or in "
+                + "Finder. \"Pick up a past conversation\" carries on where one left off, a tab can "
+                + "be named by double-clicking it, and a tab turns yellow when its assistant is "
+                + "waiting on you.\n\nDouble-click the AI row in the host list to start one with a "
+                + "question already typed."),
         Step(title: "Transfers, tunnels and the log", target: "toggle-transfers",
              body: "⌘J opens the dock. Transfers shows progress and rate for every upload and "
                 + "download, including server-to-server ones. Tunnels lists your port forwards "
@@ -139,6 +161,67 @@ enum Tour {
                 + "a cluster\u{2019}s tsh config block into ~/.ssh/config, so scp, rsync and Ansible "
                 + "reach its nodes too. A node\u{2019}s menu will also measure latency to it, both "
                 + "halves of the path."),
+        Step(title: "Kubernetes clusters, the same way", target: "sb-kind-filter",
+             body: "K8s here switches the Resources list to just Kubernetes clusters — reached "
+                + "through Teleport’s own kube proxy or a plain kubeconfig, listed beside your "
+                + "SSH hosts rather than off in a tab of their own.\n\n"
+                + "Click a cluster to expand its namespaces, then a namespace for its pods. "
+                + "Click a pod to exec straight in beside the pane you’re already looking at "
+                + "(double-click for a tab of its own); right-click for logs (including a "
+                + "crashed container’s own previous logs), YAML, delete, and port-forwarding.\n\n"
+                + "Any port-forwards running on that cluster show the moment it’s expanded — no "
+                + "need to open anything else just to see what’s live, or to stop it.\n\n"
+                + "All of KubeLife is one setting to turn off entirely — Settings → "
+                + "KubeLife — for anyone who only needs SSH."),
+        Step(title: "The full cluster browser", target: nil,
+             body: "The ⤢ button on a cluster row (or its right-click menu) opens every resource "
+                + "kind that cluster actually has — kubectl api-resources is asked, not a fixed "
+                + "list, so a CRD installed yesterday needs no app update to browse today.\n\n"
+                + "Overview leads with node/namespace counts, pods by phase, and kubectl top’s "
+                + "own numbers — not a blank list waiting to be told what to show. Every list "
+                + "sorts (click a header) and resizes (drag its edge, remembered after); a "
+                + "Namespace row’s name is a link that scopes everything above it and jumps to "
+                + "that namespace’s Pods.\n\n"
+                + "\"My access\" answers \"what can I actually do here\" — who the cluster sees you "
+                + "as, and a can-i grid across what people actually touch. YAML is viewable, "
+                + "editable (the diff is a checkbox, not forced on you) and exportable. \"+ New\" "
+                + "applies a blank manifest, or builds one from a short form — a namespace, or a "
+                + "disposable test pod (name, namespace, image, optional port) — without having "
+                + "to hand-write YAML for the common case."),
+        Step(title: "Helm releases", target: nil,
+             body: "A fixed entry in the cluster browser’s own list — Helm releases never show "
+                + "up in kubectl api-resources, so this isn’t left for the regular kind list to "
+                + "happen to discover.\n\n"
+                + "Every release, sortable and resizable like everything else, with Values, "
+                + "History (each revision a Rollback away), Uninstall, and Export. \"Install "
+                + "release…\" takes a repo chart (the repo gets added for you) or a local chart "
+                + "path, with an optional values file and a dry-run checkbox that defaults on.\n\n"
+                + "Reachable in one click from a cluster’s own right-click menu too — \"Manage "
+                + "Helm releases…\" opens the browser straight on this list."),
+        Step(title: "Port-forwarding, and knowing it’s running", target: nil,
+             body: "Right-click a Pod, Service, Deployment, StatefulSet or DaemonSet — in the "
+                + "sidebar, the full browser’s rows, or the 3D view’s own Service popup — for "
+                + "\"Port-forward…\": a remote port and an optional local one, blank for kubectl "
+                + "to pick an open one itself.\n\n"
+                + "Once it’s running, it’s visible wherever you’d look for it, not just wherever "
+                + "you started it: a badge on the cluster row in the sidebar (even collapsed), "
+                + "the inline list once it’s expanded, and a count button in the full browser’s "
+                + "own toolbar — all three with Stop right there. Stopping one always asks for "
+                + "confirmation first: it’s live traffic something may depend on mid-click, not "
+                + "a free action to undo."),
+        Step(title: "The 3D view", target: nil,
+             body: "A cluster, as a city: namespaces are districts, pods are buildings that "
+                + "breathe while running — faster and a touch bigger the busier kubectl top says "
+                + "they are — and flash red when crashing. Deployments are pillars coloured by "
+                + "their own ready/desired ratio; Services are fixed-colour beacons.\n\n"
+                + "Opened from \"🧊 3D view\" in the cluster browser’s own list (or a cluster’s "
+                + "right-click menu) — never a popup, which is also why the controls actually "
+                + "work here: drag to rotate/pan, scroll or +/- to zoom, and the arrow keys "
+                + "rotate/tilt the moment it opens, no click needed first.\n\n"
+                + "A search box finds a specific pod or service by name; a kind filter narrows "
+                + "to just one; a building-style picker changes the look, never what colour or "
+                + "height mean. The namespace selector above scopes it the same as everything "
+                + "else in the browser."),
         Step(title: "When a node goes quiet, or goes away", target: "btn-heartbeats",
              body: "A Teleport node stays in the inventory for ten or fifteen minutes after its "
                 + "agent stops heartbeating — same row, same labels, still offering a session "
@@ -164,10 +247,13 @@ enum Tour {
                 + "in there as well \u{2014} method, headers, body, bearer or basic auth \u{2014} with "
                 + "the command shown as it will run, the response formatted, and the call keepable "
                 + "to run again. Examples fills in the typical shapes for every tool, Recent "
-                + "reruns what you just did, and any output can be saved to a file."),
+                + "reruns what you just did, and any output can be saved to a file.\n\nIt also "
+                + "works out subnets and takes apart an SSH certificate, a JWT or a SPIFFE SVID \u{2014} "
+                + "right-click a selection in a terminal \u{2192} Decode."),
         Step(title: "Where the rest lives", target: nil,
              body: "Macros and snippets keep commands you retype. Every session\u{2019}s \u{25B6} "
-                + "button runs one on that host, and the last entry in that menu writes a new one. "
+                + "button runs one on that host, and the last entries in that menu write a new one "
+                + "or record one: run the commands as usual, stop, and what you ran is the macro. "
                 + "A macro can be pinned as a button in the session header \u{2014} with an icon, and "
                 + "a choice of every session, hosts only, or the local shell only.\n\nLayouts save "
                 + "an arrangement of sessions and bring it back (⌘⇧S, ⌘⇧O), and the last one is "
@@ -236,7 +322,8 @@ enum Tour {
                 DialogScaffold(title: "First time here?") {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("ServerLife puts terminals, a file browser, fleet-wide commands and "
-                             + "port forwarding for Teleport and SSH hosts in one window.")
+                             + "port forwarding for Teleport and SSH hosts — and a full Kubernetes "
+                             + "browser alongside them — in one window.")
                             .font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
                         Text("A short tour points at each part and says what it is for — about a "
                              + "minute, and you can leave at any point. It stays in the Help menu "

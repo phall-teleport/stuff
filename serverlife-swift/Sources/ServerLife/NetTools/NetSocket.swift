@@ -31,10 +31,12 @@ enum NetSocket {
 
     /// Resolve and connect within `timeoutMs` (resolution included, as the
     /// original's socket timeout included it). Tries each address in turn.
-    static func connect(_ host: String, _ port: Int, timeoutMs: Int) -> Connect {
+    /// `family` 4 or 6 forces which answer a name resolves to (Node's
+    /// `sock.connect({ family })`); 0 takes either.
+    static func connect(_ host: String, _ port: Int, timeoutMs: Int, family: Int = 0) -> Connect {
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
         var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
+        hints.ai_family = family == 6 ? AF_INET6 : family == 4 ? AF_INET : AF_UNSPEC
         hints.ai_socktype = SOCK_STREAM
         hints.ai_protocol = IPPROTO_TCP
         var res: UnsafeMutablePointer<addrinfo>?
@@ -77,11 +79,11 @@ enum NetSocket {
     }
 
     /// One port: open, refused (closed), no answer (filtered) or an error.
-    static func probe(_ host: String, _ port: Int, timeoutMs: Int) async -> PortResult {
+    static func probe(_ host: String, _ port: Int, timeoutMs: Int, family: Int = 0) async -> PortResult {
         await withCheckedContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let started = Date()
-                let r = connect(host, port, timeoutMs: timeoutMs)
+                let r = connect(host, port, timeoutMs: timeoutMs, family: family)
                 let ms = Int((Date().timeIntervalSince(started) * 1000).rounded())
                 switch r {
                 case .open(let fd, _):
@@ -104,7 +106,7 @@ enum NetSocket {
     static func telnet(_ h: String, _ p: Int, listenMs: Int, connectMs connectWithin: Int) -> TelnetResult {
         let started = Date()
         var result = TelnetResult(host: h, port: p, address: nil, state: "error", connectMs: nil, listenedMs: 0,
-                                  text: "", telnet: false, closedByPeer: false, guess: nil, command: "telnet \(h) \(p)",
+                                  text: "", telnet: false, closedByPeer: false, guess: nil, command: NetLocal.telnetCommand(h, p),
                                   error: nil)
         let fd: Int32
         switch connect(h, p, timeoutMs: connectWithin) {

@@ -20,9 +20,12 @@ final class KeysModel: ObservableObject {
         loading = true
         sessions = NTConnections.connected
         // Which ssh_config hosts name a key with IdentityFile.
-        identities = Inventory.shared.sshHosts.compactMap { h in
-            h.identityFile.map { (alias: h.alias ?? h.name, identityFile: $0) }
-        }
+        identities = Inventory.shared.sshHosts.map { h in
+            // Any of a host's identity files, not just the first ssh -G
+            // reported, so a key offered second still shows up.
+            let all = h.extra["identityFiles"]?.array?.compactMap(\.string) ?? []
+            return (all.isEmpty ? [h.identityFile].compactMap { $0 } : all).map { (alias: h.alias ?? h.name, identityFile: $0) }
+        }.flatMap { $0 }
         Task { @MainActor in
             async let k = SSHKeys.listKeys()
             async let a = SSHKeys.agentKeys()
@@ -72,6 +75,7 @@ final class KeysModel: ObservableObject {
 
     func usedBy(_ k: SSHKey) -> [String] {
         identities.filter { SSHKeys.sameKeyPath($0.identityFile, k) }.map(\.alias)
+            .reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
     }
 }
 
@@ -113,9 +117,10 @@ enum KeysDialog {
                 handle.close()
                 guard let res else { return }
                 Task { @MainActor in
-                    StatusBus.shared.show("Generating…", seconds: 0)
+                    StatusBus.shared.show(res.type.hasSuffix("-sk") ? "Waiting on the security key…" : "Generating…", seconds: 0)
                     do {
-                        let k = try await SSHKeys.generate(name: res.name, type: res.type, comment: res.comment, passphrase: res.passphrase)
+                        let k = try await SSHKeys.generate(name: res.name, type: res.type, comment: res.comment, passphrase: res.passphrase,
+                                                           resident: res.resident, verifyRequired: res.verifyRequired, pin: res.pin)
                         StatusBus.shared.toast("Created \(k.name) (\(k.type ?? res.type))", kind: .ok)
                     } catch {
                         StatusBus.shared.toast(error.localizedDescription, kind: .error)
@@ -128,7 +133,7 @@ enum KeysDialog {
     }
 
     /// Clear a stale host key after a server is rebuilt.
-    static func forgetHostKey(_ hostname: String?, window: WindowModel?) {
+    static func forgetHostKey(_ hostname: String?, window: WindowModel?, alias: String? = nil, configFile: String? = nil) {
         Task { @MainActor in
             var name = hostname?.ntTrimmed ?? ""
             if name.isEmpty {
@@ -136,17 +141,22 @@ enum KeysDialog {
                                                  ok: "Look up"), !n.ntTrimmed.isEmpty else { return }
                 name = n.ntTrimmed
             }
-            let entries = await SSHKeys.knownHostEntries(name)
+            let files = await SSHKeys.knownHostsFiles(alias: alias, configFile: configFile)
+            let entries = await SSHKeys.knownHostEntries(name, files: files)
+            // Only name the file per-entry when more than one is in play (the
+            // default plus a host-specific UserKnownHostsFile).
+            var used: [String] = []
+            for e in entries { if let f = e.file, !used.contains(f) { used.append(f) } }
             if entries.isEmpty { StatusBus.shared.toast("No known_hosts entry for \(name)", kind: .info); return }
             let ok = await Modal.confirm(window, title: "Forget host key",
                 message: "Remove \(entries.count) known_hosts entr\(entries.count == 1 ? "y" : "ies") for \(name)?\n\n"
-                    + entries.map { "\($0.type) \($0.key)" }.joined(separator: "\n")
+                    + entries.map { "\($0.type) \($0.key)\(used.count > 1 ? " (\($0.file ?? ""))" : "")" }.joined(separator: "\n")
                     + "\n\nThe next connection will ask you to accept the new key. Only do this if you "
                     + "expected the host to change — a rebuild, a re-image, a new IP.",
                 ok: "Forget", destructive: true)
             guard ok else { return }
             do {
-                let n = try await SSHKeys.forgetHost(name)
+                let n = try await SSHKeys.forgetHost(name, files: files).removed
                 StatusBus.shared.toast("Removed \(n) entr\(n == 1 ? "y" : "ies")", kind: .ok)
             } catch {
                 StatusBus.shared.toast(error.localizedDescription, kind: .error)
@@ -167,6 +177,7 @@ struct KeysView: View {
         } footer: {
             Button("Run ssh-add") { model.addDefaults() }.buttonStyle(.ghost)
             Button("Generate new key…") { KeysDialog.generateFlow(window: model.window) { model.load() } }.buttonStyle(.ghost)
+            Button("Load PKCS#11 token…") { KeysDialog.pkcs11Flow(window: model.window) { model.load() } }.buttonStyle(.ghost)
             Button("Refresh") { model.load() }.buttonStyle(.ghost)
             Button("Close") { handle.close() }.buttonStyle(.ghost).keyboardShortcut(.cancelAction)
         }
@@ -369,12 +380,21 @@ struct InstallKeyView: View {
 }
 
 struct GenerateKeyView: View {
-    struct Result { var name, type, comment, passphrase: String }
+    struct Result {
+        var name, type, comment, passphrase: String
+        var pin: String? = nil
+        var resident = false, verifyRequired = false
+    }
     let done: (Result?) -> Void
     @StateObject private var name = Local("id_serverlife")
     @StateObject private var type = Local("ed25519")
     @StateObject private var comment = Local("")
     @StateObject private var pass = Local("")
+    @StateObject private var pin = Local("")
+    @StateObject private var resident = LocalFlag(false)
+    @StateObject private var verifyRequired = LocalFlag(false)
+
+    private var sk: Bool { type.value.hasSuffix("-sk") }
 
     var body: some View {
         DialogScaffold(title: "Generate SSH key", scroll: false) {
@@ -387,6 +407,8 @@ struct GenerateKeyView: View {
                         Text("Ed25519 (recommended)").tag("ed25519")
                         Text("ECDSA").tag("ecdsa")
                         Text("RSA 4096").tag("rsa")
+                        Text("Security key (FIDO2) — Ed25519").tag("ed25519-sk")
+                        Text("Security key (FIDO2) — ECDSA").tag("ecdsa-sk")
                     }.labelsHidden().fixedSize()
                 }
                 FormRow(label: "Comment") {
@@ -395,14 +417,76 @@ struct GenerateKeyView: View {
                 FormRow(label: "Passphrase", hint: "An empty passphrase means anyone with the file can use the key.") {
                     SecureField("optional but recommended", text: $pass.value).textFieldStyle(.roundedBorder)
                 }
+                if sk {
+                    FormRow(label: "Security key PIN") {
+                        SecureField("only if your security key has one set", text: $pin.value).textFieldStyle(.roundedBorder)
+                    }
+                    Toggle("Resident — the key also lives on the token, usable from another machine", isOn: $resident.on)
+                    Toggle("Require touch and PIN for every use, not just once", isOn: $verifyRequired.on)
+                    Text("Needs a touch on the key, and its PIN if one is set — ssh-keygen waits on both.")
+                        .font(.system(size: 11)).foregroundStyle(Theme.shared.p.muted)
+                }
             }
         } footer: {
             Button("Cancel") { done(nil) }.buttonStyle(.ghost).keyboardShortcut(.cancelAction)
             Button("Generate") {
                 let n = name.value.ntTrimmed
                 if n.isEmpty { StatusBus.shared.toast("Give the key a file name", kind: .error); return }
-                done(Result(name: n, type: type.value, comment: comment.value.ntTrimmed, passphrase: pass.value))
-            }.buttonStyle(.primary).keyboardShortcut(.defaultAction)
+                var r = Result(name: n, type: type.value, comment: comment.value.ntTrimmed, passphrase: pass.value)
+                if sk { r.pin = pin.value.isEmpty ? nil : pin.value; r.resident = resident.on; r.verifyRequired = verifyRequired.on }
+                done(r)
+            }.buttonStyle(.primary)
+        }
+    }
+}
+
+/// `ssh-add -s <provider>` — every identity a PKCS#11 token holds (a
+/// YubiKey's PIV applet, a smart card), loaded through its provider library
+/// rather than from a file in ~/.ssh. Nothing to list beforehand: the
+/// provider enumerates what is on the token once ssh-add asks it.
+extension KeysDialog {
+    static func pkcs11Flow(window: WindowModel?, then: @escaping @MainActor () -> Void) {
+        Modal.sheet(window, title: "Load a PKCS#11 token", width: 480) { handle in
+            PKCS11View { res in
+                handle.close()
+                guard let res else { return }
+                Task { @MainActor in
+                    StatusBus.shared.show("Talking to the token…", seconds: 0)
+                    let r = await SSHKeys.addToAgent(nil, passphrase: res.pin, pkcs11Provider: res.provider)
+                    StatusBus.shared.clear()
+                    if r.ok { StatusBus.shared.toast("Loaded", kind: .ok) }
+                    else { StatusBus.shared.toast(r.output.isEmpty ? "ssh-add could not load that token" : r.output, kind: .error) }
+                    then()
+                }
+            }
+        }
+    }
+}
+
+struct PKCS11View: View {
+    let done: ((provider: String, pin: String?)?) -> Void
+    @StateObject private var provider = Local("")
+    @StateObject private var pin = Local("")
+
+    var body: some View {
+        DialogScaffold(title: "Load a PKCS#11 token", scroll: false) {
+            VStack(alignment: .leading, spacing: 12) {
+                FormRow(label: "Provider library",
+                        hint: "The PKCS#11 .so/.dylib/.dll that speaks to the token — OpenSC\u{2019}s, or one of your own.") {
+                    TextField("/opt/homebrew/lib/opensc-pkcs11.so, or your token\u{2019}s own library", text: $provider.value)
+                        .textFieldStyle(.roundedBorder)
+                }
+                FormRow(label: "PIN") {
+                    SecureField("only if the token asks", text: $pin.value).textFieldStyle(.roundedBorder)
+                }
+            }
+        } footer: {
+            Button("Cancel") { done(nil) }.buttonStyle(.ghost).keyboardShortcut(.cancelAction)
+            Button("Load") {
+                let p = provider.value.ntTrimmed
+                if p.isEmpty { StatusBus.shared.toast("Give the provider library\u{2019}s path", kind: .error); return }
+                done((provider: p, pin: pin.value.isEmpty ? nil : pin.value))
+            }.buttonStyle(.primary)
         }
     }
 }

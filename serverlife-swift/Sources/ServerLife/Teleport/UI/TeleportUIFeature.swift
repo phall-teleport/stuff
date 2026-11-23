@@ -21,13 +21,6 @@ enum TeleportUIFeature {
             else { TeleportPanel.openLoginDialog(window: ctx.window) }
         }
         a.register("cluster-info") { ctx in
-            // From the menu bar (no host, no proxy) the original only opened
-            // the Teleport tool with the logged-in proxy filled in, and ran
-            // nothing; the profile row's button asks about its own proxy.
-            if ctx.host == nil, ctx.args["proxy"] == nil, Actions.shared.isRegistered("nettools") {
-                Actions.shared.perform("nettools", window: ctx.window, args: ["tool": "teleport"])
-                return
-            }
             let proxy = ctx.arg("proxy", as: String.self) ?? TUI.profile(from: ctx)?.proxy ?? ctx.host?.proxy
             TeleportPanel.openClusterInfo(proxy: proxy, window: ctx.window)
         }
@@ -53,6 +46,21 @@ enum TeleportUIFeature {
                 pre = TeleportPanel.LoginPrefill(record: saved)
             }
             TeleportPanel.openLoginDialog(pre, window: ctx.window)
+        }
+        // tshenv.js editClusterEnv, from a cluster heading's menu.
+        a.register("tsh-env-edit") { ctx in
+            let proxy = ctx.arg("proxy", as: String.self) ?? TUI.profile(from: ctx)?.proxy ?? ctx.host?.proxy ?? ""
+            guard !proxy.isEmpty else { return }
+            let cluster = ctx.arg("cluster", as: String.self) ?? TUI.profile(from: ctx)?.cluster ?? ctx.host?.cluster
+            TshEnvUI.edit(proxy: proxy, cluster: cluster, window: ctx.window)
+        }
+        // doLogin for a profile, the way it is saved to be logged into, for
+        // a connect waiting on it (args profileKey; `done` (Bool) -> Void is
+        // called once the login — terminal tab included — has finished).
+        a.register("tsh-login-profile") { ctx in
+            guard let p = TUI.profile(from: ctx) else { return }
+            let done = ctx.args["done"] as? (Bool) -> Void
+            Task { let ok = await TeleportPanel.doLogin(p, window: ctx.window); done?(ok) }
         }
         a.register("tsh-status") { ctx in
             guard let p = TUI.profile(from: ctx) ?? TUI.activeProfile() else { TUIStatus.toast("No Teleport profile", "error"); return }
@@ -81,6 +89,28 @@ enum TeleportUIFeature {
                                          uuid: uuid, labels: h.labels)]
             }
             Task { await AccessRequestsUI.openCreateRequest(p, prefill: .init(resources: resources), window: ctx.window) }
+        }
+        // sidebar.js requestKubeResourceAccessFor / kubebrowser.js
+        // requestKubeResourceAccess: the picker straight at namespaces/pods
+        // in one kube cluster (args profileKey/proxy/cluster, `kubeCluster`,
+        // `title`, `subtitle`), then the request for what was picked.
+        a.register("access-request-kube-resource") { ctx in
+            guard let p = TUI.profile(from: ctx) else { TUIStatus.toast("Log in to that cluster first", "error"); return }
+            let kc = ctx.arg("kubeCluster", as: String.self)?.nilIfEmpty ?? ctx.host?.uuid?.nilIfEmpty ?? ctx.host?.name
+            let name = ctx.arg("subtitle", as: String.self) ?? ctx.host?.name ?? kc ?? ""
+            let opts = RequestPicker.Options(title: ctx.arg("title", as: String.self) ?? "Request a namespace or pod in \(name)…",
+                                             subtitle: name, initialKind: "kube_resource", initialKubeCluster: kc)
+            Task {
+                guard let picked = await RequestPicker.pickResources(p, opts: opts, window: ctx.window), !picked.isEmpty else { return }
+                await AccessRequestsUI.openCreateRequest(p, prefill: .init(resources: picked), window: ctx.window)
+            }
+        }
+        // sidebar.js requestAccessForMany: only the requestable hosts in a
+        // multi-select (args `hosts` [Host]), one request per cluster they
+        // resolve to, each prefilled with every node from it at once.
+        a.register("access-request-many") { ctx in
+            let hosts = ctx.arg("hosts", as: [Host].self) ?? []
+            Task { await requestAccessForMany(hosts, window: ctx.window) }
         }
         a.register("access-requests") { ctx in
             AccessRequestsUI.openRequestsDialog(TUI.profile(from: ctx), window: ctx.window)
@@ -126,6 +156,11 @@ enum TeleportUIFeature {
             guard let p = TUI.profile(from: ctx) else { return }
             Task { await TeleportPanel.openTshConfigDialog(p, window: ctx.window) }
         }
+        // The ⏳ "expires soon" badge: log out and straight back in, one confirmation.
+        a.register("tsh-relogin-expiring") { ctx in
+            guard let p = TUI.profile(from: ctx) else { return }
+            Task { await TeleportPanel.doRelogin(p, window: ctx.window) }
+        }
         a.register("tsh-relogin") { ctx in
             // The heading's "Log in again": the saved record, else a dialog for this proxy.
             guard let p = TUI.profile(from: ctx) else { return }
@@ -145,8 +180,24 @@ enum TeleportUIFeature {
         // Beams.
         a.register("beam-start") { ctx in
             guard let p = TUI.profile(from: ctx) else { TUIStatus.toast("Log in to a cluster first", "error"); return }
-            Task { await BeamsUI.start(p, window: ctx.window) }
+            Task { await BeamsUI.start(p, phase: ctx.arg("phase", as: String.self) ?? "", window: ctx.window) }
         }
+        // The services in a beam and their logs (beams.js `showBeamServices`).
+        a.register("beam-services") { ctx in
+            guard let b = BeamsUI.beam(from: ctx) else { return }
+            Task { await BeamsUI.showServices(b, window: ctx.window) }
+        }
+        // The Phase list read for a cluster (query; reply `BeamPhaseLists.PhaseList?`),
+        // and a fresh read of it (`phase-refresh`, args `profileKey`).
+        a.register("phase-list") { ctx in
+            let px = ctx.arg("proxy", as: String.self) ?? TUI.profile(from: ctx)?.proxy ?? ""
+            ctx.arg("reply", as: ((Any?) -> Void).self)?(BeamPhaseLists.shared.phaseList(px))
+        }
+        a.register("phase-refresh") { ctx in
+            guard let p = TUI.profile(from: ctx) else { return }
+            Task { await BeamPhaseLists.shared.refreshPhases(p) }
+        }
+        BeamPhaseLists.shared.hookBeams()
         a.register("beam-menu") { ctx in
             guard let b = BeamsUI.beam(from: ctx) else { return }
             if let menu = ctx.arg("menu", as: NSMenu.self) { BeamsUI.appendMenu(menu, b, window: ctx.window) }
@@ -196,6 +247,34 @@ enum TeleportUIFeature {
                     }.background(Theme.shared.p.panel)
                 }
             }
+        }
+    }
+
+    /// sidebar.js `requestAccessForMany`. Sequential, not parallel: each
+    /// is its own modal, and two at once would stack one behind the other.
+    static func requestAccessForMany(_ hosts: [Host], window: WindowModel?) async {
+        let requestable = hosts.filter { $0.extra["requestable"]?.truthy == true }
+        if requestable.isEmpty { TUIStatus.toast("None of the selected hosts are requestable", "error"); return }
+        let inv = Inventory.shared
+        var order: [String] = []
+        var groups: [String: (TeleportProfile, [ReqResource])] = [:]
+        var unmatched = 0
+        for h in requestable {
+            guard let p = inv.profile(for: h) ?? inv.profiles.first(where: { $0.cluster == h.cluster }),
+                  let uuid = h.uuid?.nilIfEmpty else { unmatched += 1; continue }
+            let cluster = h.cluster?.nilIfEmpty ?? p.cluster
+            let r = ReqResource(id: "/\(cluster)/node/\(uuid)", kind: "node", name: h.name, cluster: cluster, uuid: uuid,
+                                labels: h.labels)
+            if groups[p.key] == nil { order.append(p.key); groups[p.key] = (p, []) }
+            groups[p.key]?.1.append(r)
+        }
+        if groups.isEmpty { TUIStatus.toast("Log in to that cluster first", "error"); return }
+        for k in order {
+            guard let (p, rs) = groups[k] else { continue }
+            await AccessRequestsUI.openCreateRequest(p, prefill: .init(resources: rs), window: window)
+        }
+        if unmatched > 0 {
+            TUIStatus.toast("\(unmatched) host\(unmatched == 1 ? "" : "s") skipped — log in to \(unmatched == 1 ? "its" : "their") cluster first", "error")
         }
     }
 

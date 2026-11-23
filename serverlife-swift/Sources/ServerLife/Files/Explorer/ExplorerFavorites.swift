@@ -25,7 +25,7 @@ extension ExplorerModel {
     /// starred for every host.
     func favScope() -> XPFavScope? {
         if isLocal { return XPFavScope(kind: "local", key: "local", label: "this machine") }
-        if !isRemote { return nil }
+        if !isRemote { return nil }   // buckets and pods have none
         guard let conn else { return nil }
         let key = conn.host.prefKey
         return XPFavScope(kind: "host", key: key, label: conn.label.nilIfEmpty ?? "this host")

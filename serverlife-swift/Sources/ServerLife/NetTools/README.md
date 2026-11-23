@@ -9,10 +9,11 @@ the main.js `keys:*` / `knownhosts:*` handlers. GUIDE.md "Network tools" and
 
 | id | what | args |
 |---|---|---|
-| `nettools` | the Network tools panel (⌘⇧T) | `connId` (or `ctx.connId`) preselects **Run on**; `tool` (`ping`, `curl`, `traceroute`, `dns`, `ports`, `telnet`, `tls`, `http`, `whois`, `serial`, `teleport`, `local`); `host` String — a target, run at once; `preset` JSON — a saved request record |
+| `nettools` | the Network tools panel (⌘⇧T) | `connId` (or `ctx.connId`) preselects **Run on**; `tool` (`ping`, `curl`, `traceroute`, `dns`, `ports`, `sockets`, `telnet`, `tls`, `http`, `whois`, `serial`, `teleport`, `local`, `cidr`, `url`, `sshcert`, `jwt`, `svid`); `host` String — a target, run at once; `preset` JSON — a saved request record; `input` String — text for a decoder (runs at once when `tool` is one); `file` String — the path that text came from |
+| `nettools-decode-menu` | appends the "Decode" items (decoders.js `decodeMenu`) to a menu: SSH certificate / JWT / SPIFFE SVID / CIDR / URL, each opening the panel on that decoder | `menu` NSMenu; `input` String — the selection (items read "<label> — the selection"); `profile` JSON — a Teleport profile (SSH certificate picks its tsh cert) |
 | `webapi-ping` | the panel on **Teleport cluster** for a proxy, run at once (for `cluster-info` / a profile's Cluster info button) | `proxy` String (else `ctx.host.proxy`) |
 | `keys` | the SSH keys dialog (⌘⇧K) | — |
-| `forget-host-key` | look up and forget known_hosts entries | `ctx.host` (`name.cluster` for Teleport nodes, else hostname / direct hostname / alias, as sidebar.js did) or `hostname` String; neither → asks |
+| `forget-host-key` | look up and forget known_hosts entries | `ctx.host` (`name.cluster` for Teleport nodes, else hostname / direct hostname / alias, as sidebar.js did) or `hostname` String; neither → asks. `alias` / `configFile` (or a non-Teleport `ctx.host`) also search that host's `UserKnownHostsFile` (`ssh -G`) |
 
 A second `nettools` / `webapi-ping` with arguments closes the open panel and
 opens a fresh one (each `openNetTools` call was a fresh modal: Run on back to
@@ -33,7 +34,14 @@ one forward.
 | `NetToolsModel.swift` | the panel's state and `dispatch` (every tool, here and on a host), examples, saved/recent strips, telnet/serial hand-off |
 | `NetToolsView.swift`, `NetResults.swift`, `NTUI.swift` | the panel, each result's layout, shared pieces (flow layout, badges, KV grid, disclosure, `NTAsk` sheets over the panel) |
 | `SSHKeys.swift` | `listKeys` (fingerprint, type, bits, passphrase from the key's header, mtime, mode/permission check), `agentKeys`, `isEncrypted`, `addToAgent` (pty, askpass disabled, every prompt answered), `generate`, `installScript`/`install`, `knownHostEntries`, `forgetHost`, `teleportIdentity`, `agentOnly` grouping. `SSHKeys.sshDir` is overridable (tests use a temp dir) |
-| `KeysDialog.swift` | the SSH keys sheet, Install public key, Generate SSH key, passphrase prompt, Forget host key |
+| `SSHKeysExtra.swift` | FIDO2 `generateSecurityKey` (pty, PIN, touch), `knownHostEntries/forgetHost(files:)`, `knownHostsFiles(alias:configFile:)` |
+| `NetDNS.swift` | DNS commands, CAA/SOA/NAPTR, TTLs, `DNSWire` (UDP/TCP DNS to a chosen nameserver) |
+| `NetStartTLS.swift` | STARTTLS (smtp/imap/pop3) as an `NWProtocolFramer` under TLS |
+| `NetPreview.swift` | `previewCommand` — the live command preview and Copy command |
+| `NetSockets.swift`, `NetSocketsView.swift` | sockets.js: ss / netstat / lsof parsers, local (`lsof -i -n -P`) and on a host |
+| `DecodeCIDR/JWT/SSHCert/SVID.swift`, `NTDER.swift` | decoders.js: CIDR, URL, JWT, OpenSSH certificates, X.509-SVIDs (DER parser, signature checks via CryptoKit/SecKey) |
+| `NetDecodeIO.swift`, `NetDecodeViews.swift`, `NTDecodeUI.swift` | `decode:run`, tsh certificates, Browse…, the Decode menu, the decoder layouts (Readable/Raw) |
+| `KeysDialog.swift` | the SSH keys sheet, Install public key, Generate SSH key (incl. FIDO2), Load PKCS#11 token, passphrase prompt, Forget host key |
 
 ## Uses from other owners
 
@@ -70,3 +78,10 @@ one forward.
 - Save output… offers a target-shaped file name (`ping-<target>.txt`,
   `ports-from-<host>-to-<target>.json`, `response-<target>.json` …) — the original computed these
   but passed none.
+- **STARTTLS** is an `NWProtocolFramer` below TLS; unit-tested only for the command, not yet run
+  against a live mail server.
+- An SVID whose key is written with explicit EC curve parameters (LibreSSL's `openssl req`) shows
+  its key type as `ec` rather than the curve name.
+- Per-certificate `signedByNext` in a TLS chain is not computed.
+- IP version and the command preview are offered only for runs from this machine (as the original's
+  host-side tools take no family).

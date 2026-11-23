@@ -82,7 +82,7 @@ private func teleportNode(ambiguous: Bool = false) -> SLHost {
     s.x11 = "trusted"
     s.transport = .tsh
     #expect(s.tshArgs([], command: "uptime")
-            == ["--proxy=proxy.example.com:443", "--mfa-mode=browser", "ssh", "--cluster=c1", "-A", "-X",
+            == ["--proxy=proxy.example.com:443", "--mfa-mode=browser", "ssh", "--cluster=c1", "-A", "-Y",
                 "ubuntu@web-1", "uptime"])
     #expect(s.tshArgs(["-L", "8080:localhost:80", "-N"]).suffix(4) == ["-L", "8080:localhost:80", "-N", "ubuntu@web-1"])
     // An ambiguous hostname is dialled by UUID.

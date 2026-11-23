@@ -56,7 +56,7 @@ final class MainMenu: NSObject, NSMenuItemValidation {
         s.addItem(.separator())
         add(s, "Command Snippets…", "snippets", key: "c", mods: [.command, .shift])
         add(s, "SSH Keys…", "keys", key: "k", mods: [.command, .shift])
-        add(s, "Network Tools…", "nettools", key: "t", mods: [.command, .shift])
+        add(s, "Network and Certificate Tools…", "nettools", key: "t", mods: [.command, .shift])
         add(s, "S3 Buckets…", "s3")
         add(s, "Run Macro…", "run-macro", key: "r", mods: [.command, .shift])
         add(s, "Multi-Exec…", "multiexec", key: "m", mods: [.command, .shift])

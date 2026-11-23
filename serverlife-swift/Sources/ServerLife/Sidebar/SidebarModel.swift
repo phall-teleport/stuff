@@ -17,12 +17,28 @@ final class SidebarWindow: WindowFeature {
     /// The filter in force (trimmed; set 120 ms after typing stops).
     private(set) var filterText = ""
     @ObservationIgnored private(set) var filterMatch = Tags.compileQuery("")
-    /// Collapsed group keys (not persisted, as the original).
-    var collapsed: Set<String> = []
-    /// Shut folders, for this run of the app.
-    var foldersShut: Set<String> = []
+    /// All/SSH/K8s — which kind of resource the Resources (Hosts) tab shows.
+    /// Only reachable, and only shown, while KubeLife is enabled. One choice
+    /// for the sidebar and every Hosts pane in the window (`setHostKind`).
+    private(set) var hostKindFilter = "all"
+    /// Closed group headings and closed folders, kept in settings so a
+    /// restart opens the sidebar the way it was left rather than spreading
+    /// every cluster out again. Folder ids are stable; group keys are the
+    /// cluster or file key.
+    var collapsed: Set<String> {
+        get { Set(SB.store.setting("sidebarClosedGroups", [String]())) }
+        set { SB.store.setSetting("sidebarClosedGroups", newValue.sorted()) }
+    }
+    var foldersShut: Set<String> {
+        get { Set(SB.store.setting("sidebarClosedFolders", [String]())) }
+        set { SB.store.setSetting("sidebarClosedFolders", newValue.sorted()) }
+    }
     /// Host ids ticked for multi-exec.
     var checkedHosts: Set<String> = []
+    /// What the Hosts tab last drew, by host id (sidebar.js `drawnHosts`).
+    @ObservationIgnored var drawnHosts: [String: Host] = [:]
+    /// The ticked hosts, resolved back to hosts (`checkedHostObjects`).
+    var checkedHostObjects: [Host] { checkedHosts.compactMap { drawnHosts[$0] ?? SB2.hostById($0) } }
     /// Bumped when something drawn changed outside observation (requestable rows arriving).
     var tick = 0
 
@@ -51,6 +67,33 @@ final class SidebarWindow: WindowFeature {
     func toggleTerm(_ term: String) { setFilter(Tags.toggleTerm(filterText, term)) }
 
     func hostMatches(_ h: Host) -> Bool { filterMatch.match(h) }
+
+    /// `setHostKind`: all | ssh | kube, anything else is all.
+    func setHostKind(_ kind: String) {
+        hostKindFilter = ["all", "ssh", "kube"].contains(kind) ? kind : "all"
+    }
+
+    /// `hostKindShown`: SSH only while KubeLife is off.
+    var hostKindShown: String {
+        if !SBKube.enabled { return "ssh" }
+        return hostKindFilter
+    }
+
+    /// `applyKubeEnabledSetting`: switched off while filtered to K8s, there
+    /// is nothing left to show it, so fall back to the full list rather than
+    /// an empty one with no visible cause.
+    func applyKubeEnabled() {
+        if !SBKube.enabled && hostKindFilter == "kube" { hostKindFilter = "all" }
+    }
+
+    /// `inKindShown`: whether a row belongs under the All/SSH/K8s filter.
+    /// Ghosts drawn from watch records carry a `kube:` id rather than a kind.
+    func inKindShown(_ h: Host) -> Bool {
+        let k = hostKindShown
+        if k == "all" { return true }
+        let kube = SBKube.isKubeHost(h)
+        return k == "kube" ? kube : !kube
+    }
 
     /// `matches(text)` for the saved lists: a plain substring test.
     func matches(_ text: String?) -> Bool {
@@ -274,8 +317,10 @@ enum SBItem: Identifiable {
     case more(groupKey: String, hidden: Int)
     case empty(id: String, lines: [String], kind: SBEmptyKind)
     case narrowed(TeleportProfile, granted: Int)
-    case expired(TeleportProfile)
-    case beamHead(proxy: String, count: Int)
+    case expired(TeleportProfile, saved: JSON?)
+    case beamHead(TeleportProfile, count: Int)
+    case phases(TeleportProfile)
+    case kubeLocal
     case beam(Beam)
     case beamAdd(TeleportProfile, first: Bool)
     case local(String)
@@ -287,8 +332,10 @@ enum SBItem: Identifiable {
         case .more(let k, _): return "more|\(k)"
         case .empty(let id, _, _): return "e|\(id)"
         case .narrowed(let p, _): return "n|\(p.key)"
-        case .expired(let p): return "x|\(p.key)"
-        case .beamHead(let px, _): return "bh|\(px)"
+        case .expired(let p, _): return "x|\(p.key)"
+        case .beamHead(let p, _): return "bh|\(p.proxy)"
+        case .phases(let p): return "ph|\(p.proxy)"
+        case .kubeLocal: return "kube-local"
         case .beam(let b): return "b|\(b.proxy)|\(b.id)"
         case .beamAdd(let p, _): return "ba|\(p.proxy)"
         case .local(let k): return "l|\(k)"
@@ -299,6 +346,7 @@ enum SBItem: Identifiable {
 /// What an empty-state block offers.
 enum SBEmptyKind {
     case plain
+    case loading
     case noNodes
     case filterMiss
     case tpError(missing: Bool)
@@ -312,6 +360,10 @@ enum SBGroupTag {
     case leaf(TeleportProfile)
     case requests(TeleportProfile)
     case expired
+    case loggedOut
+    case vnet(TeleportProfile)
+    case env(TeleportProfile)
+    case soon(TeleportProfile)
     case refresh(key: String, title: String, profile: TeleportProfile?)
     case beams(Int)
     case active
@@ -352,7 +404,7 @@ extension SB2 {
         var rows: [SBItem] = []
         let filtering = !sw.filterText.isEmpty
         let ghosts = (HostWatch.missingIn(groupKey, hostsIn) + HostWatch.requestableIn(groupKey, hostsIn)
-            + HostWatch.unconfirmedIn(groupKey, hostsIn)).filter { visibleHost($0, sw) }
+            + HostWatch.unconfirmedIn(groupKey, hostsIn)).filter { visibleHost($0, sw) && sw.inKindShown($0) }
         let hosts = ghosts.isEmpty ? hostsIn : ghosts + hostsIn
 
         func walk(_ parent: String?, _ depth: Int) {
@@ -393,122 +445,12 @@ extension SB2 {
         let f = sw.filterText.lowercased()
         let list = f.isEmpty ? all : all.filter { JSON.encode($0).text().lowercased().contains(f) }
         if !f.isEmpty && list.isEmpty { return [] }
-        var rows: [SBItem] = [.beamHead(proxy: p.proxy, count: all.count)]
+        var rows: [SBItem] = [.beamHead(p, count: all.count)]
+        // Beams | Phases | Failed, as tabs, where this tsh can do Phases.
+        if BeamPhaseLists.shared.tab(for: p.proxy) != .beams { return rows + [.phases(p)] }
         rows += list.map { .beam($0) }
         rows.append(.beamAdd(p, first: list.isEmpty))
         return rows
-    }
-
-    /// Everything the Hosts tab draws (`renderHostsTab`), groups in the user's order.
-    static func hostsTab(_ sw: SidebarWindow) -> [SBEntry] {
-        var entries: [SBEntry] = []
-        if inv.loading && inv.nodesByKey.isEmpty && inv.sshHosts.isEmpty {
-            return [.note(id: "loading", lines: ["Loading inventory…"], kind: .plain)]
-        }
-
-        // Starred, gathered.
-        if HostPrefs.starredMode == "group" {
-            let starred = starredHosts().filter { visibleHost($0, sw) }
-            if !starred.isEmpty {
-                entries.append(.group(SBGroup(key: "starred", title: "Starred", count: starred.count, tags: [.gathered],
-                    items: starred.map { h in .host(SBHostItem(host: h, label: h.type == Host.teleport ? labelSummary(h) : (h.viaTsh ? "tsh" : (h.user ?? "")), groupKey: "starred")) })))
-            }
-        }
-
-        // Teleport clusters.
-        let beamNodes = inv.beamNodeNames()
-        for p in inv.profiles {
-            let key = FolderModel.groupKey(for: p)
-            let nodes = inv.nodesByKey[p.key] ?? []
-            let reachable = nodes.filter { !beamNodes.contains($0.name) }
-            let askable = SBRequestableCache.shared.hosts(for: p)
-            var have = Set(reachable.compactMap(\.uuid))
-            let held = Narrowed.heldBack(for: p, reachable: reachable)
-            for h in held { if let u = h.uuid { have.insert(u) } }
-            let shown = (reachable + held + askable.filter { !have.contains($0.uuid ?? "") }).filter { visibleHost($0, sw) }
-            let title = p.cluster.nilIfEmpty ?? p.proxy
-            if p.expired {
-                let ghosts = (HostWatch.missingIn(key, []) + HostWatch.unconfirmedIn(key, [])).filter { visibleHost($0, sw) }
-                var items: [SBItem] = ghosts.map { .host(SBHostItem(host: $0, label: labelSummary($0), groupKey: key)) }
-                items.append(.expired(p))
-                entries.append(.group(SBGroup(key: key, title: title, count: 0, profile: p,
-                    tags: [.home(p), .requests(p), .expired, .refresh(key: key, title: "Re-read this cluster", profile: p)],
-                    items: items)))
-                continue
-            }
-            let beamRows = beamItems(p, sw)
-            if shown.isEmpty && beamRows.isEmpty && !sw.filterText.isEmpty { continue }
-            var rows = groupRows(key, shown, sw) { labelSummary($0) }
-            if Narrowed.isNarrowed(p) { rows.insert(.narrowed(p, granted: reachable.count), at: 0) }
-            if rows.isEmpty { rows = [.empty(id: key + "|none", lines: ["No nodes visible."], kind: .noNodes)] }
-            var tags: [SBGroupTag] = [.home(p), .leaf(p), .requests(p),
-                                      .refresh(key: key, title: "Re-read this cluster: its nodes, its leaves and its beams", profile: p)]
-            let beams = BeamsUI.visibleBeams(p.proxy).count
-            if inv.beamsSupported(p.proxy) && beams > 0 { tags.append(.beams(beams)) }
-            if p.active { tags.append(.active) }
-            entries.append(.group(SBGroup(key: key, title: title, count: shown.count, profile: p, tags: tags, items: rows + beamRows)))
-        }
-
-        if !sw.filterText.isEmpty && inv.profiles.contains(where: { !$0.expired })
-            && !inv.allNodes.contains(where: { visibleHost($0, sw) }) {
-            entries.append(.note(id: "filtermiss", lines: [
-                "No Teleport node matches \(sw.filterText).",
-                "Tags match as key=value, key:partial, key=a,b for either, or -key=value to exclude.",
-            ], kind: .filterMiss))
-        }
-
-        if let err = inv.teleportError, inv.profiles.isEmpty {
-            let missing = tshMissing()
-            entries.append(.group(SBGroup(key: "tp:none", title: "Teleport", count: 0, items: [
-                .empty(id: "tp:none", lines: [
-                    missing ? "tsh was not found on this machine." : err,
-                    missing ? "Clusters are read through tsh, so nothing can be listed until it is located."
-                            : "Run tsh login, then Refresh.",
-                ], kind: .tpError(missing: missing)),
-            ])))
-        }
-
-        // ssh_config hosts, one group per file.
-        let sshShown = inv.sshHosts.filter { visibleHost($0, sw) }
-        let noSsh = sshMissing()
-        for root in configRoots() {
-            let mine = sshHosts(of: root, sshShown)
-            if !root.primary && !sw.filterText.isEmpty && mine.isEmpty { continue }
-            let sshRows = groupRows(root.key, mine, sw) { sshLabel($0) }
-            var rows: [SBItem] = []
-            if root.primary && noSsh {
-                rows.append(.empty(id: "nossh", lines: ["No ssh client on this machine.",
-                                                         "These hosts need OpenSSH; Teleport nodes open with tsh ssh instead."], kind: .noSsh))
-            }
-            if sshRows.isEmpty {
-                let line = !sw.filterText.isEmpty ? "No matches." : !root.exists ? "That file is not there." : "No hosts in \(root.label)."
-                rows.append(.empty(id: root.key + "|none", lines: [line], kind: .sshEmpty(primary: root.primary, showButton: sw.filterText.isEmpty)))
-            } else {
-                rows += sshRows
-            }
-            var tags: [SBGroupTag] = []
-            if !root.exists { tags.append(.missingFile(root.file)) }
-            if !root.primary { tags.append(.extraFile(root.file)) }
-            tags.append(.refresh(key: root.key, title: "Re-read the ssh config files", profile: nil))
-            entries.append(.group(SBGroup(key: root.key, title: root.label, count: mine.count, tags: tags, items: rows)))
-        }
-
-        // This machine.
-        entries.append(.group(SBGroup(key: "local", title: "Local", count: 3,
-                                      items: [.local("shell"), .local("keys"), .local("nettools")])))
-
-        // Watched hosts with nowhere left to be drawn.
-        let orphans = HostWatch.orphanGhosts(folderGroups().map(\.key)).filter { sw.hostMatches($0) }
-        if !orphans.isEmpty {
-            let goneN = orphans.filter(\.watchMissing).count
-            var tags: [SBGroupTag] = []
-            if goneN > 0 { tags.append(.gone(goneN)) }
-            if orphans.count - goneN > 0 { tags.append(.unchecked(orphans.count - goneN)) }
-            entries.append(.group(SBGroup(key: "gone", title: "Watched", count: orphans.count, tags: tags,
-                items: orphans.map { .host(SBHostItem(host: $0, label: labelSummary($0), groupKey: $0.watchGroup ?? "gone")) })))
-        }
-
-        return applyGroupOrder(entries)
     }
 
     /// Put the groups in the user's order, each into a slot another occupied,

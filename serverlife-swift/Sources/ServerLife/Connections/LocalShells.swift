@@ -144,8 +144,11 @@ final class LocalShells {
         let inv = LocalShells.invocation(shell: shell, blank: blank, command: command, args: args)
         var env: [String: String?] = ["TERM": "xterm-256color", "ELECTRON_RUN_AS_NODE": nil]
         if let h = teleportHome?.nilIfEmpty { env["TELEPORT_HOME"] = h }
-        if blank && command == nil { env["SERVERLIFE_BLANK_SHELL"] = "1" }
+        for (k, v) in LocalShells.toolsEnv(command: command, argv: inv.args) { env[k] = v }
+        // A launched program's own settings — an AI assistant's session config.
         for (k, v) in extra { env[k] = v }
+        // A blank shell says so, so a prompt or a script can tell.
+        if blank && command == nil { env["SERVERLIFE_BLANK_SHELL"] = "1" }
         var isDir: ObjCBool = false
         let dir: String
         if let c = cwd?.expandingTilde, FileManager.default.fileExists(atPath: c, isDirectory: &isDir), isDir.boolValue {
@@ -159,6 +162,25 @@ final class LocalShells {
         let kind = command == nil ? "local" : "command"
         return LocalShellSession(backend: LocalTerminal(PTYBackend(p, kind: kind)), shell: inv.file, blank: blank && command == nil,
                                  args: inv.args)
+    }
+
+    /// A tsh run in a tab — a login, a recording, a Phase build console — is
+    /// the tsh the app chose, the same as every tsh it runs in the background:
+    /// with a picked binary, client-tools managed updates are off, or another
+    /// build named `tsh` hands the console to another version. A plain shell
+    /// gets the every-cluster variables, if Settings asks for them there too.
+    static func toolsEnv(command: String?, argv: [String],
+                         environment: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        guard let command, !command.isEmpty else { return TshEnv.envForShells() }
+        let tsh = Tools.tsh
+        let same = command == tsh || Proc.which(command).map { $0 == (Proc.which(tsh) ?? tsh) } == true
+        guard same else { return [:] }
+        // The tsh variables from Settings, for the cluster this command names.
+        var out = TshEnv.envFor(TshEnv.proxyInArgs(argv))
+        if TshEnv.chosenTsh() != nil, environment["TELEPORT_TOOLS_VERSION"] == nil, out["TELEPORT_TOOLS_VERSION"] == nil {
+            out["TELEPORT_TOOLS_VERSION"] = "off"
+        }
+        return out
     }
 
     /// Hang up every local terminal (quitting).

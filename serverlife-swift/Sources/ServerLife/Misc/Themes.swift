@@ -91,6 +91,11 @@ enum MiscThemes {
                  term: .own("#343d46 #ec5f67 #99c794 #fac863 #6699cc #c594c5 #5fb3b3 #cdd3de #65737e #ec5f67 #99c794 #fac863 #6699cc #c594c5 #5fb3b3 #d8dee9")),
         AppTheme(id: "iceberg", label: "Iceberg", tone: "dark", bg: "#161821", fg: "#c6c8d1", accent: "#84a0c6",
                  term: .own("#1e2132 #e27878 #b4be82 #e2a478 #84a0c6 #a093c7 #89b8c2 #c6c8d1 #6b7089 #e98989 #c0ca8e #e9b189 #91acd1 #ada0d3 #95c4ce #d2d4de")),
+        // Phosphor green on green-black, like the Matrix skin, but an error still
+        // reads red and a directory still reads blue: the skin for a demo, this
+        // for a working day.
+        AppTheme(id: "matrix", label: "Matrix", tone: "dark", bg: "#020a04", fg: "#8fef9f", accent: "#00ff41",
+                 term: .own("#0a1f0f #e5484d #00d936 #b5e533 #3ea8d8 #a87fd6 #30d5b0 #9fe8ae #2f6b3e #ff6b6b #00ff41 #d7ff5f #6cc4f0 #c69cf0 #5ff5cf #d4ffdc")),
         AppTheme(id: "high-contrast", label: "High contrast", tone: "dark", bg: "#000000", fg: "#ffffff", accent: "#409cff",
                  term: .palette("high-contrast")),
         AppTheme(id: "solarized-light", label: "Solarized light", tone: "light", bg: "#fdf6e3", fg: "#586e75", accent: "#268bd2",
@@ -207,56 +212,6 @@ enum MiscThemes {
     static func toneOf(_ id: String?) -> String? {
         if id == "light" || id == "dark" { return id }
         return themeById(id)?.tone
-    }
-
-    // MARK: - macOS system colours
-
-    /// The styles.css tokens filled from AppKit's semantic colours, resolved
-    /// for a dark or light appearance. Translucent colours (separators,
-    /// secondary labels) are flattened over the background, since the tokens
-    /// are opaque hex.
-    static func systemTokens(dark: Bool) -> ([String: String], String) {
-        var out: [String: String] = [:]
-        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
-        appearance.performAsCurrentDrawingAppearance {
-            func srgb(_ c: NSColor) -> NSColor { c.usingColorSpace(.sRGB) ?? c }
-            let bg = srgb(dark ? NSColor.underPageBackgroundColor : NSColor.textBackgroundColor)
-            func hex(_ c: NSColor, over base: NSColor? = nil) -> String {
-                var c = srgb(c)
-                if let base, c.alphaComponent < 1 {
-                    let a = c.alphaComponent, b = srgb(base)
-                    c = NSColor(srgbRed: c.redComponent * a + b.redComponent * (1 - a),
-                                green: c.greenComponent * a + b.greenComponent * (1 - a),
-                                blue: c.blueComponent * a + b.blueComponent * (1 - a), alpha: 1)
-                }
-                return String(format: "#%02x%02x%02x", Int(round(c.redComponent * 255)),
-                              Int(round(c.greenComponent * 255)), Int(round(c.blueComponent * 255)))
-            }
-            let panel = srgb(NSColor.windowBackgroundColor)
-            out["--bg"] = hex(bg)
-            out["--panel"] = hex(panel)
-            // panel-2/panel-3 are what buttons are filled with (resting /
-            // hover): use the native push-button face, not the near-black
-            // control *background* colour, so buttons look like macOS's own.
-            let face = srgb(NSColor.controlColor)
-            out["--panel-2"] = hex(face, over: panel)
-            out["--panel-3"] = hex(face.withAlphaComponent(min(1, face.alphaComponent + (dark ? 0.12 : 0.0))),
-                                   over: dark ? panel : srgb(NSColor.unemphasizedSelectedContentBackgroundColor))
-            out["--border"] = hex(NSColor.separatorColor, over: panel)
-            out["--border-soft"] = hex(NSColor.separatorColor.withAlphaComponent(0.5), over: panel)
-            out["--text"] = hex(NSColor.labelColor, over: bg)
-            out["--text-dim"] = hex(NSColor.secondaryLabelColor, over: bg)
-            out["--muted"] = hex(NSColor.tertiaryLabelColor, over: bg)
-            out["--accent"] = hex(NSColor.controlAccentColor)
-            out["--accent-dim"] = hex(NSColor.controlAccentColor.withAlphaComponent(0.55), over: bg)
-            out["--green"] = hex(NSColor.systemGreen)
-            out["--red"] = hex(NSColor.systemRed)
-            out["--amber"] = hex(NSColor.systemOrange)
-            out["--purple"] = hex(NSColor.systemPurple)
-            out["--scroll-thumb"] = hex(NSColor.tertiaryLabelColor, over: panel)
-            out["--scroll-thumb-hover"] = hex(NSColor.secondaryLabelColor, over: panel)
-        }
-        return (out, dark ? "dark" : "light")
     }
 
     // MARK: - Colour arithmetic
@@ -380,6 +335,10 @@ enum MiscThemes {
              tokens: tokens("#120a24 #1b1036 #241547 #311d5e #452a80 #2d1a57 #f2e9ff #b39cf5 #7f6bbf #ff2e97 #a81361 #05ffa1 #ff5470 #ffb800 #b967ff #3d2570 #523397")),
         Skin(id: "matrix", label: "\u{1F7E9} Matrix", tone: "dark",
              tokens: tokens("#000700 #041004 #071807 #0b220b #144014 #0d2b0d #b6ffb6 #52d552 #2f8f2f #00ff41 #00a52a #00ff41 #ff4136 #d7ff2f #6cff9e #113d11 #1a5c1a")),
+        // Black and gold; blackletter (UnifrakturMaguntia) on the sidebar's
+        // headings, tabs, host names and dialog titles — `MiscThemes.skinDisplayFont(size:)`.
+        Skin(id: "thuglife", label: "\u{1F576}\u{FE0F} Thug Life", tone: "dark",
+             tokens: tokens("#080808 #101010 #171717 #1f1f1f #3a3220 #262014 #f1ece0 #c9bfa6 #9a8f74 #d4af37 #8a7224 #7fd36b #e5484d #f0c040 #b88cff #2e2818 #463c24")),
     ]
 
     static func skin(_ id: String?) -> Skin? { skins.first { $0.id == id } }
@@ -416,13 +375,6 @@ enum MiscThemes {
         let named = themeById(theme)
         var tone: String
         var tok: [String: String]
-        if theme == "system" {
-            // macOS's own colours, light or dark as the system is set, with
-            // the system accent; a skin still repaints on top.
-            let (t, tn) = systemTokens(dark: systemDark)
-            if let sk = skin(skinId) { return (sk.tokens, sk.tone) }
-            return (t, tn)
-        }
         if let named {
             tone = named.tone
             tok = themeTokens(named, appThemeAnsi(named) ?? [:])
@@ -445,15 +397,9 @@ enum MiscThemes {
     /// term.js `activeTheme()`.
     static func terminalColours(theme: String, skin skinId: String, palette: String, systemDark: Bool,
                                 tokens tok: [String: String]) -> [String: String] {
-        let tone = toneOf(theme == "auto" || theme == "system" ? nil : theme)
+        let tone = toneOf(theme == "auto" ? nil : theme)
         let light = tone == "light" || (tone == nil && !systemDark)
-        var base = light ? lightTerminal : darkTerminal
-        if theme == "system" {
-            // The terminal sits on the same surface as the window.
-            base["background"] = tok["--bg"] ?? base["background"]
-            base["foreground"] = tok["--text"] ?? base["foreground"]
-            base["cursorAccent"] = tok["--bg"] ?? base["cursorAccent"]
-        }
+        let base = light ? lightTerminal : darkTerminal
         func over(_ p: [String: String]) -> [String: String] { base.merging(p) { _, n in n } }
         // A named palette wins over both the theme and any skin.
         if let named = paletteByName(palette) { return over(named) }
@@ -524,5 +470,20 @@ extension Theme {
         }
         return NSColor(srgbRed: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
                        blue: CGFloat(v & 0xff) / 255, alpha: 1)
+    }
+}
+
+extension MiscThemes {
+    /// The Thug Life skin's blackletter (styles.css `[data-skin="thuglife"]`):
+    /// group heads, tabs, item names (15px), context-menu headings (14px, in
+    /// the accent colour) and dialog titles, not upper-cased. nil when another
+    /// skin is in force — draw the usual font. For the sidebar, tab strip and
+    /// dialog owners to apply.
+    @MainActor static func skinDisplayFont(size: CGFloat) -> Font? {
+        let skinId = preview?.skin ?? Store.shared.settingJSON("skin").string ?? "none"
+        guard skinId == "thuglife" else { return nil }
+        MiscFonts.registerBundled()
+        guard NSFontManager.shared.availableFontFamilies.contains("UnifrakturMaguntia") else { return nil }
+        return .custom("UnifrakturMaguntia", size: size)
     }
 }

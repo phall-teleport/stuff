@@ -12,6 +12,12 @@ struct TeleportTabView: View {
     var body: some View {
         let inv = Inventory.shared
         let profiles = inv.profiles
+        // The Hosts tab's shared filter box, in its own query language.
+        let sw = window.feature(SidebarWindow.self)
+        let filterText = sw.filterText.trimmed
+        let match = Tags.compileQuery(filterText)
+        let shown = profiles.filter { TeleportPanel.clusterMatchesFilter(name: TUI.name($0), cluster: $0.cluster,
+                                                                          proxy: $0.proxy, user: $0.username, match) }
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 if profiles.isEmpty {
@@ -25,10 +31,13 @@ struct TeleportTabView: View {
                     // Saved clusters are the whole point when nothing is logged
                     // in: the proxy address is gone from every list, and this is
                     // where it was kept.
-                    SavedLoginsSection(window: window)
+                    SavedLoginsSection(window: window, filterText: filterText, match: match)
                 } else {
-                    ForEach(profiles, id: \.key) { p in ProfileRow(p: p, window: window) }
-                    SavedLoginsSection(window: window)
+                    if !filterText.isEmpty && shown.isEmpty {
+                        TUIEmpty(lines: ["No cluster matches \(filterText)."])
+                    }
+                    ForEach(shown, id: \.key) { p in ProfileRow(p: p, window: window) }
+                    SavedLoginsSection(window: window, filterText: filterText, match: match)
                     TUIFlow(spacing: 6) {
                         Button("Add cluster…") { TeleportPanel.openLoginDialog(window: window) }.buttonStyle(.ghost)
                         Button("Requests…") { AccessRequestsUI.openRequestsDialog(TUI.activeProfile(), window: window) }
@@ -72,10 +81,25 @@ struct ProfileRow: View {
                 if !icon.isEmpty { Text(icon).font(.system(size: 12)) }
                 Text(TUI.name(p)).font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(colour ?? pal.text).lineLimit(1).truncationMode(.middle)
+                // A cluster name is only sometimes the proxy it is reached at;
+                // naming the proxy too is how the row is found again. The
+                // standard 443 is dropped from both comparison and display.
+                let proxyHost = Teleport.proxyAddress(p.proxy).replacingOccurrences(of: ":443$", with: "", options: .regularExpression)
+                if !p.cluster.isEmpty && !proxyHost.isEmpty && proxyHost != p.cluster {
+                    Text("(\(proxyHost))").font(.system(size: 11)).foregroundStyle(pal.muted).lineLimit(1).truncationMode(.middle)
+                }
                 if !p.homeName.isEmpty { TUITag(text: p.homeName, help: "TELEPORT_HOME=" + p.homeDir) }
                 LeafClusterTag(p: p, window: window)
                 if p.active { TUITag(text: "active", kind: .live, help: "Plain tsh commands use this cluster") }
                 if p.expired { TUITag(text: "expired", kind: .expired, help: "The certificate has lapsed") }
+                // One command away from being the row above, so clicking it
+                // offers resetting the clock.
+                if TeleportPanel.expiringSoon(p) {
+                    Button { Task { await TeleportPanel.doRelogin(p, window: window) } } label: {
+                        TUITag(text: "\u{23f3} \(TUI.formatUntil(p.validUntil)) left", kind: .warn,
+                               help: "Certificate expires soon — click to log out and back in now")
+                    }.buttonStyle(.plain)
+                }
                 Spacer(minLength: 0)
             }
             VStack(alignment: .leading, spacing: 1) {
@@ -104,7 +128,7 @@ struct ProfileRow: View {
     @ViewBuilder private var actions: some View {
         let sm = GhostButtonStyle(small: true)
         if p.expired {
-            Button("Login") { Task { await TeleportPanel.doLogin(p) } }.buttonStyle(sm)
+            Button("Login") { Task { await TeleportPanel.doLogin(p, window: window) } }.buttonStyle(sm)
         } else {
             Button(p.active ? "Active" : "Switch to") { Task { await TeleportPanel.doSwitch(p) } }
                 .buttonStyle(sm).disabled(p.active)
@@ -115,13 +139,31 @@ struct ProfileRow: View {
         }
         Button("Copy login cmd") { TeleportPanel.copyLoginCommand(p) }.buttonStyle(sm)
             .help("Copy the tsh login command for this cluster, to paste into a terminal")
+        Button("Login settings\u{2026}") {
+            let recs = TeleportPanel.savedRecordsFor(p)
+            var pre = TeleportPanel.LoginPrefill(proxy: p.proxy, home: TeleportPanel.recordHome(p), user: p.username, cluster: p.cluster)
+            pre.remember = true
+            // So saving from here does not quietly switch these off.
+            pre.autoLogin = recs.contains { $0["autoLogin"].truthy }
+            pre.showInHosts = recs.contains { $0["showInHosts"].truthy }
+            TeleportPanel.openLoginDialog(pre, window: window)
+        }.buttonStyle(sm)
+            .help("How this cluster is logged into \u{2014} SSO provider, local, passwordless, MFA \u{2014} kept for next time")
         Button("Save cluster") {
             TeleportPanel.saveClusterLogin(["name": .string(TUI.name(p)), "proxy": .string(p.proxy),
                                             "cluster": .string(p.cluster), "user": .string(p.username),
-                                            "home": .string(p.home != nil ? p.homeDir : "")])
+                                            "home": .string(TeleportPanel.recordHome(p))])
         }.buttonStyle(sm).help("Keep this cluster so it can be logged into again after the certificate goes")
+        let pinned = TeleportPanel.isPinned(p)
+        Button(pinned ? "Unpin" : "Pin") { TeleportPanel.togglePin(p) }.buttonStyle(sm)
+            .help(pinned ? "Stop keeping this cluster on the Hosts tab after a logout. The saved login is kept."
+                  : "Keep this cluster on the Hosts tab even after a logout, when tsh status no longer lists it")
+        // Nodes, leaves and beams for just this cluster, without waiting for
+        // the global Refresh — the same call the Hosts tab's ⟳ makes.
+        Button("Refresh") { Task { await Inventory.shared.refreshProfile(p) } }.buttonStyle(sm)
+            .help("Re-read this cluster: its nodes, its leaves and its beams")
         Button("Status") { Task { await TeleportPanel.openClusterStatus(p, window: window) } }.buttonStyle(sm)
-            .help("What tsh status says about this cluster")
+            .help("tsh status and version — what tsh status says about this cluster, plus the version it is running")
         if !p.expired {
             Button("Add to ssh config…") { Task { await TeleportPanel.openTshConfigDialog(p, window: window) } }.buttonStyle(sm)
                 .help("Put this cluster\u{2019}s tsh config block into ~/.ssh/config, so plain ssh, scp and rsync reach its nodes")
@@ -140,15 +182,24 @@ struct ProfileRow: View {
 /// certificate is live — a saved cluster is a record of how you log in.
 private struct SavedLoginsSection: View {
     let window: WindowModel
+    var filterText = ""
+    var match = Tags.compileQuery("")
 
     var body: some View {
-        let list = TUIData.listTshLogins()
+        let all = TUIData.listTshLogins()
+        // Filtered separately: a saved-but-never-logged-in cluster has no
+        // profile to match against.
+        let list = all.filter {
+            TeleportPanel.clusterMatchesFilter(name: $0["name"].stringish ?? "", cluster: $0["cluster"].stringish ?? "",
+                                               proxy: $0["proxy"].stringish ?? "", user: $0["user"].stringish ?? "", match)
+        }
         let profiles = Inventory.shared.profiles
-        if !list.isEmpty {
+        if !all.isEmpty && (!list.isEmpty || !filterText.isEmpty) {
             VStack(alignment: .leading, spacing: 0) {
                 Text("SAVED CLUSTERS").font(.system(size: 10.5, weight: .semibold)).kerning(0.6)
                     .foregroundStyle(Theme.shared.p.muted)
                     .padding(.horizontal, 10).padding(.top, 9).padding(.bottom, 3)
+                if list.isEmpty { TUIEmpty(lines: ["No saved cluster matches \(filterText)."]) }
                 ForEach(Array(list.enumerated()), id: \.offset) { _, t in
                     let home = t["home"].stringish ?? ""
                     let live = profiles.first { $0.proxy == t["proxy"].stringish && $0.homeDir == (home.nilIfEmpty ?? $0.homeDir) }
@@ -171,8 +222,11 @@ private struct SavedLoginRow: View {
         let cluster = t["cluster"].stringish ?? ""
         let name = t["name"].stringish ?? proxy
         let ttl = t["ttl"].stringish ?? ""
-        let meta = [t["user"].stringish ?? "", t["authConnector"].stringish ?? "", ttl.isEmpty ? "" : ttl + "m"]
+        let auth = t["authConnector"].stringish ?? "", mfa = t["mfaMode"].stringish ?? ""
+        let meta = [t["user"].stringish ?? "", auth.isEmpty ? "cluster default login" : "via \(auth)",
+                    mfa.isEmpty ? "" : "MFA \(mfa)", ttl.isEmpty ? "" : ttl + "m"]
             .filter { !$0.isEmpty }.joined(separator: " · ")
+        let pinned = t["showInHosts"].truthy
         let sm = GhostButtonStyle(small: true)
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 7) {
@@ -183,6 +237,7 @@ private struct SavedLoginRow: View {
                 if t["autoLogin"].truthy {
                     TUITag(text: "auto", help: "Logged in automatically when the app starts, if the certificate has gone")
                 }
+                if pinned { TUITag(text: "pinned", help: "Kept on the Hosts tab even when tsh status does not list it") }
                 Spacer(minLength: 0)
             }
             VStack(alignment: .leading, spacing: 1) {
@@ -193,6 +248,13 @@ private struct SavedLoginRow: View {
             TUIFlow(spacing: 5) {
                 Button(on ? "Log in again" : "Log in") { TeleportPanel.loginFromSaved(t, window: window) }
                     .buttonStyle(GhostButtonStyle(small: true, prominent: !on))
+                Button(pinned ? "Unpin" : "Pin") {
+                    var r = t
+                    r["showInHosts"] = .bool(!pinned)
+                    TeleportPanel.saveClusterLogin(r)
+                }.buttonStyle(sm)
+                    .help(pinned ? "Stop keeping this cluster on the Hosts tab while tsh status does not list it. The saved login is kept."
+                          : "Keep this cluster on the Hosts tab even when tsh status does not list it")
                 Button("Copy login cmd") {
                     TeleportPanel.copyLoginCommand(proxy: proxy, username: t["user"].stringish ?? "",
                                                    homeDir: t["home"].stringish?.nilIfEmpty,

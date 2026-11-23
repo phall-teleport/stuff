@@ -23,6 +23,12 @@ folders.js.
 | `FolderModel.swift` | folder model (pure-ish, on `SB.store`) |
 | `Heartbeat.swift`, `Narrowed.swift`, `Requestable.swift`, `HostWatch.swift`, `ClusterMarks.swift`, `HostPrefs.swift` | the original modules of the same names; HostPrefs = per-host/cluster prefs of sidebar.js |
 | `SidebarHooks.swift` | extension points |
+| `SidebarHostsTab.swift` | 0.39 Hosts tab builder: kind filter (All/SSH/K8s), pinned saved clusters, expired list (last known hosts), kube groups |
+| `SidebarKube.swift`, `SidebarRowsExtra.swift` | kube rows (drawn through `SidebarHooks` kube hooks), `sbPrefKey`, loading radar, beam/AI rows |
+| `HostMenuExtra.swift`, `GroupMenuExtra.swift` | 0.39 host-menu items (startup command, bulk request, style, Ask AI, SSH options, ssh source, install Teleport, watch profile) and group-menu items (Decode, ssh config, tsh env, VNet, proxy note) |
+| `SidebarTeleportPresence.swift`, `SidebarInstallTeleport.swift` | presence tags / offer and the "Install Teleport on this host…" wizard |
+| `SidebarWatchProfile.swift` | watch profile dialog |
+| `SidebarRunCommand.swift`, `SidebarRunCommandView.swift` | "Run a command…": `commandHistory` (25, Recent…), Run as + note, tsh-transport interactive exec with the MFA prompt row |
 | `_SidebarDataStandIn.swift` | store.js `addForwardFavorite` / `markForwardFavoriteUsed` |
 
 ## Action ids registered
@@ -43,6 +49,10 @@ folders.js.
 | `open-host-from-list` | open a host exactly as the list does (tmux / MFA routing, preferred login) | host; `login` |
 | `request-access-for` | start a request for a requestable/out-of-reach node | host |
 | `watch-forget-all` | stop watching every host | — |
+| `watch-note-logged-out` | watch.js `noteLoggedOut` — **teleport-ui: call on logout** | `groupKey`, or `proxy` + `home` |
+| `add-to-teleport` | "Install Teleport on this host…" wizard | host, or `hostId` + `label` |
+| `teleport-presence` | query `TeleportPresence?` (`reply`), and/or set it (`presence` JSON) | `hostId`, `reply`, `presence` |
+| `teleport-install-offer` | `offerTeleportInstallFor`: the one-time "no Teleport agent" notice | `hostId`, `label`, `again` Bool |
 | `sidebar-debug-next-tab` | `--snapshot` only: step through tabs | — |
 
 ## Extension points
@@ -95,6 +105,10 @@ teleport-ui: `access-requests`, `access-request-new`, `request-monitor-add`, `ts
 `tsh-logout`, `tsh-make-active`, `tsh-config`, `live-sessions`, `recordings`, `beam-start`, `beam-open`,
 `beam-menu` (all with `profileKey` where a profile is meant). consoles: `tmux-open` (no `session` → its
 dialog). nettools: `keys`, `nettools`, `forget-host-key`. explorer: `local-files` (`path`; **`show: true`** for "Show local files in this pane" — explorer, please honour it as force-on).
+0.39: `kube-refresh` (`proxy`, `home`), `kube-host-menu` (`menu`, `context`, `groupKey`), `kube-browser`,
+`decode-menu` (`menu`, `input`, `proxy`, `cluster`, `home` — **nettools: not registered yet**),
+`host-style-menu` (`key`, `reply` — **sessions: not registered yet**), `access-request-many`, `tsh-env-edit`,
+`vnet-*`, `ai-ask`, `ai-sidebar-row`, `ssh-options`, `ssh-config-edit` (`path`), `add-server` (`configFile`), `multiexec`.
 misc: `locate-tools`, `backup-export`, `backup-import`. fleet: `snippet-from-selection` (`text`).
 
 ## Differences / not done
@@ -110,3 +124,6 @@ misc: `locate-tools`, `backup-export`, `backup-import`. fleet: `snippet-from-sel
 - Menus show "✓" via the key column (CtxMenu has no checkmark state).
 - Context-menu right-clicks are caught by a transparent overlay (`SBRightClick`) so menus can be built
   from `CtxItem`s with icons, subtitles and tooltips.
+- Macros drag-reorder uses `SidebarMacroSource.moveMacro` (fleet's `FleetSidebarMacros` has it; default no-op).
+- Settings read with their store.js defaults inline (`showServerIcon`, `expiredListMode`/`Hours`,
+  `commandHistory`, `hostStartupCommand`, `kubeEnabled`) — `Core/StoreDefaults.swift` does not list them.

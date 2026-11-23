@@ -112,6 +112,15 @@ enum MCPBridge {
 
     // MARK: JSON-RPC over stdio
 
+    /// The client's own name from `initialize` (`clientInfo.name`, at most 60
+    /// characters), passed along as `_client` with every call.
+    private static let clientLock = NSLock()
+    nonisolated(unsafe) private static var _clientName: String?
+    static var clientName: String? {
+        get { clientLock.withLock { _clientName } }
+        set { clientLock.withLock { _clientName = newValue } }
+    }
+
     private static let writeLock = NSLock()
 
     static func write(_ msg: JSON) {
@@ -140,13 +149,19 @@ enum MCPBridge {
         }
         switch msg["method"].string ?? "" {
         case "initialize":
+            // Who is asking, so ServerLife can name it when it asks the person.
+            let n = msg["params"]["clientInfo"]["name"].stringish ?? ""
+            clientName = n.isEmpty ? nil : String(n.prefix(60))
             return ok([
                 "protocolVersion": .string(protocolVersion),
                 "capabilities": ["tools": .object([:])],
                 "serverInfo": ["name": "serverlife", "version": "1.0.0"],
                 "instructions": .string("Drives a running ServerLife window: list hosts and beams, open sessions (singly "
-                    + "or as a set), synchronise folders with a server or a beam, manage layouts, read Teleport "
-                    + "cluster state and run the user's saved macros. "
+                    + "or as a set — a Kubernetes cluster opens its own browser tab the same way a host opens a "
+                    + "terminal), browse a logged-in Kubernetes cluster's own resources (kinds, resources, a "
+                    + "resource's YAML or description — all read-only), synchronise folders with a server or a "
+                    + "beam, manage layouts, read Teleport cluster state, run the user's saved macros, read what "
+                    + "a session shows, and — when the user allows it — type into a session. "
                     + "The app must be running with Settings → Local automation turned on."),
             ])
         case "ping":
@@ -160,8 +175,9 @@ enum MCPBridge {
                 return err(-32602, "Unknown tool \"\(name ?? "undefined")\"")
             }
             do {
-                let args = msg["params"]["arguments"]
-                let data = try call(tool.verb, args.object != nil ? args : .object([:]))
+                var args = msg["params"]["arguments"].object ?? [:]
+                args["_client"] = clientName.map(JSON.string) ?? .null
+                let data = try call(tool.verb, .object(args))
                 return ok(["content": [["type": "text", "text": .string(data.jsText(indent: 2))]]])
             } catch {
                 // A tool that failed is a result, not a protocol error: the

@@ -130,22 +130,63 @@ struct NetToolsView: View {
     @ViewBuilder
     private var optionsRow: some View {
         switch model.tool {
+        case "url", "sshcert", "jwt", "svid":
+            pasteBlock.padding(.bottom, 9)
+        case "cidr":
+            NTFlow(spacing: 12) {
+                NTField(label: "Is this address in it?") {
+                    NTTextBox(placeholder: "10.0.4.20 (optional)", text: $model.cidrCheck, width: 200, onSubmit: { model.run() })
+                }
+            }.padding(.bottom, 9)
         case "ping":
             NTFlow(spacing: 12) {
                 NTField(label: "Packets") { NTTextBox(placeholder: "5", text: $model.count, width: 70) }
+                // The host-side ping is a different implementation that does
+                // not take this, so it is only offered for a run from here.
+                if model.runOn.isEmpty { ipVersionField }
             }.padding(.bottom, 9)
+            cmdPreviewBlock
+        case "traceroute":
+            if model.runOn.isEmpty { NTFlow(spacing: 12) { ipVersionField }.padding(.bottom, 9) }
+            cmdPreviewBlock
         case "ports":
             NTFlow(spacing: 12) {
                 NTField(label: "Ports", hint: "Blank uses the port in the target, else the usual SSH and Teleport ports") {
                     NTTextBox(placeholder: "22,443,3022-3025", text: $model.ports, width: 220, onSubmit: { model.run() })
                 }
+                if model.runOn.isEmpty { ipVersionField }
             }.padding(.bottom, 9)
-        case "http":
+            cmdPreviewBlock
+        case "dns":
             NTFlow(spacing: 12) {
-                NTField(label: "Method") {
-                    NTSelect(options: [("GET", "GET"), ("HEAD", "HEAD")], value: $model.method).fixedSize()
+                NTField(label: "Via nameserver", hint: "Blank asks this machine\u{2019}s own resolver") {
+                    NTTextBox(placeholder: "this machine\u{2019}s own (default)", text: $model.dnsServer, width: 220, onSubmit: { model.run() })
                 }
             }.padding(.bottom, 9)
+            cmdPreviewBlock
+        case "tls":
+            NTFlow(spacing: 12) {
+                NTField(label: "Protocol", hint: "For a plaintext port that upgrades itself — SMTP, IMAP or POP3") {
+                    NTSelect(options: [("", "Direct TLS (default)"), ("smtp", "STARTTLS — SMTP"), ("imap", "STARTTLS — IMAP"),
+                                       ("pop3", "STARTTLS — POP3")], value: $model.starttls).fixedSize()
+                }
+            }.padding(.bottom, 9)
+            cmdPreviewBlock
+        case "http":
+            VStack(alignment: .leading, spacing: 8) {
+                NTFlow(spacing: 12) {
+                    NTField(label: "Method") {
+                        NTSelect(options: [("GET", "GET"), ("HEAD", "HEAD")], value: $model.method).fixedSize()
+                    }
+                }
+                NTField(label: "Headers (one per line)") {
+                    NTTextArea(placeholder: "Accept: application/json\nX-Request-Id: abc123", text: $model.httpHeaders, minHeight: 50)
+                }
+                Toggle("Skip certificate verification (-k)", isOn: $model.httpInsecure).font(.system(size: 12))
+            }.padding(.bottom, 9)
+            cmdPreviewBlock
+        case "whois", "teleport":
+            cmdPreviewBlock
         case "telnet":
             let noTelnet = !model.runOn.isEmpty && (model.caps.map { !$0.tools.contains("telnet") } ?? false)
             NTFlow(spacing: 12) {
@@ -169,6 +210,7 @@ struct NetToolsView: View {
                                                     : "Open a terminal on that host running telnet to the target")
                 }
             }.padding(.bottom, 9)
+            cmdPreviewBlock
         case "serial":
             NTFlow(spacing: 12) {
                 NTField(label: "Port") { NTTextBox(placeholder: "/dev/tty.usbserial-1410 or COM3", text: $model.serialPath, width: 240) }
@@ -196,6 +238,71 @@ struct NetToolsView: View {
             }.padding(.bottom, 9)
         default:
             EmptyView()
+        }
+    }
+
+    /// Shared by ping, traceroute and the port check — a dual-stack host
+    /// flaky over one family but not the other.
+    private var ipVersionField: some View {
+        NTField(label: "IP version") {
+            NTSelect(options: [("", "Either"), ("4", "IPv4"), ("6", "IPv6")], value: $model.ipVersion).fixedSize()
+        }
+    }
+
+    /// The command a tool would run, before it is run — copyable, so it can
+    /// be run by hand without ServerLife touching the target at all. Not when
+    /// running from a host: it would be the local equivalent of something else.
+    @ViewBuilder
+    private var cmdPreviewBlock: some View {
+        let pv = model.commandPreview
+        if let c = pv.command, !c.isEmpty {
+            NTCmdBlock(command: c, note: pv.note).padding(.bottom, 9)
+        }
+    }
+
+    private static let pastePlaceholders = [
+        "url": "Text or a URL — it is shown both encoded and decoded",
+        "sshcert": "ssh-ed25519-cert-v01@openssh.com AAAA… (a -cert.pub line)",
+        "jwt": "eyJhbGciOi… (a \"Bearer \" in front is fine)",
+        "svid": "-----BEGIN CERTIFICATE-----\n… (a chain may follow the leaf)",
+    ]
+
+    private var pasteBlock: some View {
+        let p = theme.p
+        return VStack(alignment: .leading, spacing: 6) {
+            NTField(label: model.tool == "url" ? "Text" : "Paste it here") {
+                NTTextArea(placeholder: Self.pastePlaceholders[model.tool] ?? "",
+                           text: Binding(get: { model.pasteText }, set: { model.pasteText = $0; model.pasteEdited() }),
+                           minHeight: 84)
+            }
+            HStack(spacing: 8) {
+                Button("Browse…") { model.browsePaste() }
+                    .buttonStyle(.ghostSmall)
+                    .help("Decode a file from disk instead of pasting it")
+                if model.tool == "sshcert" {
+                    Menu {
+                        ForEach(Array(model.tshCerts.enumerated()), id: \.offset) { i, c in
+                            Button("\(c.cert.user) @ \(c.cert.cluster) (\(c.cert.proxy))") { model.useTshCert(i) }
+                        }
+                    } label: {
+                        Text(model.tshCerts.isEmpty ? "No tsh certificates found" : "Use a certificate tsh issued…")
+                            .font(.system(size: 12))
+                    }
+                    .menuStyle(.button).fixedSize()
+                    .disabled(model.tshCerts.isEmpty)
+                    .onAppear { model.tshCerts = NetDecodeIO.tshCerts() }
+                }
+                // ⌘Return runs, as in the original's paste box.
+                Button("") { model.run() }.keyboardShortcut(.return, modifiers: .command).hidden().frame(width: 0)
+            }
+            if !model.pasteFile.isEmpty {
+                HStack(spacing: 6) {
+                    Text("File").font(.system(size: 11)).foregroundStyle(p.muted)
+                    Button(model.pasteFile) { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.pasteFile)]) }
+                        .buttonStyle(.plain).font(.system(size: 11, design: .monospaced)).foregroundStyle(p.accent)
+                        .help("Show in Finder: \(model.pasteFile)")
+                }
+            }
         }
     }
 
@@ -230,6 +337,17 @@ struct NetToolsView: View {
                 NTField(label: "Basic auth") { NTTextBox(placeholder: "user (basic auth)", text: $model.curlUser, width: 180) }
                 NTField(label: "Password") { NTTextBox(placeholder: "password", text: $model.curlPass, width: 180, secure: true) }
             }
+            // --resolve, a private CA and a client cert/key: "what would this
+            // look like after the DNS cutover", and mutual TLS.
+            NTField(label: "--resolve (host:port:address, one per line)") {
+                NTTextArea(placeholder: "internal.example.com:443:10.0.0.5 — one per line, for --resolve",
+                           text: $model.curlResolve, minHeight: 36)
+            }
+            curlFileRow("CA bundle", "A CA bundle this proxy or service signs against", "Choose a CA bundle", $model.curlCaCert)
+            HStack(alignment: .top, spacing: 12) {
+                curlFileRow("Client certificate", "For mutual TLS", "Choose a client certificate", $model.curlClientCert)
+                curlFileRow("Client key", "Its private key", "Choose the certificate\u{2019}s private key", $model.curlClientKey)
+            }
             Toggle("Follow redirects (-L)", isOn: $model.curlFollow).font(.system(size: 12))
             Toggle("Skip certificate verification (-k)", isOn: $model.curlInsecure).font(.system(size: 12))
             Text(model.curlPreview)
@@ -238,6 +356,15 @@ struct NetToolsView: View {
                 .padding(.top, 2)
         }
         .padding(.top, 4).padding(.bottom, 2)
+    }
+
+    private func curlFileRow(_ label: String, _ placeholder: String, _ title: String, _ value: Binding<String>) -> some View {
+        NTField(label: label) {
+            HStack(spacing: 6) {
+                NTTextBox(placeholder: placeholder, text: value)
+                Button("Browse…") { model.pickCurlFile(title) { value.wrappedValue = $0 } }.buttonStyle(.ghostSmall)
+            }
+        }
     }
 
     // MARK: Strips
@@ -352,6 +479,8 @@ struct NetToolsView: View {
             }
             Spacer()
             Button("Close") { model.handle?.close() }.buttonStyle(.ghost).keyboardShortcut(.cancelAction)
+            Button("Copy command") { model.copyCommand() }.buttonStyle(.ghost)
+                .help("Copy the command this would run, or just ran, locally — without ServerLife touching the target at all")
             Button("Copy output") { model.copyOutput() }.buttonStyle(.ghost)
             examplesMenu
             Button("Save output…") { model.saveOutput() }.buttonStyle(.ghost)
@@ -427,6 +556,13 @@ struct NetHelp: View {
             "whois": "Registration for a domain or address.",
             "teleport": "A proxy\u{2019}s /webapi/ping — version, edition, auth and listeners. No login needed.",
             "local": "Interfaces and resolvers on this machine.",
+            "sockets": "Every listening and connected socket, with its process — ss/netstat/lsof -i, read and laid out.",
+            "cidr": "Network, mask, usable range and size of a subnet — IPv4 or IPv6. Worked out here; nothing is sent.",
+            "url": "Text encoded and decoded both ways, and a URL taken apart with its query decoded.",
+            "sshcert": "An OpenSSH certificate as ssh-keygen -L shows it — principals, validity, extensions and the signing CA. "
+                + "Decoded here; the signature is not checked against a CA.",
+            "jwt": "A JWT\u{2019}s header and claims, with its times in words. The signature is not verified — that needs the issuer\u{2019}s key.",
+            "svid": "An X.509-SVID: its SPIFFE ID, validity and issuer, checked against the SPIFFE rules, and any chain pasted after it.",
         ][id] ?? "Press Run."
     }
 
@@ -434,13 +570,18 @@ struct NetHelp: View {
         [
             "ping": ["Five packets at a host, to see loss and round-trip time",
                      "Twenty at one that drops out, to catch loss that comes and goes",
-                     "The default gateway, to rule out the local network first"],
+                     "The default gateway, to rule out the local network first",
+                     "Forced onto IPv6, when a dual-stack host is flaky over one family"],
             "traceroute": ["Find the hop where a route stops — usually the answer",
                            "Compare the path to a known-good address like 1.1.1.1"],
             "dns": ["Everything a name resolves to, in one pass", "A PTR for an address, to see which name claims it",
-                    "An SRV record, for how clients discover a service"],
+                    "An SRV record, for how clients discover a service",
+                    "Against 1.1.1.1 directly, to tell propagation from a stale local resolver"],
             "ports": ["The Teleport set — 443, 3023, 3024, 3025, 3080", "Just 22, when ssh hangs rather than refuses",
                       "The local end of a port forward, to prove the tunnel is up"],
+            "sockets": ["What is actually bound to a port, and by which process",
+                        "Confirming a service you just started is really listening",
+                        "Spotting a port already taken before your own process fails to bind it"],
             "telnet": ["A switch, PDU or terminal server that only answers on 23",
                        "What a port says when it is connected to — SSH, SMTP and friends name themselves",
                        "Which address a name resolves to today, the way telnet always told you"],
@@ -448,15 +589,27 @@ struct NetHelp: View {
                        "A console at 115200 8N1 — or 9600, for older network gear",
                        "Keep one you go back to as a saved connection"],
             "tls": ["How many days are left on a certificate", "Which names it actually covers (its SANs)",
-                    "What a non-standard port is presenting"],
-            "http": ["Whether a URL answers, and how quickly", "Where a redirect chain ends up", "Headers only, with a HEAD request"],
+                    "What a non-standard port is presenting",
+                    "A mail server on 587/143/110, with STARTTLS asked for first"],
+            "http": ["Whether a URL answers, and how quickly", "Where a redirect chain ends up", "Headers only, with a HEAD request",
+                     "For a method beyond GET/HEAD, a body, or bearer/basic auth — HTTP request (curl) below does those"],
             "curl": ["GET a JSON API and read it back formatted", "POST a JSON body, with a bearer token if it needs one",
-                     "Fire a webhook, and keep the call to fire again later"],
+                     "Fire a webhook, and keep the call to fire again later",
+                     "For per-hop timing across a redirect chain, the plain HTTP check above shows that; this does not"],
             "whois": ["Who a domain belongs to, and when it expires", "Which network an address belongs to"],
             "teleport": ["A cluster\u{2019}s version and edition, without logging in",
                          "Which auth connector is in play, and whether it is passwordless",
                          "Every listener, including Kubernetes and database addresses"],
             "local": ["This machine\u{2019}s addresses, when the problem may be here", "Which resolvers it is using"],
+            "cidr": ["The usable range of a VPC or security-group rule", "Whether an address falls inside an allow-list entry",
+                     "A netmask turned into a prefix: 10.0.0.0 255.255.240.0"],
+            "url": ["Read an encoded redirect or callback URL", "Encode a value before putting it in a query string"],
+            "sshcert": ["Which principals (logins) your Teleport certificate allows", "When it expires, and which roles it carries",
+                        "Which CA signed it — to match against TrustedUserCAKeys"],
+            "jwt": ["The claims in a Teleport application token", "Whether a token has expired, and when it was issued",
+                    "The subject of a JWT-SVID"],
+            "svid": ["The SPIFFE ID a workload was issued", "Whether the SVID keeps the SPIFFE rules",
+                     "When it expires, and whether the chain pasted with it lines up"],
         ][id] ?? []
     }
 

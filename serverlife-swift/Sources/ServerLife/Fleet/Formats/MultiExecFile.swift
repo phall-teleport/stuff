@@ -27,6 +27,28 @@ enum MultiExecFile {
         /// Milliseconds.
         var timeout = 120_000
         var stopOnError = false
+        /// Staged runs keep their stages: first so many, then batches of so many.
+        var stages: MultiExecService.Stages?
+        /// A host that fails is tried this many more times, so many seconds apart.
+        var retries = 0
+        /// Seconds.
+        var retryDelay: Double = 10
+
+        /// The staged-run and retry fields, through Data's helpers.
+        var extras: MXFileOptions.Extras {
+            get {
+                MXFileOptions.Extras(stages: stages.map {
+                    MXFileOptions.Stages(first: $0.first, batch: $0.batch, pause: $0.pause, stopOnFail: $0.stopOnFail)
+                }, retries: retries, retryDelaySeconds: retryDelay)
+            }
+            set {
+                stages = newValue.stages.map {
+                    MultiExecService.Stages(first: $0.first, batch: $0.batch, pause: $0.pause, stopOnFail: $0.stopOnFail)
+                }
+                retries = newValue.retries
+                retryDelay = newValue.retryDelaySeconds
+            }
+        }
     }
 
     /// A tag run: a cluster and a query resolved when it runs.
@@ -99,7 +121,7 @@ enum MultiExecFile {
             ("command", .string(oneTrailingNewline(command))),
             ("options", .map([("concurrency", .int(options.concurrency)),
                               ("timeoutSeconds", .int(Int((Double(options.timeout) / 1000).rounded(.toNearestOrAwayFromZero)))),
-                              ("stopOnError", .bool(options.stopOnError))])),
+                              ("stopOnError", .bool(options.stopOnError))] + MXFileOptions.yamlEntries(options.extras))),
         ]
         /*
          * A tag run saves the question rather than the answer: `selector` is what
@@ -176,6 +198,7 @@ enum MultiExecFile {
         def.options = Options(concurrency: conc.isFinite && conc != 0 ? Int(conc) : 10,
                               timeout: Int((secs.isFinite && secs != 0 ? secs : 120) * 1000),
                               stopOnError: o["stopOnError"].truthy)
+        def.options.extras = MXFileOptions.parse(options: o)
         def.selector = selector
         def.targets = targets
         return def

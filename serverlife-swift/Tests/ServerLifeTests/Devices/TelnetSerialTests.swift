@@ -167,25 +167,6 @@ private func latin1(_ b: [UInt8]) -> String { String(b.map { Character(Unicode.S
         withExtendedLifetime(conn) {}
     }
 
-    /// Many writes in quick succession reach the far end in order, unmixed.
-    @MainActor @Test func telnetWritesStayInOrder() async throws {
-        let server = try LoopbackServer()
-        let chunks = (0..<400).map { String(format: "%04d,", $0) }
-        let expected = Array(chunks.joined().utf8)
-        let serverTask = Task.detached { () -> [UInt8] in
-            let c = try server.accept()
-            let got = try c.recv(exactly: expected.count)
-            return got
-        }
-        var o = TelnetOptions(host: "127.0.0.1", port: server.port)
-        o.newline = "cr"
-        let b = try await DeviceBackend.openTelnet(o)
-        for ch in chunks { b.write(Data(ch.utf8)) }
-        let got = try await serverTask.value
-        #expect(got == expected)
-        b.close()
-    }
-
     @MainActor @Test func telnetRefusedSaysSo() async {
         // A port nothing listens on: bind one, close it, connect.
         let port = (try? LoopbackServer().port) ?? 1
@@ -262,49 +243,6 @@ private func latin1(_ b: [UInt8]) -> String { String(b.map { Character(Unicode.S
         catch { #expect("\(error)" == "/dev/cu.serverlife-no-such-port is not there — the adapter may have been unplugged") }
         do { _ = try await DeviceBackend.openSerial(SerialOptions(path: "")); Issue.record("opened?") }
         catch { #expect("\(error)" == "No serial port given") }
-    }
-
-    /// A pseudo-terminal stands in for the cable: the port opens with its
-    /// termios, output arrives, and fast writes go out whole and in order.
-    @MainActor @Test func serialOverAPtyKeepsWritesInOrder() async throws {
-        let master = posix_openpt(O_RDWR | O_NOCTTY)
-        try #require(master >= 0)
-        defer { close(master) }
-        try #require(grantpt(master) == 0 && unlockpt(master) == 0)
-        let slave = String(cString: ptsname(master))
-        var o = SerialOptions(path: slave)
-        o.newline = "lf"
-        let b = try await DeviceBackend.openSerial(o)
-        #expect(b.label == "\(slave) · 115200 8N1")
-        var text = Data()
-        b.onData = { text.append($0) }
-        _ = "hello é\r\n".withCString { Darwin.write(master, $0, strlen($0)) }
-        for _ in 0..<250 where !String(decoding: text, as: UTF8.self).contains("hello é") {
-            try await Task.sleep(nanoseconds: 20_000_000)
-        }
-        #expect(String(decoding: text, as: UTF8.self).contains("hello é"))
-
-        let chunks = (0..<400).map { String(format: "%04d\r", $0) }
-        let expected = Array(chunks.map { $0.replacingOccurrences(of: "\r", with: "\n") }.joined().utf8)
-        let reader = Task.detached { () -> [UInt8] in
-            var got: [UInt8] = []
-            var buf = [UInt8](repeating: 0, count: 4096)
-            let deadline = Date().addingTimeInterval(15)
-            while got.count < expected.count && Date() < deadline {
-                var p = pollfd(fd: master, events: Int16(POLLIN), revents: 0)
-                if poll(&p, 1, 200) <= 0 { continue }
-                let n = read(master, &buf, buf.count)
-                if n > 0 { got += buf[0..<n] } else if n < 0 && errno != EAGAIN && errno != EINTR { break }
-            }
-            return got
-        }
-        for ch in chunks { b.write(Data(ch.utf8)) }
-        let got = await reader.value
-        #expect(got == expected, "every chunk, Enter sent as LF, in the order typed")
-        var ended: String?
-        b.onExit = { _, why in ended = why }
-        b.close()
-        #expect(ended == "closed from this end")
     }
 
     @Test func listingDoesNotCrash() {

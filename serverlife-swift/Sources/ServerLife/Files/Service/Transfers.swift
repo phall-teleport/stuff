@@ -278,8 +278,21 @@ enum Transfers {
 
     // MARK: - Planning
 
+    /// Thrown by planUpload()/planDownload() when `isCancelled` turned true
+    /// mid-walk — a marker, not a real failure, so a caller can tell "this was
+    /// a deliberate cancel" apart from an actual error (a permission denial, a
+    /// vanished path) without string-matching a message.
+    struct PlanCancelled: Error, LocalizedError {
+        var errorDescription: String? { "Cancelled" }
+    }
+
     /// Walk a local file or directory into a flat file list with remote destinations.
-    static func planUpload(_ localPath: String, remoteDir: String) async throws -> Plan {
+    /// `isCancelled`, when given, is checked at each directory boundary — not an
+    /// instant mid-syscall abort, but bounded to "finish this directory, then
+    /// stop" rather than walking the rest of a huge tree for nothing once a
+    /// cancel has already been asked for.
+    static func planUpload(_ localPath: String, remoteDir: String,
+                           isCancelled: (@Sendable () -> Bool)? = nil) async throws -> Plan {
         let st = try LocalFS.statOrThrow(localPath)
         let base = (localPath as NSString).lastPathComponent
         if !st.isDir {
@@ -288,8 +301,10 @@ enum Transfers {
         var files: [Item] = []
         var dirs: [String] = []
         func walk(_ lp: String, _ rp: String) throws {
+            if isCancelled?() == true { throw PlanCancelled() }
             dirs.append(rp)
             for name in try LocalFS.readdir(lp) {
+                if isCancelled?() == true { throw PlanCancelled() }
                 let l = (lp as NSString).appendingPathComponent(name)
                 let r = Posix.join(rp, name)
                 guard let e = LocalFS.lstat(l) else { continue }
@@ -301,8 +316,10 @@ enum Transfers {
         return Plan(files: files, dirs: dirs)
     }
 
-    /// Walk a remote file or directory into a flat file list with local destinations.
-    static func planDownload(_ sftp: SFTPClient, remotePath: String, localDir: String, known: FileEntry? = nil) async throws -> Plan {
+    /// Walk a remote file or directory into a flat file list with local
+    /// destinations. Same cancellation shape as planUpload() above.
+    static func planDownload(_ sftp: SFTPClient, remotePath: String, localDir: String, known: FileEntry? = nil,
+                             isCancelled: (@Sendable () -> Bool)? = nil) async throws -> Plan {
         let base = remotePath.split(separator: "/").last.map(String.init) ?? "download"
         var type = known?.type
         if type == nil || type == .symlink {
@@ -317,8 +334,10 @@ enum Transfers {
         var files: [Item] = []
         var dirs: [String] = []
         func walk(_ rp: String, _ lp: String) async throws {
+            if isCancelled?() == true { throw PlanCancelled() }
             dirs.append(lp)
             for e in try await sftp.list(rp) {
+                if isCancelled?() == true { throw PlanCancelled() }
                 let l = (lp as NSString).appendingPathComponent(e.name)
                 if e.type == .directory { try await walk(e.path, l) }
                 else if e.type == .file { files.append(Item(local: l, remote: e.path, size: e.size)) }

@@ -4,6 +4,11 @@ import SwiftUI
 /// Small pure helpers the panes, tabs and layouts share.
 @MainActor
 enum SessionsCore {
+    /// Where the last local shell to close was, so the next one that opens
+    /// with nowhere else in mind starts there instead of always back at
+    /// home. Read only when the caller named no `cwd` of its own.
+    static var lastLocalCwd: String?
+
     /// Every window's sessions.
     static func allWindows() -> [SessionsWindow] {
         WindowManager.shared.windows.map { $0.feature(SessionsWindow.self) }
@@ -74,6 +79,10 @@ enum SessionsCore {
         guard let pane else { return "" }
         _ = pane.titleRevision
         if pane.isHosts { return pane.title ?? "Hosts" }
+        // kube-ui's panes: the browser, a pod's shell, a pod's logs.
+        if let k = pane.attachments["kubeKind"] as? String {
+            return pane.title ?? (k == "browser" ? "Kubernetes" : k == "exec" ? "kube exec" : "kube logs")
+        }
         if pane.kind == .tmux {
             if let t = pane.titleProvider?(pane, long) { return t }
             return pane.title ?? "tmux"

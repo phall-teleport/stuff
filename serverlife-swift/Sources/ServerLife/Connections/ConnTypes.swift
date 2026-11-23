@@ -39,6 +39,12 @@ struct ConnectOptions {
     var timeout: TimeInterval?
     /// ForwardX11Timeout (spec.x11Timeout; default "596h").
     var x11Timeout: String?
+    /// SSH options for this opening (sshoptions.js shape). nil: the host's
+    /// saved default; `.null`: a plain session, the default skipped.
+    var sshOptions: JSON?
+    /// A saved profile's own extra -o lines (newline-separated), merged into
+    /// the options; the profile's line wins for the same option name.
+    var profileSshOptions: String?
 
     init(login: String? = nil, x11: String? = nil, transport: String? = nil, mfaMode: String? = nil,
          agentForward: Bool? = nil, compression: Bool? = nil, reuse: Bool = false,
@@ -149,7 +155,7 @@ struct ServerInfo: Sendable {
     /// kernel_sys, kernel, arch, hostname, user, shell, os_pretty, os_name,
     /// os_version, os_id, uptime, cpus, cpu_model, mem_total_kb, mem_avail_kb,
     /// load, disk_root, virt, init, users_online, pkg, has_docker, has_kubectl,
-    /// has_podman.
+    /// has_podman, has_helm, has_kustomize.
     var values: [String: String]
     var memTotal: Double?
     var memAvail: Double?
@@ -213,6 +219,13 @@ enum ConnEvent {
     case serverInfo(id: String, info: ServerInfo)
     case logging(id: String, termId: String, path: String?, active: Bool)
     case terminalExit(id: String, termId: String, code: Int32?)
+    /// The live monitor said something (`conn:monitor`): a sample, hello,
+    /// unsupported, or ended. Local shells report as id "local".
+    case monitor(id: String, event: MonitorEvent)
+    /// Output of an interactive exec (`exec:data`).
+    case execData(id: String, execId: String, data: String)
+    /// An interactive exec asked something (`exec:prompt`): an MFA code, a tap.
+    case execPrompt(id: String, execId: String, text: String)
     /// The list of connections changed (created, removed, or a state changed).
     case changed
 }

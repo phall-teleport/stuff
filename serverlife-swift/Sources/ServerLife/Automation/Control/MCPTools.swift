@@ -32,7 +32,7 @@ enum MCPTools {
   },
   {
     "name": "serverlife_list_hosts",
-    "description": "Every host ServerLife can open: Teleport nodes (with labels), ssh_config aliases and saved profiles. Use before opening a session to get names right.",
+    "description": "Every host ServerLife can open: beams (by the name to open them with), Teleport nodes (with labels), Kubernetes clusters (logged in or available — not ones you would first have to request), ssh_config aliases and saved profiles. Use before opening a session to get names right.",
     "verb": "list_hosts",
     "inputSchema": {
       "type": "object",
@@ -59,25 +59,29 @@ enum MCPTools {
   },
   {
     "name": "serverlife_open_session",
-    "description": "Open one session in ServerLife. The host is named as a person would: a Teleport node hostname, an ssh_config alias, a saved profile name, or \"local\".",
+    "description": "Open one session in ServerLife. The host is named as a person would: a beam’s name (as list_beams shows it), a Teleport node hostname, an ssh_config alias, a saved profile name, a Kubernetes cluster name (opens its cluster browser tab — logging in first if it is only available, not yet connected), or \"local\".",
     "verb": "open_session",
     "inputSchema": {
       "type": "object",
-      "required": [
-        "host"
-      ],
       "properties": {
         "host": {
           "type": "string",
-          "description": "Host name, alias, profile name, or \"local\"."
+          "description": "Beam name, host name, alias, profile name, Kubernetes cluster name, or \"local\". Beams match exactly, never partially."
         },
         "login": {
           "type": "string",
-          "description": "Remote user to connect as."
+          "description": "Remote user to connect as. Not meaningful for a Kubernetes cluster."
         },
         "cluster": {
           "type": "string",
           "description": "Teleport cluster, when the same name exists in several."
+        },
+        "beam": {
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "description": "A beam’s name (in place of host, as sync_apply takes it), or true: the host is a beam / false: it is not. Only needed when a beam and another host share the exact name — that case is refused until you say which."
         },
         "filesOnly": {
           "type": "boolean",
@@ -89,7 +93,11 @@ enum MCPTools {
             "right",
             "down"
           ],
-          "description": "Split the focused pane instead of opening a tab."
+          "description": "Split a pane instead of opening a tab. By default the currently-focused one — pass \"tab\" to name exactly which one instead of relying on that. Not available for a Kubernetes cluster, which always opens its own tab."
+        },
+        "tab": {
+          "type": "number",
+          "description": "With split: which open tab to split, by its index from list_sessions — e.g. the one a previous open_session call just opened — rather than whatever happens to be focused."
         },
         "tmux": {
           "type": "boolean",
@@ -117,9 +125,6 @@ enum MCPTools {
           "description": "Sessions to open, in order.",
           "items": {
             "type": "object",
-            "required": [
-              "host"
-            ],
             "properties": {
               "host": {
                 "type": "string"
@@ -130,6 +135,12 @@ enum MCPTools {
               "cluster": {
                 "type": "string"
               },
+              "beam": {
+                "type": [
+                  "string",
+                  "boolean"
+                ]
+              },
               "filesOnly": {
                 "type": "boolean"
               },
@@ -139,6 +150,10 @@ enum MCPTools {
                   "right",
                   "down"
                 ]
+              },
+              "tab": {
+                "type": "number",
+                "description": "With split: which open tab to split, by its index from list_sessions."
               },
               "tmux": {
                 "type": "boolean"
@@ -162,13 +177,10 @@ enum MCPTools {
     "verb": "list_tmux",
     "inputSchema": {
       "type": "object",
-      "required": [
-        "host"
-      ],
       "properties": {
         "host": {
           "type": "string",
-          "description": "Host name, alias or profile name."
+          "description": "Beam name, host name, alias or profile name."
         },
         "cluster": {
           "type": "string",
@@ -177,13 +189,20 @@ enum MCPTools {
         "login": {
           "type": "string",
           "description": "Remote user to connect as."
+        },
+        "beam": {
+          "type": [
+            "string",
+            "boolean"
+          ],
+          "description": "A beam’s name (in place of host, as sync_apply takes it), or true: the host is a beam / false: it is not. Only needed when a beam and another host share the exact name — that case is refused until you say which."
         }
       }
     }
   },
   {
     "name": "serverlife_close_session",
-    "description": "Close a session tab, by index (from list_sessions) or title. With all=true, closes every session.",
+    "description": "Close a session tab, by index (from list_sessions) or title. With all=true, closes every session. If it still has a live session in it, the user is asked to confirm first (skipped if it already exited, and can be turned off for good from that dialog or from Settings); a decline throws.",
     "verb": "close_session",
     "inputSchema": {
       "type": "object",
@@ -198,6 +217,32 @@ enum MCPTools {
           "type": "boolean"
         }
       }
+    }
+  },
+  {
+    "name": "serverlife_get_settings",
+    "description": "Every app setting as it is right now, the same object the Settings dialog reads from — fonts, cursor (cursorStyle: \"bar\"|\"block\"|\"underline\", cursorBlink), scrollback, confirmations, kubeEnabled (KubeLife, the optional Kubernetes module — on by default), and the rest.",
+    "verb": "get_settings",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "serverlife_set_settings",
+    "description": "Change one or more settings, by the same keys the Settings dialog’s own Save button writes (see serverlife_get_settings for the current ones) — e.g. { cursorStyle: \"block\" } or { kubeEnabled: false } to turn KubeLife off. A cursor change applies live to every open terminal; kubeEnabled applies live to the Resources tab; others take effect the way they always have.",
+    "verb": "set_settings",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "patch": {
+          "type": "object",
+          "description": "Settings to change, as { key: value }."
+        }
+      },
+      "required": [
+        "patch"
+      ]
     }
   },
   {
@@ -268,6 +313,117 @@ enum MCPTools {
         },
         "home": {
           "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "serverlife_list_kube_resource_types",
+    "description": "Every resource kind a Kubernetes cluster actually has — kubectl api-resources under the hood, CRDs included, not a fixed list. The cluster has to already be logged in (see serverlife_list_hosts/serverlife_open_session).",
+    "verb": "list_kube_resource_types",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "cluster"
+      ],
+      "properties": {
+        "cluster": {
+          "type": "string",
+          "description": "Cluster name, as serverlife_list_hosts shows it, or its exact kubeconfig context name."
+        }
+      }
+    }
+  },
+  {
+    "name": "serverlife_list_kube_resources",
+    "description": "Resources of one kind in a Kubernetes cluster — kubectl get, trimmed to name, namespace, status and age. Read-only.",
+    "verb": "list_kube_resources",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "cluster",
+        "kind"
+      ],
+      "properties": {
+        "cluster": {
+          "type": "string",
+          "description": "Cluster name, as serverlife_list_hosts shows it, or its exact kubeconfig context name."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Resource kind, e.g. Pod, Deployment, Service. See serverlife_list_kube_resource_types for what this cluster has."
+        },
+        "namespace": {
+          "type": "string",
+          "description": "One namespace. Every namespace, if left out."
+        },
+        "selector": {
+          "type": "string",
+          "description": "A label selector, kubectl’s own -l syntax, e.g. \"app=foo,env=prod\"."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Maximum resources to return (default 100)."
+        }
+      }
+    }
+  },
+  {
+    "name": "serverlife_get_kube_resource",
+    "description": "One Kubernetes resource’s own YAML — kubectl get -o yaml. Read-only.",
+    "verb": "get_kube_resource",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "cluster",
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "cluster": {
+          "type": "string",
+          "description": "Cluster name, as serverlife_list_hosts shows it, or its exact kubeconfig context name."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Resource kind, e.g. Pod, Deployment, Service."
+        },
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Required for a namespaced kind."
+        }
+      }
+    }
+  },
+  {
+    "name": "serverlife_describe_kube_resource",
+    "description": "kubectl describe for one Kubernetes resource — conditions and recent events, in kubectl’s own words. Read-only.",
+    "verb": "describe_kube_resource",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "cluster",
+        "kind",
+        "name"
+      ],
+      "properties": {
+        "cluster": {
+          "type": "string",
+          "description": "Cluster name, as serverlife_list_hosts shows it, or its exact kubeconfig context name."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Resource kind, e.g. Pod, Deployment, Service."
+        },
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Required for a namespaced kind."
         }
       }
     }
@@ -433,7 +589,7 @@ enum MCPTools {
   },
   {
     "name": "serverlife_list_requests",
-    "description": "The HTTP requests the user has saved in Network Tools, with the method and URL of each.",
+    "description": "The HTTP requests the user has saved in Network and certificate tools, with the method and URL of each.",
     "verb": "list_requests",
     "inputSchema": {
       "type": "object",
@@ -462,6 +618,47 @@ enum MCPTools {
     }
   },
   {
+    "name": "serverlife_search",
+    "description": "Search everything in ServerLife by name or details, as the search box at the top of its window does: hosts (name, address, labels, uuid), saved profiles, clusters, beams, open tabs, macros, snippets, layouts, past multi-exec runs, and saved AI prompts and responses. Each kind of result says which tool opens or runs it. Read-only.",
+    "verb": "search",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "query"
+      ],
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Words to find; every word must match. Labels work as text, e.g. \"env=prod web\"."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Most results per kind (default 8, at most 50)."
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "tab",
+              "host",
+              "profile",
+              "beam",
+              "cluster",
+              "macro",
+              "snippet",
+              "layout",
+              "run",
+              "prompt",
+              "response"
+            ]
+          },
+          "description": "Only these kinds of result."
+        }
+      }
+    }
+  },
+  {
     "name": "serverlife_list_macros",
     "description": "The macros the user has saved, with the command each one runs.",
     "verb": "list_macros",
@@ -472,7 +669,7 @@ enum MCPTools {
   },
   {
     "name": "serverlife_run_macro",
-    "description": "Run one of the user's saved macros in the focused session. Only saved macros can be run — there is no way to run an arbitrary command through this interface.",
+    "description": "Run one of the user's saved macros in the focused session. Only saved macros can be run — there is no way to run an arbitrary command through this interface. Pass waitSeconds to wait for it and get back what it printed; or read it afterwards with serverlife_read_output.",
     "verb": "run_macro",
     "inputSchema": {
       "type": "object",
@@ -487,6 +684,61 @@ enum MCPTools {
         "allPanes": {
           "type": "boolean",
           "description": "Run it in every pane of the focused tab."
+        },
+        "waitSeconds": {
+          "type": "number",
+          "description": "Wait this long (up to 60) for the command, then return its output."
+        }
+      }
+    }
+  },
+  {
+    "name": "serverlife_type_into_session",
+    "description": "Type (paste) text into a terminal session — the focused pane of the current tab unless tab and pane (indexes from serverlife_list_sessions) are given — and optionally press Enter to run it. The user decides in ServerLife whether this is allowed: by default they are shown the text and the target and asked each time, and they may decline, paste without running, or turn it off. Read the result with serverlife_read_output.",
+    "verb": "type_text",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "What to type. Several lines are pasted as one paste."
+        },
+        "enter": {
+          "type": "boolean",
+          "description": "Press Enter afterwards, to run it. Default false."
+        },
+        "tab": {
+          "type": "integer",
+          "description": "Tab index from list_sessions. Default: the current tab."
+        },
+        "pane": {
+          "type": "integer",
+          "description": "Pane index within that tab. Default: its focused pane."
+        }
+      }
+    }
+  },
+  {
+    "name": "serverlife_read_output",
+    "description": "Read the text a session shows: the last lines of a terminal pane — the focused pane of the current tab unless tab and pane (indexes from serverlife_list_sessions) are given. Read-only. Use it to see what a macro printed. It returns whatever the terminal shows, which can include anything the session displayed.",
+    "verb": "read_output",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tab": {
+          "type": "integer",
+          "description": "Tab index from list_sessions. Default: the current tab."
+        },
+        "pane": {
+          "type": "integer",
+          "description": "Pane index within that tab. Default: its focused pane."
+        },
+        "lines": {
+          "type": "integer",
+          "description": "How many of the last lines to return (1–1000, default 80)."
         }
       }
     }
