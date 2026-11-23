@@ -742,6 +742,32 @@ final class AppModel {
         }
         reconcileAgentProxy()
         busy.insert(sessionID)
+        // pi fails fast with "Connection error." when nothing listens on the
+        // proxy port, which used to look like "nothing happens". Wait briefly
+        // for the supervised `tsh proxy app` (it may have just started), and
+        // hand the prompt back with the proxy's state if it never comes up.
+        let port = config.agentProxyPort
+        Task { [weak self] in
+            var up = false
+            for i in 0..<15 {
+                if await Supervisor.probe(port: port) { up = true; break }
+                if i < 14 { try? await Task.sleep(for: .seconds(1)) }
+            }
+            await MainActor.run {
+                guard let self else { return }
+                guard up else {
+                    _ = self.busy.remove(sessionID)
+                    if self.composer.isEmpty { self.composer = prompt }
+                    let st = self.mcpStatus["agentProxy"].map { " (\($0))" } ?? ""
+                    self.toast("The \(PublishedURLs.serviceApp(for: self.config.agent)) proxy on 127.0.0.1:\(port) isn't answering\(st). Check Settings, or log in to Teleport.", .err, seconds: 8)
+                    return
+                }
+                self.startPiTurn(sessionID: sessionID, prompt: prompt, workDir: s.localWorkDir)
+            }
+        }
+    }
+
+    private func startPiTurn(sessionID: String, prompt: String, workDir: String) {
         turnStart[sessionID] = Date()
         recordUserTurn(sessionID, prompt)
         // Same agent/model Settings already picks for beam turns, routed to
@@ -752,12 +778,12 @@ final class AppModel {
         // picker starts blank until touched, so fall back to its first option.
         let defaultModel = (config.agent == "codex" ? SettingsView.codexModels : SettingsView.claudeModels).first ?? ""
         let model = config.model.isEmpty ? defaultModel : config.model
-        let turn = PiTurn(workDir: s.localWorkDir, sessionID: sessionID, prompt: prompt, provider: provider, model: model)
+        let turn = PiTurn(workDir: workDir, sessionID: sessionID, prompt: prompt, provider: provider, model: model)
         Task { [weak self] in
             guard let self else { return }
             var errMsg = ""
             do {
-                try await Shell.run(turn.argv, cwd: s.localWorkDir,
+                try await Shell.run(turn.argv, cwd: workDir,
                     onStdoutLine: { line in Task { @MainActor in self.handlePiLine(sessionID, line) } },
                     onStderrLine: { line in Task { @MainActor in self.appendStderr(sessionID, line) } },
                     register: { p in Task { @MainActor in self.running[sessionID] = p } })
@@ -779,8 +805,12 @@ final class AppModel {
         guard t.hasPrefix("{"), let ev = StreamEvent(line: t) else { appendStderr(id, t); return }
         store.appendTranscript(id, line: t)
         var n = seq[id, default: 0]
-        let newItems = PiEvents.items(from: ev, seq: &n)
+        var newItems = PiEvents.items(from: ev, seq: &n)
         seq[id] = n
+        // A turn that ended on an error already shows it; don't follow with "done".
+        if ev.type == "agent_settled", items[id]?.last.map({ $0.kind == .result && !$0.ok }) == true {
+            newItems.removeAll { $0.kind == .result }
+        }
         items[id, default: []] += newItems
         if ev.type == "agent_settled" {
             updateSession(id) { $0.turns += 1; $0.updated = Date() }

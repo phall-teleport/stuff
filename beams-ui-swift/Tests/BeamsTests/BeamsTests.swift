@@ -571,3 +571,18 @@ private func testPNG(_ w: Int, _ h: Int) -> Data {
     let ev = try #require(StreamEvent(line: #"{"type":"beamsui.user","text":"","images":["images/a.png"]}"#))
     #expect(TranscriptItem.items(from: ev, seq: &n).first?.images == ["images/a.png"])
 }
+
+/// A failed pi request (proxy down) is an empty assistant message with
+/// stopReason "error"; it must show up instead of looking like nothing happened.
+@Test func piErrorMessageShows() throws {
+    let line = #"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Connection error."}}"#
+    var n = 0
+    let items = PiEvents.items(from: try #require(StreamEvent(line: line)), seq: &n)
+    #expect(items.count == 1)
+    #expect(items.first?.kind == .result && items.first?.ok == false)
+    #expect(items.first?.text.contains("Connection error.") == true)
+    let retry = #"{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"Connection error."}"#
+    let ev = try #require(StreamEvent(line: retry))
+    #expect(PiEvents.isPiLine(ev))
+    #expect(PiEvents.items(from: ev, seq: &n).first?.kind == .stderr)
+}

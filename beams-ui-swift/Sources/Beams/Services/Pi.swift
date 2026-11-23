@@ -41,7 +41,7 @@ struct PiTurn {
 enum PiEvents {
     static func isPiLine(_ ev: StreamEvent) -> Bool {
         ev.type == "session" || ev.type.hasPrefix("message_") || ev.type.hasPrefix("tool_execution_")
-            || ev.type.hasPrefix("agent_") || ev.type.hasPrefix("turn_")
+            || ev.type.hasPrefix("agent_") || ev.type.hasPrefix("turn_") || ev.type.hasPrefix("auto_retry_")
     }
 
     static func items(from ev: StreamEvent, seq: inout Int) -> [TranscriptItem] {
@@ -53,7 +53,20 @@ enum PiEvents {
 
         case "message_end":
             guard let msg = ev.raw["message"] as? [String: Any], msg["role"] as? String == "assistant" else { return [] }
-            return contentItems(msg["content"], nextID: nextID)
+            var out = contentItems(msg["content"], nextID: nextID)
+            // Failed requests (proxy down, 529, …) arrive as an empty assistant
+            // message with stopReason "error"; without this the turn looked
+            // like nothing happened.
+            if msg["stopReason"] as? String == "error" {
+                let why = msg["errorMessage"] as? String ?? "request failed"
+                out.append(TranscriptItem(id: nextID(), kind: .result, text: "pi: \(why)", ok: false))
+            }
+            return out
+
+        case "auto_retry_start":
+            let attempt = ev.raw["attempt"] as? Int ?? 0, max = ev.raw["maxAttempts"] as? Int ?? 0
+            let why = ev.raw["errorMessage"] as? String ?? ""
+            return [TranscriptItem(id: nextID(), kind: .stderr, text: "pi: retrying (\(attempt)/\(max)) after: \(why)")]
 
         case "tool_execution_end":
             let name = ev.raw["toolName"] as? String ?? "tool"
